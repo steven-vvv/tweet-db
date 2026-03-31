@@ -13,6 +13,7 @@ use crate::{
     auth::{self, ActiveSession},
     error::{AppError, AppResult},
     state::AppState,
+    transfer::{self, TransferStatusInfo},
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -139,6 +140,7 @@ pub struct IngestResponse {
     pub submission_id: Uuid,
     pub status: String,
     pub accepted_count: i32,
+    pub transfer_jobs_enqueued: i32,
     pub warnings: Vec<String>,
 }
 
@@ -281,6 +283,7 @@ pub async fn ingest_submission(
     .await?;
 
     let mut accepted_count = 0_i32;
+    let mut transfer_jobs_enqueued = 0_i32;
     let mut warnings = Vec::new();
 
     for user in &payload.users {
@@ -308,6 +311,25 @@ pub async fn ingest_submission(
             Ok(true) => {
                 accepted_count += 1;
                 insert_media_variants(&state.db, submission_id, &source_kind, media, now).await?;
+                if let Some((source_url, content_type)) = transfer_candidate(media) {
+                    match transfer::enqueue_media_transfer(
+                        &state.db,
+                        &source_kind,
+                        &media.id,
+                        &media.tweet_id,
+                        &source_url,
+                        &content_type,
+                    )
+                    .await
+                    {
+                        Ok(true) => transfer_jobs_enqueued += 1,
+                        Ok(false) => {}
+                        Err(error) => warnings.push(format!(
+                            "failed to enqueue transfer for media {}: {error}",
+                            media.id
+                        )),
+                    }
+                }
             }
             Ok(false) => warnings.push("skipped media with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert media {}: {error}", media.id)),
@@ -348,6 +370,7 @@ pub async fn ingest_submission(
         submission_id,
         status,
         accepted_count,
+        transfer_jobs_enqueued,
         &warnings,
         now,
     )
@@ -357,6 +380,7 @@ pub async fn ingest_submission(
         submission_id,
         status: status.to_owned(),
         accepted_count,
+        transfer_jobs_enqueued,
         warnings,
     }))
 }
@@ -415,6 +439,8 @@ pub async fn query_post_status(
         .into_iter()
         .map(|item| (item.source_media_id.clone(), item))
         .collect::<HashMap<_, _>>();
+    let transfer_statuses =
+        transfer::fetch_transfer_statuses(&state.db, &source_kind, &media_ids).await?;
 
     let timeline_hits = fetch_timeline_hits(&state.db, &source_kind, &unique_post_ids).await?;
     let mut timeline_hits_by_post: HashMap<String, Vec<TimelineHit>> = HashMap::new();
@@ -433,6 +459,7 @@ pub async fn query_post_status(
                 posts_by_id.get(&lookup_id),
                 &actors_by_id,
                 &media_by_id,
+                &transfer_statuses,
                 timeline_hits_by_post.remove(&lookup_id).unwrap_or_default(),
             )
         })
@@ -510,6 +537,7 @@ async fn finalize_submission(
     submission_id: Uuid,
     status: &str,
     accepted_count: i32,
+    transfer_jobs_enqueued: i32,
     warnings: &[String],
     processed_at: OffsetDateTime,
 ) -> AppResult<()> {
@@ -518,14 +546,16 @@ async fn finalize_submission(
         UPDATE ingest_submissions
         SET status = $2,
             accepted_count = $3,
-            warnings = $4,
-            processed_at = $5
+            transfer_jobs_enqueued = $4,
+            warnings = $5,
+            processed_at = $6
         WHERE id = $1
         "#,
     )
     .bind(submission_id)
     .bind(status)
     .bind(accepted_count)
+    .bind(transfer_jobs_enqueued)
     .bind(serde_json::to_value(warnings)?)
     .bind(processed_at)
     .execute(pool)
@@ -1035,6 +1065,30 @@ fn ms_to_time(value: i64) -> Option<OffsetDateTime> {
         .map(|time| time + Duration::milliseconds(millis))
 }
 
+fn transfer_candidate(item: &XMediaInput) -> Option<(String, String)> {
+    if !matches!(item.r#type.as_str(), "video" | "animated_gif")
+        || item.source_url.trim().is_empty()
+    {
+        return None;
+    }
+
+    let content_type = item
+        .video_variants
+        .iter()
+        .find(|variant| variant.url == item.source_url)
+        .map(|variant| variant.content_type.clone())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if item.r#type == "animated_gif" {
+                "image/gif".to_owned()
+            } else {
+                "video/mp4".to_owned()
+            }
+        });
+
+    Some((item.source_url.clone(), content_type))
+}
+
 #[derive(Debug, Clone)]
 struct PostRow {
     source_post_id: String,
@@ -1319,6 +1373,7 @@ fn build_post_status_aggregate(
     post: Option<&PostRow>,
     actors_by_id: &HashMap<String, ActorRow>,
     media_by_id: &HashMap<String, MediaRow>,
+    transfer_statuses: &HashMap<String, TransferStatusInfo>,
     timeline_hits: Vec<TimelineHit>,
 ) -> PostStatusAggregate {
     let Some(post) = post else {
@@ -1352,8 +1407,17 @@ fn build_post_status_aggregate(
 
     let mut media = Vec::new();
     let mut missing_media_source_ids = Vec::new();
+    let mut transfer_summary = TransferSummary::default();
     for media_id in &post.media_source_ids {
         if let Some(item) = media_by_id.get(media_id) {
+            let transfer = transfer_statuses.get(media_id);
+            match transfer.and_then(|status| status.status.as_deref()) {
+                Some("pending") | Some("retryable") => transfer_summary.pending += 1,
+                Some("processing") => transfer_summary.processing += 1,
+                Some("succeeded") => transfer_summary.succeeded += 1,
+                Some("failed") => transfer_summary.failed += 1,
+                _ => {}
+            }
             media.push(MediaStatusView {
                 source_media_id: item.source_media_id.clone(),
                 media_key: item.media_key.clone(),
@@ -1366,9 +1430,9 @@ fn build_post_status_aggregate(
                 alt_text: item.alt_text.clone(),
                 allow_download: item.allow_download,
                 duration_ms: item.duration_ms,
-                transfer_status: None,
-                storage_object_key: None,
-                last_error: None,
+                transfer_status: transfer.and_then(|status| status.status.clone()),
+                storage_object_key: transfer.and_then(|status| status.storage_object_key.clone()),
+                last_error: transfer.and_then(|status| status.last_error.clone()),
             });
         } else {
             missing_media_source_ids.push(media_id.clone());
@@ -1412,6 +1476,6 @@ fn build_post_status_aggregate(
             first_observed_at: post.first_observed_at,
             last_observed_at: post.last_observed_at,
         }),
-        transfer_summary: TransferSummary::default(),
+        transfer_summary,
     }
 }

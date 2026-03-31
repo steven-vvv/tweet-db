@@ -29,6 +29,8 @@ pub struct AppSecrets {
     pub database_url: String,
     pub app_token: String,
     pub session_hmac_key: [u8; 32],
+    pub storage_access_key: Option<String>,
+    pub storage_secret_key: Option<String>,
 }
 
 impl AppSecrets {
@@ -42,11 +44,15 @@ impl AppSecrets {
             &env::var("SESSION_HMAC_KEY")
                 .map_err(|_| AppError::config("SESSION_HMAC_KEY is required"))?,
         )?;
+        let storage_access_key = env::var("STORAGE_ACCESS_KEY").ok();
+        let storage_secret_key = env::var("STORAGE_SECRET_KEY").ok();
 
         Ok(Self {
             database_url,
             app_token,
             session_hmac_key,
+            storage_access_key,
+            storage_secret_key,
         })
     }
 }

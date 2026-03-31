@@ -87,7 +87,8 @@ struct SsoExchangeResponse {
 
 #[derive(Debug, Deserialize)]
 struct AuthorizationStatusResponse {
-    subject_id: Uuid,
+    #[serde(rename = "subject_id")]
+    _subject_id: Uuid,
     active: bool,
     status: String,
     #[serde(default, with = "time::serde::rfc3339::option")]

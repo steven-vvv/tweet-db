@@ -8,12 +8,14 @@ use crate::{
     error::AppResult,
     frontend, routes,
     state::{AppState, build_http_client, connect_db},
+    transfer,
 };
 
 pub async fn build_app(settings: Settings) -> AppResult<Router> {
     let db = connect_db(&settings).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
     let state = AppState::new(settings, db, build_http_client()?);
+    transfer::spawn_worker(state.clone());
 
     let app = Router::new()
         .merge(routes::api_routes(&state))
