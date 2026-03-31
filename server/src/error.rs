@@ -76,9 +76,7 @@ impl AppError {
             | Self::SqlxMigrate(_)
             | Self::Reqwest(_)
             | Self::SerdeJson(_)
-            | Self::Io(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }

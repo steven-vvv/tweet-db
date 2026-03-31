@@ -22,6 +22,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/api/auth/register/complete", post(auth::register_complete))
         .route("/api/session/logout", post(auth::logout))
         .route("/api/ingest/submissions", post(content::ingest_submission))
+        .route("/api/posts/status/query", post(content::query_post_status))
         .route(
             "/auth/sso/webhooks/revocations",
             post(auth::revocation_webhook),

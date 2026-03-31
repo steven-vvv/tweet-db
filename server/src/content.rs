@@ -4,7 +4,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
+use std::collections::{HashMap, HashSet};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -141,6 +142,122 @@ pub struct IngestResponse {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStatusQueryRequest {
+    pub source_kind: String,
+    pub post_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStatusQueryResponse {
+    pub items: Vec<PostStatusAggregate>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostStatusAggregate {
+    pub source_kind: String,
+    pub post_id: String,
+    pub found: bool,
+    pub post: Option<PostView>,
+    pub author: Option<ActorView>,
+    pub media: Vec<MediaStatusView>,
+    pub missing_media_source_ids: Vec<String>,
+    pub timeline_hits: Vec<TimelineHit>,
+    pub capture_summary: Option<CaptureSummary>,
+    pub transfer_summary: TransferSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostView {
+    pub source_post_id: String,
+    pub author_source_actor_id: String,
+    pub conversation_source_post_id: String,
+    pub full_text: String,
+    pub legacy_full_text: String,
+    pub note_text: Option<String>,
+    pub lang: String,
+    pub source_created_at_raw: String,
+    pub in_reply_to_source_post_id: Option<String>,
+    pub in_reply_to_source_actor_id: Option<String>,
+    pub quoted_source_post_id: Option<String>,
+    pub retweeted_source_post_id: Option<String>,
+    pub view_count: Option<i64>,
+    pub possibly_sensitive: Option<bool>,
+    pub favorite_count: i64,
+    pub retweet_count: i64,
+    pub reply_count: i64,
+    pub quote_count: i64,
+    pub bookmark_count: i64,
+    pub media_source_ids: Vec<String>,
+    pub source_label: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActorView {
+    pub source_actor_id: String,
+    pub name: String,
+    pub screen_name: String,
+    pub description: String,
+    pub location: String,
+    pub avatar_url: String,
+    pub profile_url: Option<String>,
+    pub banner_url: Option<String>,
+    pub verified_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaStatusView {
+    pub source_media_id: String,
+    pub media_key: String,
+    pub source_post_id: String,
+    pub media_type: String,
+    pub source_url: String,
+    pub thumb_url: String,
+    pub width: i32,
+    pub height: i32,
+    pub alt_text: Option<String>,
+    pub allow_download: bool,
+    pub duration_ms: Option<i64>,
+    pub transfer_status: Option<String>,
+    pub storage_object_key: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineHit {
+    pub timeline_kind: String,
+    pub timeline_key: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSummary {
+    pub first_submission_id: Option<Uuid>,
+    pub last_submission_id: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub first_observed_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_observed_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferSummary {
+    pub pending: u32,
+    pub processing: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+}
+
 pub async fn ingest_submission(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -242,6 +359,86 @@ pub async fn ingest_submission(
         accepted_count,
         warnings,
     }))
+}
+
+pub async fn query_post_status(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Json(payload): Json<PostStatusQueryRequest>,
+) -> AppResult<Json<PostStatusQueryResponse>> {
+    let _session = auth::require_registered_session(session)?;
+    let source_kind = validate_source_kind(&payload.source_kind)?;
+    if payload.post_ids.is_empty() {
+        return Err(AppError::bad_request("postIds must not be empty"));
+    }
+
+    let unique_post_ids = payload
+        .post_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if unique_post_ids.is_empty() {
+        return Err(AppError::bad_request(
+            "postIds must contain at least one non-empty value",
+        ));
+    }
+
+    let posts = fetch_posts(&state.db, &source_kind, &unique_post_ids).await?;
+    let posts_by_id = posts
+        .iter()
+        .map(|post| (post.source_post_id.clone(), post.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let author_ids = posts
+        .iter()
+        .map(|post| post.author_source_actor_id.clone())
+        .filter(|id| !id.is_empty())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let actors = fetch_actors(&state.db, &source_kind, &author_ids).await?;
+    let actors_by_id = actors
+        .into_iter()
+        .map(|actor| (actor.source_actor_id.clone(), actor))
+        .collect::<HashMap<_, _>>();
+
+    let media_ids = posts
+        .iter()
+        .flat_map(|post| post.media_source_ids.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let media = fetch_media(&state.db, &source_kind, &media_ids).await?;
+    let media_by_id = media
+        .into_iter()
+        .map(|item| (item.source_media_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+
+    let timeline_hits = fetch_timeline_hits(&state.db, &source_kind, &unique_post_ids).await?;
+    let mut timeline_hits_by_post: HashMap<String, Vec<TimelineHit>> = HashMap::new();
+    for (post_id, hit) in timeline_hits {
+        timeline_hits_by_post.entry(post_id).or_default().push(hit);
+    }
+
+    let items = payload
+        .post_ids
+        .into_iter()
+        .map(|requested_id| {
+            let lookup_id = requested_id.trim().to_owned();
+            build_post_status_aggregate(
+                &source_kind,
+                requested_id,
+                posts_by_id.get(&lookup_id),
+                &actors_by_id,
+                &media_by_id,
+                timeline_hits_by_post.remove(&lookup_id).unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    Ok(Json(PostStatusQueryResponse { items }))
 }
 
 fn validate_source_kind(raw: &str) -> AppResult<String> {
@@ -836,4 +1033,385 @@ fn ms_to_time(value: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(seconds)
         .ok()
         .map(|time| time + Duration::milliseconds(millis))
+}
+
+#[derive(Debug, Clone)]
+struct PostRow {
+    source_post_id: String,
+    author_source_actor_id: String,
+    conversation_source_post_id: String,
+    full_text: String,
+    legacy_full_text: String,
+    note_text: Option<String>,
+    lang: String,
+    source_created_at_raw: String,
+    in_reply_to_source_post_id: Option<String>,
+    in_reply_to_source_actor_id: Option<String>,
+    quoted_source_post_id: Option<String>,
+    retweeted_source_post_id: Option<String>,
+    view_count: Option<i64>,
+    possibly_sensitive: Option<bool>,
+    favorite_count: i64,
+    retweet_count: i64,
+    reply_count: i64,
+    quote_count: i64,
+    bookmark_count: i64,
+    media_source_ids: Vec<String>,
+    source_label: String,
+    first_submission_id: Option<Uuid>,
+    last_submission_id: Option<Uuid>,
+    first_observed_at: OffsetDateTime,
+    last_observed_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+struct ActorRow {
+    source_actor_id: String,
+    name: String,
+    screen_name: String,
+    description: String,
+    location: String,
+    avatar_url: String,
+    profile_url: Option<String>,
+    banner_url: Option<String>,
+    verified_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MediaRow {
+    source_media_id: String,
+    media_key: String,
+    source_post_id: String,
+    media_type: String,
+    source_url: String,
+    thumb_url: String,
+    width: i32,
+    height: i32,
+    alt_text: Option<String>,
+    allow_download: bool,
+    duration_ms: Option<i64>,
+}
+
+async fn fetch_posts(
+    pool: &PgPool,
+    source_kind: &str,
+    post_ids: &[String],
+) -> AppResult<Vec<PostRow>> {
+    if post_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            source_post_id,
+            author_source_actor_id,
+            conversation_source_post_id,
+            full_text,
+            legacy_full_text,
+            note_text,
+            lang,
+            source_created_at_raw,
+            in_reply_to_source_post_id,
+            in_reply_to_source_actor_id,
+            quoted_source_post_id,
+            retweeted_source_post_id,
+            view_count,
+            possibly_sensitive,
+            favorite_count,
+            retweet_count,
+            reply_count,
+            quote_count,
+            bookmark_count,
+            media_source_ids,
+            source_label,
+            first_submission_id,
+            last_submission_id,
+            first_observed_at,
+            last_observed_at
+        FROM posts
+        WHERE source_kind = $1
+          AND source_post_id = ANY($2)
+        "#,
+    )
+    .bind(source_kind)
+    .bind(post_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PostRow {
+            source_post_id: row.get("source_post_id"),
+            author_source_actor_id: row.get("author_source_actor_id"),
+            conversation_source_post_id: row.get("conversation_source_post_id"),
+            full_text: row.get("full_text"),
+            legacy_full_text: row.get("legacy_full_text"),
+            note_text: row.get("note_text"),
+            lang: row.get("lang"),
+            source_created_at_raw: row.get("source_created_at_raw"),
+            in_reply_to_source_post_id: row.get("in_reply_to_source_post_id"),
+            in_reply_to_source_actor_id: row.get("in_reply_to_source_actor_id"),
+            quoted_source_post_id: row.get("quoted_source_post_id"),
+            retweeted_source_post_id: row.get("retweeted_source_post_id"),
+            view_count: row.get("view_count"),
+            possibly_sensitive: row.get("possibly_sensitive"),
+            favorite_count: row.get("favorite_count"),
+            retweet_count: row.get("retweet_count"),
+            reply_count: row.get("reply_count"),
+            quote_count: row.get("quote_count"),
+            bookmark_count: row.get("bookmark_count"),
+            media_source_ids: row.get("media_source_ids"),
+            source_label: row.get("source_label"),
+            first_submission_id: row.get("first_submission_id"),
+            last_submission_id: row.get("last_submission_id"),
+            first_observed_at: row.get("first_observed_at"),
+            last_observed_at: row.get("last_observed_at"),
+        })
+        .collect())
+}
+
+async fn fetch_actors(
+    pool: &PgPool,
+    source_kind: &str,
+    actor_ids: &[String],
+) -> AppResult<Vec<ActorRow>> {
+    if actor_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            source_actor_id,
+            name,
+            screen_name,
+            description,
+            location,
+            avatar_url,
+            profile_url,
+            banner_url,
+            verified_type
+        FROM actors
+        WHERE source_kind = $1
+          AND source_actor_id = ANY($2)
+        "#,
+    )
+    .bind(source_kind)
+    .bind(actor_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ActorRow {
+            source_actor_id: row.get("source_actor_id"),
+            name: row.get("name"),
+            screen_name: row.get("screen_name"),
+            description: row.get("description"),
+            location: row.get("location"),
+            avatar_url: row.get("avatar_url"),
+            profile_url: row.get("profile_url"),
+            banner_url: row.get("banner_url"),
+            verified_type: row.get("verified_type"),
+        })
+        .collect())
+}
+
+async fn fetch_media(
+    pool: &PgPool,
+    source_kind: &str,
+    media_ids: &[String],
+) -> AppResult<Vec<MediaRow>> {
+    if media_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            source_media_id,
+            media_key,
+            source_post_id,
+            media_type,
+            source_url,
+            thumb_url,
+            width,
+            height,
+            alt_text,
+            allow_download,
+            duration_ms
+        FROM media
+        WHERE source_kind = $1
+          AND source_media_id = ANY($2)
+        "#,
+    )
+    .bind(source_kind)
+    .bind(media_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| MediaRow {
+            source_media_id: row.get("source_media_id"),
+            media_key: row.get("media_key"),
+            source_post_id: row.get("source_post_id"),
+            media_type: row.get("media_type"),
+            source_url: row.get("source_url"),
+            thumb_url: row.get("thumb_url"),
+            width: row.get("width"),
+            height: row.get("height"),
+            alt_text: row.get("alt_text"),
+            allow_download: row.get("allow_download"),
+            duration_ms: row.get("duration_ms"),
+        })
+        .collect())
+}
+
+async fn fetch_timeline_hits(
+    pool: &PgPool,
+    source_kind: &str,
+    post_ids: &[String],
+) -> AppResult<Vec<(String, TimelineHit)>> {
+    if post_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT timeline_kind, timeline_key, post_source_ids, observed_at
+        FROM timeline_observations
+        WHERE source_kind = $1
+          AND post_source_ids && $2
+        ORDER BY observed_at DESC
+        LIMIT 500
+        "#,
+    )
+    .bind(source_kind)
+    .bind(post_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let requested = post_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut hits = Vec::new();
+
+    for row in rows {
+        let hit = TimelineHit {
+            timeline_kind: row.get("timeline_kind"),
+            timeline_key: row.get("timeline_key"),
+            observed_at: row.get("observed_at"),
+        };
+        let post_source_ids: Vec<String> = row.get("post_source_ids");
+        for post_id in post_source_ids {
+            if requested.contains(&post_id) {
+                hits.push((post_id, hit.clone()));
+            }
+        }
+    }
+
+    Ok(hits)
+}
+
+fn build_post_status_aggregate(
+    source_kind: &str,
+    requested_id: String,
+    post: Option<&PostRow>,
+    actors_by_id: &HashMap<String, ActorRow>,
+    media_by_id: &HashMap<String, MediaRow>,
+    timeline_hits: Vec<TimelineHit>,
+) -> PostStatusAggregate {
+    let Some(post) = post else {
+        return PostStatusAggregate {
+            source_kind: source_kind.to_owned(),
+            post_id: requested_id,
+            found: false,
+            post: None,
+            author: None,
+            media: Vec::new(),
+            missing_media_source_ids: Vec::new(),
+            timeline_hits,
+            capture_summary: None,
+            transfer_summary: TransferSummary::default(),
+        };
+    };
+
+    let author = actors_by_id
+        .get(&post.author_source_actor_id)
+        .map(|actor| ActorView {
+            source_actor_id: actor.source_actor_id.clone(),
+            name: actor.name.clone(),
+            screen_name: actor.screen_name.clone(),
+            description: actor.description.clone(),
+            location: actor.location.clone(),
+            avatar_url: actor.avatar_url.clone(),
+            profile_url: actor.profile_url.clone(),
+            banner_url: actor.banner_url.clone(),
+            verified_type: actor.verified_type.clone(),
+        });
+
+    let mut media = Vec::new();
+    let mut missing_media_source_ids = Vec::new();
+    for media_id in &post.media_source_ids {
+        if let Some(item) = media_by_id.get(media_id) {
+            media.push(MediaStatusView {
+                source_media_id: item.source_media_id.clone(),
+                media_key: item.media_key.clone(),
+                source_post_id: item.source_post_id.clone(),
+                media_type: item.media_type.clone(),
+                source_url: item.source_url.clone(),
+                thumb_url: item.thumb_url.clone(),
+                width: item.width,
+                height: item.height,
+                alt_text: item.alt_text.clone(),
+                allow_download: item.allow_download,
+                duration_ms: item.duration_ms,
+                transfer_status: None,
+                storage_object_key: None,
+                last_error: None,
+            });
+        } else {
+            missing_media_source_ids.push(media_id.clone());
+        }
+    }
+
+    PostStatusAggregate {
+        source_kind: source_kind.to_owned(),
+        post_id: requested_id,
+        found: true,
+        post: Some(PostView {
+            source_post_id: post.source_post_id.clone(),
+            author_source_actor_id: post.author_source_actor_id.clone(),
+            conversation_source_post_id: post.conversation_source_post_id.clone(),
+            full_text: post.full_text.clone(),
+            legacy_full_text: post.legacy_full_text.clone(),
+            note_text: post.note_text.clone(),
+            lang: post.lang.clone(),
+            source_created_at_raw: post.source_created_at_raw.clone(),
+            in_reply_to_source_post_id: post.in_reply_to_source_post_id.clone(),
+            in_reply_to_source_actor_id: post.in_reply_to_source_actor_id.clone(),
+            quoted_source_post_id: post.quoted_source_post_id.clone(),
+            retweeted_source_post_id: post.retweeted_source_post_id.clone(),
+            view_count: post.view_count,
+            possibly_sensitive: post.possibly_sensitive,
+            favorite_count: post.favorite_count,
+            retweet_count: post.retweet_count,
+            reply_count: post.reply_count,
+            quote_count: post.quote_count,
+            bookmark_count: post.bookmark_count,
+            media_source_ids: post.media_source_ids.clone(),
+            source_label: post.source_label.clone(),
+        }),
+        author,
+        media,
+        missing_media_source_ids,
+        timeline_hits,
+        capture_summary: Some(CaptureSummary {
+            first_submission_id: post.first_submission_id,
+            last_submission_id: post.last_submission_id,
+            first_observed_at: post.first_observed_at,
+            last_observed_at: post.last_observed_at,
+        }),
+        transfer_summary: TransferSummary::default(),
+    }
 }
