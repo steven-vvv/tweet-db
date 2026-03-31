@@ -1,0 +1,42 @@
+[app]
+environment = "development"
+base_url = "http://127.0.0.1:3001"
+
+[server]
+listen_addr = "127.0.0.1:3001"
+webui_dist_dir = "../../webui/dist"
+
+[session]
+cookie_name = "tweet_db_sid"
+pending_login_cookie_name = "tweet_db_sso_state"
+cookie_secure = false
+ttl_hours = 12
+absolute_ttl_hours = 720
+auto_renew = true
+pending_login_ttl_seconds = 600
+
+[sso]
+issuer = "http://127.0.0.1:3000"
+client_id = "tweet-db"
+login_redirect_uri = "http://127.0.0.1:3001/auth/sso/callback"
+authorization_cache_ttl_seconds = 300
+
+[ingest]
+max_items_per_batch = 5000
+
+[storage]
+provider = "s3_compatible"
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+bucket = "tweet-db"
+path_style = true
+
+[transfer]
+enabled = true
+part_size_bytes = 10485760
+worker_poll_interval_seconds = 5
+max_attempts = 8
+
+[observability]
+log_filter = "tweet_db_server=info,tower_http=info,sqlx=warn"
+

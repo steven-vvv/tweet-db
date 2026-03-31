@@ -1,0 +1,7 @@
+server/target/
+server/.env
+webui/node_modules/
+webui/dist/
+.codex/
+*.log
+.DS_Store
