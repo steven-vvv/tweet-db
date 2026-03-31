@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{auth, db, error::AppResult, state::AppState};
+use crate::{auth, content, db, error::AppResult, state::AppState};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -21,6 +21,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/api/session/me", get(auth::session_me))
         .route("/api/auth/register/complete", post(auth::register_complete))
         .route("/api/session/logout", post(auth::logout))
+        .route("/api/ingest/submissions", post(content::ingest_submission))
         .route(
             "/auth/sso/webhooks/revocations",
             post(auth::revocation_webhook),
