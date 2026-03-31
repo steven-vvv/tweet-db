@@ -24,6 +24,8 @@ pub enum AppError {
     Config(String),
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    SqlxMigrate(#[from] sqlx::migrate::MigrateError),
     #[error("http client error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error("serialization error: {0}")]
@@ -70,7 +72,11 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Sqlx(_) | Self::Reqwest(_) | Self::SerdeJson(_) | Self::Io(_) => {
+            Self::Sqlx(_)
+            | Self::SqlxMigrate(_)
+            | Self::Reqwest(_)
+            | Self::SerdeJson(_)
+            | Self::Io(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         }

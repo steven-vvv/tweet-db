@@ -1,5 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
+use rand::{RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -70,16 +71,7 @@ pub fn pkce_s256(verifier: &str) -> String {
 }
 
 pub fn random_urlsafe_string(byte_len: usize) -> String {
-    let bytes = (0..byte_len).map(|_| rand_byte()).collect::<Vec<_>>();
+    let mut bytes = vec![0_u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn rand_byte() -> u8 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch");
-    let nanos = now.subsec_nanos();
-    (nanos % 255) as u8
 }

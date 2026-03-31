@@ -16,7 +16,7 @@ pub async fn build_app(settings: Settings) -> AppResult<Router> {
     let state = AppState::new(settings, db, build_http_client()?);
 
     let app = Router::new()
-        .merge(routes::api_routes())
+        .merge(routes::api_routes(&state))
         .merge(frontend::routes(&state))
         .with_state(state)
         .layer(CompressionLayer::new())
