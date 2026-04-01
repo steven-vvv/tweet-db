@@ -36,9 +36,7 @@ pub struct SessionMeResponse {
     pub username: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
-    pub source_login_url: String,
-    pub source_register_url: String,
-    pub source_manage_url: String,
+    pub account_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,14 +49,6 @@ pub struct InternalSessionMeResponse {
     pub authorization_id: Option<Uuid>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
-    pub source_login_url: String,
-    pub source_register_url: String,
-    pub source_manage_url: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LoginUrlResponse {
-    pub login_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,36 +114,17 @@ pub async fn session_cookie_middleware(
     Ok(response)
 }
 
-pub async fn login_url(
+pub async fn account_login(
     State(state): State<AppState>,
     jar: CookieJar,
-) -> AppResult<(CookieJar, Json<LoginUrlResponse>)> {
-    let now = OffsetDateTime::now_utc();
-    let state_id = Uuid::now_v7();
-    let code_verifier =
-        issue_compound_secret(&state.settings.secrets.session_hmac_key, TokenKind::Session)
-            .verifier;
-    let expires_at =
-        now + Duration::seconds(state.settings.config.session.pending_login_ttl_seconds);
+    session: Option<Extension<ActiveSession>>,
+) -> AppResult<(CookieJar, Redirect)> {
+    if session.is_some() {
+        return Ok((jar, Redirect::temporary("/account")));
+    }
 
-    db::delete_expired_pending_sso_logins(&state.db, now).await?;
-    db::insert_pending_sso_login(&state.db, state_id, &code_verifier, expires_at).await?;
-    register_revocation_webhook(&state).await;
-
-    let cookie = pending_cookie(
-        &state.settings.config.session,
-        state_id.to_string(),
-        expires_at - now,
-    );
-
-    let login_url = format!(
-        "{}/sso/authorize?client_id={}&code_challenge={}",
-        state.settings.config.sso.issuer.trim_end_matches('/'),
-        state.settings.config.sso.client_id,
-        pkce_s256(&code_verifier),
-    );
-
-    Ok((jar.add(cookie), Json(LoginUrlResponse { login_url })))
+    let (cookie, login_url) = begin_sso_login(&state).await?;
+    Ok((jar.add(cookie), Redirect::temporary(&login_url)))
 }
 
 pub async fn sso_callback(
@@ -167,7 +138,7 @@ pub async fn sso_callback(
     let jar = clear_pending_cookie(&state, jar);
 
     if let Some(error) = query.error {
-        return Ok((jar, Redirect::temporary(&format!("/login?error={error}"))));
+        return Ok((jar, Redirect::temporary(&format!("/account?error={error}"))));
     }
 
     let code = query
@@ -232,19 +203,13 @@ pub async fn sso_callback(
     )
     .await?;
 
-    let next_path = if existing.is_some() {
-        "/account"
-    } else {
-        "/register"
-    };
-
     Ok((
         jar.add(session_cookie(
             &state.settings.config.session,
             &secret.compound_value(),
             expires_at - now,
         )),
-        Redirect::temporary(next_path),
+        Redirect::temporary("/account"),
     ))
 }
 
@@ -256,13 +221,13 @@ pub async fn session_me(
 }
 
 pub async fn internal_session_me(
-    State(state): State<AppState>,
+    _state: State<AppState>,
     session: Option<Extension<ActiveSession>>,
 ) -> AppResult<Json<InternalSessionMeResponse>> {
-    Ok(Json(build_internal_session_me_response(&state, session)))
+    Ok(Json(build_internal_session_me_response(session)))
 }
 
-pub async fn register_complete(
+pub async fn internal_register_complete(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
     Json(payload): Json<RegisterCompleteRequest>,
@@ -284,7 +249,7 @@ pub async fn register_complete(
     }))
 }
 
-pub async fn logout(
+pub async fn internal_logout(
     State(state): State<AppState>,
     jar: CookieJar,
     session: Option<Extension<ActiveSession>>,
@@ -365,6 +330,34 @@ fn require_pending_registration(
         return Err(AppError::bad_request("session is not pending registration"));
     }
     Ok(session)
+}
+
+async fn begin_sso_login(state: &AppState) -> AppResult<(Cookie<'static>, String)> {
+    let now = OffsetDateTime::now_utc();
+    let state_id = Uuid::now_v7();
+    let code_verifier =
+        issue_compound_secret(&state.settings.secrets.session_hmac_key, TokenKind::Session)
+            .verifier;
+    let expires_at =
+        now + Duration::seconds(state.settings.config.session.pending_login_ttl_seconds);
+
+    db::delete_expired_pending_sso_logins(&state.db, now).await?;
+    db::insert_pending_sso_login(&state.db, state_id, &code_verifier, expires_at).await?;
+    register_revocation_webhook(state).await;
+
+    let cookie = pending_cookie(
+        &state.settings.config.session,
+        state_id.to_string(),
+        expires_at - now,
+    );
+    let login_url = format!(
+        "{}/sso/authorize?client_id={}&code_challenge={}",
+        state.settings.config.sso.issuer.trim_end_matches('/'),
+        state.settings.config.sso.client_id,
+        pkce_s256(&code_verifier),
+    );
+
+    Ok((cookie, login_url))
 }
 
 enum CookieAction {
@@ -654,41 +647,33 @@ fn build_public_session_me_response(
     state: &AppState,
     session: Option<Extension<ActiveSession>>,
 ) -> SessionMeResponse {
-    let source_login_url = state.settings.config.sso.source_login_url.clone();
-    let source_register_url = state.settings.config.sso.source_register_url.clone();
-    let source_manage_url = state.settings.config.sso.source_manage_url.clone();
+    build_public_session_response(
+        &state.settings.config.app.base_url,
+        session.as_ref().map(|extension| &extension.0.record),
+    )
+}
 
-    let Some(Extension(session)) = session else {
-        return SessionMeResponse {
-            authenticated: false,
-            registered: false,
-            username: None,
-            expires_at: None,
-            source_login_url,
-            source_register_url,
-            source_manage_url,
-        };
-    };
+fn build_public_session_response(
+    base_url: &str,
+    session: Option<&db::SessionRecord>,
+) -> SessionMeResponse {
+    let authenticated = session.is_some();
+    let registered = session
+        .map(|record| record.registration_state == "active")
+        .unwrap_or(false);
 
     SessionMeResponse {
-        authenticated: true,
-        registered: session.record.registration_state == "active",
-        username: session.record.username.clone(),
-        expires_at: Some(session.record.expires_at),
-        source_login_url,
-        source_register_url,
-        source_manage_url,
+        authenticated,
+        registered,
+        username: session.and_then(|record| record.username.clone()),
+        expires_at: session.map(|record| record.expires_at),
+        account_url: (!registered).then(|| account_management_url(base_url)),
     }
 }
 
 fn build_internal_session_me_response(
-    state: &AppState,
     session: Option<Extension<ActiveSession>>,
 ) -> InternalSessionMeResponse {
-    let source_login_url = state.settings.config.sso.source_login_url.clone();
-    let source_register_url = state.settings.config.sso.source_register_url.clone();
-    let source_manage_url = state.settings.config.sso.source_manage_url.clone();
-
     let Some(Extension(session)) = session else {
         return InternalSessionMeResponse {
             authenticated: false,
@@ -698,9 +683,6 @@ fn build_internal_session_me_response(
             subject_id: None,
             authorization_id: None,
             expires_at: None,
-            source_login_url,
-            source_register_url,
-            source_manage_url,
         };
     };
 
@@ -712,10 +694,11 @@ fn build_internal_session_me_response(
         subject_id: Some(session.record.sso_subject_id),
         authorization_id: Some(session.record.authorization_id),
         expires_at: Some(session.record.expires_at),
-        source_login_url,
-        source_register_url,
-        source_manage_url,
     }
+}
+
+fn account_management_url(base_url: &str) -> String {
+    format!("{}/account", base_url.trim_end_matches('/'))
 }
 
 fn session_expires_at(
@@ -777,4 +760,73 @@ fn clear_pending_cookie(state: &AppState, jar: CookieJar) -> CookieJar {
         &state.settings.config.session.pending_login_cookie_name,
         state.settings.config.session.cookie_secure,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_session(registration_state: &str, username: Option<&str>) -> db::SessionRecord {
+        let now = OffsetDateTime::now_utc();
+        db::SessionRecord {
+            selector: Uuid::now_v7(),
+            verifier_hash: vec![1, 2, 3],
+            user_id: username.map(|_| Uuid::now_v7()),
+            username: username.map(ToOwned::to_owned),
+            sso_subject_id: Uuid::now_v7(),
+            authorization_id: Uuid::now_v7(),
+            registration_state: registration_state.to_owned(),
+            expires_at: now + Duration::hours(1),
+            last_seen_at: now,
+            created_at: now,
+            authorization_status: "active".to_owned(),
+            authorization_last_checked_at: now,
+            authorization_remote_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn public_session_returns_account_url_when_anonymous() {
+        let response = build_public_session_response("http://127.0.0.1:3001", None);
+        assert!(!response.authenticated);
+        assert!(!response.registered);
+        assert_eq!(response.username, None);
+        assert_eq!(
+            response.account_url.as_deref(),
+            Some("http://127.0.0.1:3001/account")
+        );
+    }
+
+    #[test]
+    fn public_session_returns_account_url_when_registration_is_pending() {
+        let session = sample_session("pending", None);
+        let response = build_public_session_response("http://127.0.0.1:3001/", Some(&session));
+        assert!(response.authenticated);
+        assert!(!response.registered);
+        assert_eq!(
+            response.account_url.as_deref(),
+            Some("http://127.0.0.1:3001/account")
+        );
+        assert_eq!(response.expires_at, Some(session.expires_at));
+    }
+
+    #[test]
+    fn public_session_hides_account_url_when_registered() {
+        let session = sample_session("active", Some("demo_user"));
+        let response = build_public_session_response("http://127.0.0.1:3001", Some(&session));
+        assert!(response.authenticated);
+        assert!(response.registered);
+        assert_eq!(response.username.as_deref(), Some("demo_user"));
+        assert_eq!(response.account_url, None);
+    }
+
+    #[test]
+    fn require_registered_session_rejects_pending_registration() {
+        let session = ActiveSession {
+            record: sample_session("pending", None),
+        };
+        let error = require_registered_session(Some(Extension(session))).unwrap_err();
+        assert!(matches!(error, AppError::Unauthorized(_)));
+        assert_eq!(error.to_string(), "registration must be completed");
+    }
 }

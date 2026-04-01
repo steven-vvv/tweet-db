@@ -125,9 +125,6 @@ pub struct SsoSection {
     pub issuer: String,
     pub client_id: String,
     pub login_redirect_uri: String,
-    pub source_login_url: String,
-    pub source_register_url: String,
-    pub source_manage_url: String,
     pub authorization_cache_ttl_seconds: i64,
 }
 

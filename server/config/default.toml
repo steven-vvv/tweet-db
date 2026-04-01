@@ -19,9 +19,6 @@ pending_login_ttl_seconds = 600
 issuer = "http://127.0.0.1:3000"
 client_id = "tweet-db"
 login_redirect_uri = "http://127.0.0.1:3001/integrations/sso/callback"
-source_login_url = "http://127.0.0.1:3000/login"
-source_register_url = "http://127.0.0.1:3000/register"
-source_manage_url = "http://127.0.0.1:3000/account"
 authorization_cache_ttl_seconds = 300
 
 [ingest]

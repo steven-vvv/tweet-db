@@ -2,6 +2,8 @@
 
 Centralized post capture storage and status service built with Axum, PostgreSQL, and Vue.
 
+The expected integration model is a Tampermonkey script using `GM_*` privileged network APIs as a centralized client for this service. Public API consumers only need one session-check endpoint plus post ingest/query endpoints; login and first-time registration are handled separately through the built-in `/account` SPA.
+
 ## API Docs
 
 - [`docs/public-api.md`](docs/public-api.md): public business API under `/api/v1/...`
@@ -11,4 +13,4 @@ Centralized post capture storage and status service built with Axum, PostgreSQL,
 ## Layout
 
 - `server/`: Rust backend and database migrations
-- `webui/`: minimal Vue frontend for login, registration, and account status
+- `webui/`: minimal Vue frontend for the single `/account` entrypoint and account state

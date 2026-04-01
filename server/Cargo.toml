@@ -30,3 +30,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.5.4"
 uuid = { version = "1.16.0", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5.2", features = ["util"] }

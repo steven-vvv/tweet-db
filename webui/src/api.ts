@@ -1,11 +1,19 @@
-export type SessionMeResponse = {
+export type PublicSessionResponse = {
   authenticated: boolean
   registered: boolean
   username: string | null
   expires_at: string | null
-  source_login_url: string
-  source_register_url: string
-  source_manage_url: string
+  account_url: string | null
+}
+
+export type InternalSessionResponse = {
+  authenticated: boolean
+  registered: boolean
+  user_id: string | null
+  username: string | null
+  subject_id: string | null
+  authorization_id: string | null
+  expires_at: string | null
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -26,29 +34,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export function fetchSession(): Promise<SessionMeResponse> {
-  return request<SessionMeResponse>('/api/v1/session', {
+export function fetchPublicSession(): Promise<PublicSessionResponse> {
+  return request<PublicSessionResponse>('/api/v1/session', {
     method: 'GET',
   })
 }
 
-export async function fetchLoginUrl(): Promise<string> {
-  const response = await request<{ login_url: string }>('/api/v1/auth/login-url', {
-    method: 'POST',
-    body: JSON.stringify({}),
+export function fetchInternalSession(): Promise<InternalSessionResponse> {
+  return request<InternalSessionResponse>('/internal/v1/session', {
+    method: 'GET',
   })
-  return response.login_url
 }
 
 export function completeRegistration(username: string) {
-  return request<{ user_id: string; username: string }>('/api/v1/auth/registration', {
+  return request<{ user_id: string; username: string }>('/internal/v1/auth/registration', {
     method: 'POST',
     body: JSON.stringify({ username }),
   })
 }
 
 export function logout() {
-  return request<{ ok: boolean }>('/api/v1/session', {
+  return request<{ ok: boolean }>('/internal/v1/session', {
     method: 'DELETE',
   })
 }

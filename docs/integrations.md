@@ -8,9 +8,8 @@ SSO 登录回调入口。外部 SSO 提供方完成授权后重定向到该路�
 
 当前行为：
 
-- 成功且已完成本地绑定时，重定向到 `/account`
-- 成功但尚未完成本地绑定时，重定向到 `/register`
-- 上游返回错误时，重定向到 `/login?error=<error>`
+- 成功后统一重定向到 `/account`
+- 上游返回错误时，重定向到 `/account?error=<error>`
 
 ## `POST /integrations/sso/webhooks/revocations`
 
