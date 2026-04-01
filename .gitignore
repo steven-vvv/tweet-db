@@ -3,5 +3,6 @@ server/.env
 webui/node_modules/
 webui/dist/
 .codex/
+.db-certs/
 *.log
 .DS_Store
