@@ -4,7 +4,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -221,6 +221,8 @@ struct ProcessOutcome {
     transfer_jobs_enqueued: i32,
 }
 
+type DbTx<'a> = Transaction<'a, Postgres>;
+
 pub async fn ingest_submission(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -266,7 +268,22 @@ pub async fn ingest_submission(
     );
 
     for user in &users.items {
-        match process_actor(&state.db, submission_id, &source_kind, user, now).await {
+        match process_actor(
+            &state.db,
+            submission_id,
+            &source_kind,
+            user,
+            now,
+            time::Duration::seconds(
+                state
+                    .settings
+                    .config
+                    .ingest
+                    .actor_metrics_min_interval_seconds,
+            ),
+        )
+        .await
+        {
             Ok(outcome) if outcome.accepted => {
                 accepted_count += 1;
                 transfer_jobs_enqueued += outcome.transfer_jobs_enqueued;
@@ -579,21 +596,23 @@ async fn process_actor(
     source_kind: &str,
     item: &XUserInput,
     observed_at: OffsetDateTime,
+    metrics_min_interval: time::Duration,
 ) -> AppResult<ProcessOutcome> {
     let actor_id = item.id.trim();
     if actor_id.is_empty() {
         return Ok(ProcessOutcome::default());
     }
 
-    upsert_actor_head(pool, submission_id, source_kind, actor_id, observed_at).await?;
+    let mut tx = pool.begin().await?;
 
+    upsert_actor_head(&mut tx, submission_id, source_kind, actor_id, observed_at).await?;
     let avatar_media =
-        register_actor_avatar_media(pool, submission_id, source_kind, item, observed_at).await?;
+        register_actor_avatar_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
     let banner_media =
-        register_actor_banner_media(pool, submission_id, source_kind, item, observed_at).await?;
+        register_actor_banner_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
 
     sync_actor_profile_version(
-        pool,
+        &mut tx,
         submission_id,
         source_kind,
         item,
@@ -603,7 +622,16 @@ async fn process_actor(
     )
     .await?;
 
-    insert_actor_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    insert_actor_metric_observation(
+        &mut tx,
+        submission_id,
+        source_kind,
+        item,
+        observed_at,
+        metrics_min_interval,
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(ProcessOutcome {
         accepted: true,
@@ -632,9 +660,11 @@ async fn process_post(
         return Ok(ProcessOutcome::default());
     }
 
-    upsert_post(pool, submission_id, source_kind, item, observed_at).await?;
-    replace_post_media(pool, source_kind, item).await?;
-    insert_post_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    let mut tx = pool.begin().await?;
+    upsert_post(&mut tx, submission_id, source_kind, item, observed_at).await?;
+    replace_post_media(&mut tx, source_kind, item).await?;
+    insert_post_metric_observation(&mut tx, submission_id, source_kind, item, observed_at).await?;
+    tx.commit().await?;
 
     Ok(ProcessOutcome {
         accepted: true,
@@ -653,10 +683,11 @@ async fn process_media(
         return Ok(ProcessOutcome::default());
     }
 
+    let mut tx = pool.begin().await?;
     let managed_media =
-        register_post_media(pool, submission_id, source_kind, item, observed_at).await?;
+        register_post_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
     upsert_post_media_source(
-        pool,
+        &mut tx,
         submission_id,
         source_kind,
         item,
@@ -664,7 +695,8 @@ async fn process_media(
         observed_at,
     )
     .await?;
-    replace_media_variants(pool, source_kind, item).await?;
+    replace_media_variants(&mut tx, source_kind, item).await?;
+    tx.commit().await?;
 
     Ok(ProcessOutcome {
         accepted: true,
@@ -673,7 +705,7 @@ async fn process_media(
 }
 
 async fn upsert_actor_head(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     actor_id: &str,
@@ -700,14 +732,14 @@ async fn upsert_actor_head(
     .bind(actor_id)
     .bind(submission_id)
     .bind(observed_at)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
 async fn sync_actor_profile_version(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XUserInput,
@@ -717,20 +749,20 @@ async fn sync_actor_profile_version(
 ) -> AppResult<()> {
     let actor_id = item.id.trim();
     let fingerprint = actor_profile_fingerprint(item)?;
-    let current = fetch_current_actor_profile_version(pool, source_kind, actor_id).await?;
+    let current = fetch_current_actor_profile_version(tx, source_kind, actor_id).await?;
 
     if let Some(current) = current.as_ref() {
         if current.profile_fingerprint == fingerprint {
             return Ok(());
         }
 
-        close_actor_profile_version(pool, current.id, observed_at).await?;
+        close_actor_profile_version(tx, current.id, observed_at).await?;
     }
 
     let version_id = Uuid::now_v7();
     let version_no = current.map(|item| item.version_no + 1).unwrap_or(1);
     insert_actor_profile_version(
-        pool,
+        tx,
         version_id,
         submission_id,
         source_kind,
@@ -743,7 +775,7 @@ async fn sync_actor_profile_version(
     )
     .await?;
     set_actor_current_profile_version(
-        pool,
+        tx,
         source_kind,
         actor_id,
         version_id,
@@ -756,7 +788,7 @@ async fn sync_actor_profile_version(
 }
 
 async fn fetch_current_actor_profile_version(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     source_kind: &str,
     actor_id: &str,
 ) -> AppResult<Option<CurrentActorProfileVersionRow>> {
@@ -774,7 +806,7 @@ async fn fetch_current_actor_profile_version(
     )
     .bind(source_kind)
     .bind(actor_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
 
     Ok(row.and_then(|row| {
@@ -789,7 +821,7 @@ async fn fetch_current_actor_profile_version(
 }
 
 async fn close_actor_profile_version(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     version_id: Uuid,
     effective_to: OffsetDateTime,
 ) -> AppResult<()> {
@@ -803,7 +835,7 @@ async fn close_actor_profile_version(
     )
     .bind(version_id)
     .bind(effective_to)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
@@ -811,7 +843,7 @@ async fn close_actor_profile_version(
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_actor_profile_version(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     version_id: Uuid,
     submission_id: Uuid,
     source_kind: &str,
@@ -879,14 +911,14 @@ async fn insert_actor_profile_version(
     .bind(item.created_at.trim())
     .bind(avatar_media_id)
     .bind(banner_media_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
 async fn set_actor_current_profile_version(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     source_kind: &str,
     actor_id: &str,
     version_id: Uuid,
@@ -909,19 +941,25 @@ async fn set_actor_current_profile_version(
     .bind(version_id)
     .bind(submission_id)
     .bind(observed_at)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
 async fn insert_actor_metric_observation(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XUserInput,
     observed_at: OffsetDateTime,
+    min_interval: time::Duration,
 ) -> AppResult<()> {
+    let latest = fetch_latest_actor_metric_observation(tx, source_kind, item.id.trim()).await?;
+    if !should_insert_actor_metric_observation(latest.as_ref(), item, observed_at, min_interval) {
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
         INSERT INTO actor_metric_observations (
@@ -957,14 +995,74 @@ async fn insert_actor_metric_observation(
     .bind(item.statuses_count)
     .bind(item.media_count)
     .bind(item.listed_count)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
+async fn fetch_latest_actor_metric_observation(
+    tx: &mut DbTx<'_>,
+    source_kind: &str,
+    actor_id: &str,
+) -> AppResult<Option<LatestActorMetricObservationRow>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            observed_at,
+            followers_count,
+            friends_count,
+            favourites_count,
+            statuses_count,
+            media_count,
+            listed_count
+        FROM actor_metric_observations
+        WHERE source_kind = $1
+          AND source_actor_id = $2
+        ORDER BY observed_at DESC, created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(source_kind)
+    .bind(actor_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(row.map(|row| LatestActorMetricObservationRow {
+        observed_at: row.get("observed_at"),
+        followers_count: row.get("followers_count"),
+        friends_count: row.get("friends_count"),
+        favourites_count: row.get("favourites_count"),
+        statuses_count: row.get("statuses_count"),
+        media_count: row.get("media_count"),
+        listed_count: row.get("listed_count"),
+    }))
+}
+
+fn should_insert_actor_metric_observation(
+    latest: Option<&LatestActorMetricObservationRow>,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+    min_interval: time::Duration,
+) -> bool {
+    let Some(latest) = latest else {
+        return true;
+    };
+
+    actor_metrics_changed(latest, item) || observed_at - latest.observed_at >= min_interval
+}
+
+fn actor_metrics_changed(latest: &LatestActorMetricObservationRow, item: &XUserInput) -> bool {
+    latest.followers_count != item.followers_count
+        || latest.friends_count != item.friends_count
+        || latest.favourites_count != item.favourites_count
+        || latest.statuses_count != item.statuses_count
+        || latest.media_count != item.media_count
+        || latest.listed_count != item.listed_count
+}
+
 async fn upsert_post(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XTweetInput,
@@ -1033,13 +1131,17 @@ async fn upsert_post(
     .bind(item.source.trim())
     .bind(submission_id)
     .bind(observed_at)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
-async fn replace_post_media(pool: &PgPool, source_kind: &str, item: &XTweetInput) -> AppResult<()> {
+async fn replace_post_media(
+    tx: &mut DbTx<'_>,
+    source_kind: &str,
+    item: &XTweetInput,
+) -> AppResult<()> {
     let post_id = item.id.trim();
     sqlx::query(
         r#"
@@ -1050,7 +1152,7 @@ async fn replace_post_media(pool: &PgPool, source_kind: &str, item: &XTweetInput
     )
     .bind(source_kind)
     .bind(post_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     let media_ids = unique_nonempty_strings(&item.media_ids);
@@ -1070,7 +1172,7 @@ async fn replace_post_media(pool: &PgPool, source_kind: &str, item: &XTweetInput
         .bind(post_id)
         .bind(media_id)
         .bind(position as i32)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -1078,7 +1180,7 @@ async fn replace_post_media(pool: &PgPool, source_kind: &str, item: &XTweetInput
 }
 
 async fn insert_post_metric_observation(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XTweetInput,
@@ -1119,13 +1221,13 @@ async fn insert_post_metric_observation(
     .bind(item.reply_count)
     .bind(item.quote_count)
     .bind(item.bookmark_count)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 async fn register_post_media(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XMediaInput,
@@ -1153,11 +1255,11 @@ async fn register_post_media(
         observed_at,
     };
 
-    media::register_managed_media(pool, &spec).await
+    media::register_managed_media(tx, &spec).await
 }
 
 async fn register_actor_avatar_media(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XUserInput,
@@ -1180,11 +1282,11 @@ async fn register_actor_avatar_media(
         observed_at,
     };
 
-    media::register_managed_media(pool, &spec).await.map(Some)
+    media::register_managed_media(tx, &spec).await.map(Some)
 }
 
 async fn register_actor_banner_media(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XUserInput,
@@ -1210,11 +1312,11 @@ async fn register_actor_banner_media(
         observed_at,
     };
 
-    media::register_managed_media(pool, &spec).await.map(Some)
+    media::register_managed_media(tx, &spec).await.map(Some)
 }
 
 async fn upsert_post_media_source(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
     item: &XMediaInput,
@@ -1287,14 +1389,14 @@ async fn upsert_post_media_source(
     .bind(item.duration_ms)
     .bind(submission_id)
     .bind(observed_at)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
 }
 
 async fn replace_media_variants(
-    pool: &PgPool,
+    tx: &mut DbTx<'_>,
     source_kind: &str,
     item: &XMediaInput,
 ) -> AppResult<()> {
@@ -1308,7 +1410,7 @@ async fn replace_media_variants(
     )
     .bind(source_kind)
     .bind(media_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     let variants = unique_video_variants(&item.video_variants);
@@ -1332,7 +1434,7 @@ async fn replace_media_variants(
         .bind(position as i32)
         .bind(variant.bitrate)
         .bind(variant.content_type.trim())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -1430,6 +1532,17 @@ struct CurrentActorProfileVersionRow {
     id: Uuid,
     version_no: i64,
     profile_fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+struct LatestActorMetricObservationRow {
+    observed_at: OffsetDateTime,
+    followers_count: i64,
+    friends_count: i64,
+    favourites_count: i64,
+    statuses_count: i64,
+    media_count: i64,
+    listed_count: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1899,6 +2012,57 @@ mod tests {
         changed.avatar_url = "https://example.com/avatar2_normal.jpg".to_owned();
         let changed_avatar = actor_profile_fingerprint(&changed).unwrap();
         assert_ne!(left, changed_avatar);
+    }
+
+    #[test]
+    fn actor_metric_observation_requires_change_or_interval() {
+        let observed_at = OffsetDateTime::now_utc();
+        let latest = LatestActorMetricObservationRow {
+            observed_at: observed_at - time::Duration::hours(1),
+            followers_count: 10,
+            friends_count: 20,
+            favourites_count: 30,
+            statuses_count: 40,
+            media_count: 50,
+            listed_count: 60,
+        };
+        let item = XUserInput {
+            id: "u1".to_owned(),
+            followers_count: 10,
+            friends_count: 20,
+            favourites_count: 30,
+            statuses_count: 40,
+            media_count: 50,
+            listed_count: 60,
+            ..Default::default()
+        };
+
+        assert!(!should_insert_actor_metric_observation(
+            Some(&latest),
+            &item,
+            observed_at,
+            time::Duration::hours(24),
+        ));
+
+        let mut changed = item.clone();
+        changed.followers_count = 11;
+        assert!(should_insert_actor_metric_observation(
+            Some(&latest),
+            &changed,
+            observed_at,
+            time::Duration::hours(24),
+        ));
+
+        let older = LatestActorMetricObservationRow {
+            observed_at: observed_at - time::Duration::hours(24),
+            ..latest
+        };
+        assert!(should_insert_actor_metric_observation(
+            Some(&older),
+            &item,
+            observed_at,
+            time::Duration::hours(24),
+        ));
     }
 
     #[test]

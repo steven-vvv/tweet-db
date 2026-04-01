@@ -1,4 +1,4 @@
-use sqlx::{PgPool, Row};
+use sqlx::{Postgres, Row, Transaction};
 use time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
@@ -63,7 +63,7 @@ pub struct ManagedMediaRecord {
 }
 
 pub async fn register_managed_media(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     spec: &ManagedMediaSpec,
 ) -> AppResult<ManagedMediaRecord> {
     let identity_value = spec.identity_value.trim();
@@ -124,12 +124,12 @@ pub async fn register_managed_media(
     .bind(trimmed_or_empty(&spec.content_type_hint))
     .bind(spec.submission_id)
     .bind(spec.observed_at)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
 
     let media_id: Uuid = row.get("id");
     let transfer_enqueued = transfer::enqueue_media_transfer(
-        pool,
+        tx,
         media_id,
         spec.source_kind.trim(),
         fetch_url,

@@ -19,6 +19,7 @@ CREATE TABLE media_transfer_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     leased_at TIMESTAMPTZ,
+    lease_expires_at TIMESTAMPTZ,
     storage_object_id UUID REFERENCES storage_objects(id) ON DELETE SET NULL,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -26,8 +27,8 @@ CREATE TABLE media_transfer_jobs (
     UNIQUE (media_id)
 );
 
-CREATE INDEX idx_media_transfer_jobs_status_next_run_at
-ON media_transfer_jobs (status, next_run_at);
+CREATE INDEX idx_media_transfer_jobs_status_schedule
+ON media_transfer_jobs (status, next_run_at, lease_expires_at);
 
 CREATE TABLE media_transfer_attempts (
     id UUID PRIMARY KEY,

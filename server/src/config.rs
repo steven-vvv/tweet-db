@@ -131,6 +131,7 @@ pub struct SsoSection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestSection {
     pub max_items_per_batch: usize,
+    pub actor_metrics_min_interval_seconds: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,10 +146,15 @@ pub struct StorageSection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransferSection {
     pub enabled: bool,
+    pub worker_count: usize,
     pub chunk_size_bytes: usize,
     pub download_parallelism: usize,
     pub upload_parallelism: usize,
     pub max_in_flight_parts: usize,
+    pub connect_timeout_seconds: u64,
+    pub read_timeout_seconds: u64,
+    pub attempt_timeout_seconds: u64,
+    pub memory_budget_bytes: usize,
     pub worker_poll_interval_seconds: u64,
     pub max_attempts: i32,
 }

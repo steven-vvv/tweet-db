@@ -7,14 +7,16 @@ use crate::{
     config::Settings,
     error::AppResult,
     frontend, routes,
-    state::{AppState, build_http_client, connect_db},
+    state::{AppState, build_auth_http_client, build_transfer_http_client, connect_db},
     transfer,
 };
 
 pub async fn build_app(settings: Settings) -> AppResult<Router> {
     let db = connect_db(&settings).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
-    let state = AppState::new(settings, db, build_http_client()?);
+    let auth_http_client = build_auth_http_client()?;
+    let transfer_http_client = build_transfer_http_client(&settings)?;
+    let state = AppState::new(settings, db, auth_http_client, transfer_http_client);
     transfer::spawn_worker(state.clone());
 
     let app = Router::new()

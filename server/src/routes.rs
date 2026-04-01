@@ -118,6 +118,7 @@ mod tests {
                 },
                 ingest: IngestSection {
                     max_items_per_batch: 5000,
+                    actor_metrics_min_interval_seconds: 86_400,
                 },
                 storage: StorageSection {
                     provider: "s3_compatible".to_owned(),
@@ -128,10 +129,15 @@ mod tests {
                 },
                 transfer: TransferSection {
                     enabled: false,
+                    worker_count: 1,
                     chunk_size_bytes: 1,
                     download_parallelism: 1,
                     upload_parallelism: 1,
                     max_in_flight_parts: 1,
+                    connect_timeout_seconds: 5,
+                    read_timeout_seconds: 30,
+                    attempt_timeout_seconds: 300,
+                    memory_budget_bytes: 1,
                     worker_poll_interval_seconds: 5,
                     max_attempts: 1,
                 },
@@ -153,6 +159,7 @@ mod tests {
             PgPoolOptions::new()
                 .connect_lazy("postgres://postgres:postgres@127.0.0.1/tweet_db")
                 .unwrap(),
+            Client::new(),
             Client::new(),
         )
     }

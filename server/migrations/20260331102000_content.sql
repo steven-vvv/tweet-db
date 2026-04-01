@@ -86,6 +86,12 @@ CREATE TABLE actor_profile_versions (
         ON DELETE CASCADE
 );
 
+ALTER TABLE actors
+ADD CONSTRAINT fk_actors_current_profile_version
+FOREIGN KEY (current_profile_version_id)
+REFERENCES actor_profile_versions(id)
+ON DELETE SET NULL;
+
 CREATE INDEX idx_actor_profile_versions_actor_id
 ON actor_profile_versions (source_kind, source_actor_id, effective_from DESC);
 

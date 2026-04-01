@@ -23,6 +23,7 @@ authorization_cache_ttl_seconds = 300
 
 [ingest]
 max_items_per_batch = 5000
+actor_metrics_min_interval_seconds = 86400
 
 [storage]
 provider = "s3_compatible"
@@ -33,10 +34,15 @@ path_style = true
 
 [transfer]
 enabled = true
+worker_count = 2
 chunk_size_bytes = 10485760
 download_parallelism = 4
 upload_parallelism = 4
 max_in_flight_parts = 8
+connect_timeout_seconds = 5
+read_timeout_seconds = 30
+attempt_timeout_seconds = 300
+memory_budget_bytes = 134217728
 worker_poll_interval_seconds = 5
 max_attempts = 8
 

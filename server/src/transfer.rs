@@ -1,4 +1,4 @@
-use std::{cmp, collections::HashMap, sync::Arc};
+use std::{cmp, collections::HashMap, sync::Arc, time::Duration as StdDuration};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -13,9 +13,9 @@ use reqwest::{
     header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use time::OffsetDateTime;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 use uuid::Uuid;
 
@@ -32,6 +32,13 @@ struct TransferJob {
     fetch_url: String,
     content_type_hint: String,
     attempt_count: i32,
+    reclaimed_from_lease: bool,
+}
+
+#[derive(Clone)]
+struct TransferRuntime {
+    s3_client: Client,
+    buffer_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,36 +75,26 @@ pub fn spawn_worker(state: AppState) {
     }
 
     tokio::spawn(async move {
-        let client = match build_s3_client(&state).await {
-            Ok(client) => client,
+        let runtime = match build_transfer_runtime(&state).await {
+            Ok(runtime) => runtime,
             Err(error) => {
-                tracing::warn!("transfer worker failed to build S3 client: {error}");
+                tracing::warn!("transfer worker failed to initialize runtime: {error}");
                 return;
             }
         };
 
-        let poll_interval = std::time::Duration::from_secs(
-            state.settings.config.transfer.worker_poll_interval_seconds,
-        );
-        loop {
-            match claim_next_job(&state.db).await {
-                Ok(Some(job)) => {
-                    if let Err(error) = process_job(&state, &client, job).await {
-                        tracing::warn!("transfer job processing failed: {error}");
-                    }
-                }
-                Ok(None) => tokio::time::sleep(poll_interval).await,
-                Err(error) => {
-                    tracing::warn!("transfer worker poll failed: {error}");
-                    tokio::time::sleep(poll_interval).await;
-                }
-            }
+        for worker_id in 0..state.settings.config.transfer.worker_count.max(1) {
+            let state = state.clone();
+            let runtime = runtime.clone();
+            tokio::spawn(async move {
+                run_worker_loop(state, runtime, worker_id).await;
+            });
         }
     });
 }
 
 pub async fn enqueue_media_transfer(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     media_id: Uuid,
     source_kind: &str,
     fetch_url: &str,
@@ -116,7 +113,7 @@ pub async fn enqueue_media_transfer(
         "#,
     )
     .bind(media_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
 
     let should_enqueue = match existing.as_ref() {
@@ -150,7 +147,7 @@ pub async fn enqueue_media_transfer(
         .bind(source_kind)
         .bind(fetch_url)
         .bind(content_type_hint.unwrap_or_default().trim())
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
         return Ok(true);
     }
@@ -174,14 +171,9 @@ pub async fn enqueue_media_transfer(
                 WHEN $5 = 'pending' THEN NOW()
                 ELSE next_run_at
             END,
-            leased_at = CASE
-                WHEN $5 = 'pending' THEN NULL
-                ELSE leased_at
-            END,
-            last_error = CASE
-                WHEN $5 = 'pending' THEN NULL
-                ELSE last_error
-            END,
+            leased_at = NULL,
+            lease_expires_at = NULL,
+            last_error = NULL,
             updated_at = NOW()
         WHERE media_id = $1
         "#,
@@ -191,7 +183,7 @@ pub async fn enqueue_media_transfer(
     .bind(fetch_url)
     .bind(content_type_hint.unwrap_or_default().trim())
     .bind(status)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
 
     Ok(should_enqueue)
@@ -266,21 +258,59 @@ async fn build_s3_client(state: &AppState) -> AppResult<Client> {
     Ok(Client::from_conf(config))
 }
 
-async fn claim_next_job(pool: &PgPool) -> AppResult<Option<TransferJob>> {
+async fn build_transfer_runtime(state: &AppState) -> AppResult<TransferRuntime> {
+    Ok(TransferRuntime {
+        s3_client: build_s3_client(state).await?,
+        buffer_permits: Arc::new(Semaphore::new(buffer_permit_count(state))),
+    })
+}
+
+async fn run_worker_loop(state: AppState, runtime: TransferRuntime, worker_id: usize) {
+    let poll_interval =
+        StdDuration::from_secs(state.settings.config.transfer.worker_poll_interval_seconds);
+
+    loop {
+        match claim_next_job(&state.db, lease_duration(&state)).await {
+            Ok(Some(job)) => {
+                if let Err(error) = process_job(&state, &runtime, job).await {
+                    tracing::warn!("transfer worker {worker_id} processing failed: {error}");
+                }
+            }
+            Ok(None) => tokio::time::sleep(poll_interval).await,
+            Err(error) => {
+                tracing::warn!("transfer worker {worker_id} poll failed: {error}");
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
+}
+
+async fn claim_next_job(
+    pool: &PgPool,
+    lease_duration: time::Duration,
+) -> AppResult<Option<TransferJob>> {
+    let lease_expires_at = OffsetDateTime::now_utc() + lease_duration;
     let row = sqlx::query(
         r#"
         WITH picked AS (
-            SELECT id
+            SELECT id, status AS previous_status
             FROM media_transfer_jobs
-            WHERE status IN ('pending', 'retryable')
-              AND next_run_at <= NOW()
-            ORDER BY next_run_at ASC, created_at ASC
+            WHERE (
+                    status IN ('pending', 'retryable')
+                AND next_run_at <= NOW()
+            ) OR (
+                    status = 'processing'
+                AND lease_expires_at IS NOT NULL
+                AND lease_expires_at <= NOW()
+            )
+            ORDER BY COALESCE(lease_expires_at, next_run_at) ASC, created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
         UPDATE media_transfer_jobs j
         SET status = 'processing',
             leased_at = NOW(),
+            lease_expires_at = $1,
             updated_at = NOW()
         FROM picked
         WHERE j.id = picked.id
@@ -290,23 +320,56 @@ async fn claim_next_job(pool: &PgPool) -> AppResult<Option<TransferJob>> {
             j.source_kind,
             j.fetch_url,
             j.content_type_hint,
-            j.attempt_count
+            j.attempt_count,
+            picked.previous_status
         "#,
     )
+    .bind(lease_expires_at)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|row| TransferJob {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let job = TransferJob {
         id: row.get("id"),
         media_id: row.get("media_id"),
         source_kind: row.get("source_kind"),
         fetch_url: row.get("fetch_url"),
         content_type_hint: row.get("content_type_hint"),
         attempt_count: row.get("attempt_count"),
-    }))
+        reclaimed_from_lease: row.get::<String, _>("previous_status") == "processing",
+    };
+    if job.reclaimed_from_lease {
+        mark_stale_attempts_failed(pool, job.id).await?;
+    }
+
+    Ok(Some(job))
 }
 
-async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> AppResult<()> {
+async fn mark_stale_attempts_failed(pool: &PgPool, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE media_transfer_attempts
+        SET status = 'failed',
+            error = COALESCE(error, 'worker lease expired'),
+            finished_at = COALESCE(finished_at, NOW())
+        WHERE job_id = $1
+          AND status = 'running'
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn process_job(
+    state: &AppState,
+    runtime: &TransferRuntime,
+    job: TransferJob,
+) -> AppResult<()> {
     let attempt_id = Uuid::now_v7();
     sqlx::query(
         r#"
@@ -321,7 +384,18 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
     .execute(&state.db)
     .await?;
 
-    let result = upload_job(state, client, &job).await;
+    let attempt_timeout_seconds = state.settings.config.transfer.attempt_timeout_seconds;
+    let result = match tokio::time::timeout(
+        StdDuration::from_secs(attempt_timeout_seconds),
+        upload_job(state, runtime, &job),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(AppError::upstream(format!(
+            "transfer attempt timed out after {attempt_timeout_seconds} seconds"
+        ))),
+    };
     match result {
         Ok(outcome) => {
             let storage_object_id = upsert_storage_object(
@@ -343,6 +417,7 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
                     attempt_count = attempt_count + 1,
                     storage_object_id = $2,
                     leased_at = NULL,
+                    lease_expires_at = NULL,
                     last_error = NULL,
                     updated_at = NOW()
                 WHERE id = $1
@@ -386,6 +461,7 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
                     attempt_count = attempt_count + 1,
                     next_run_at = $3,
                     leased_at = NULL,
+                    lease_expires_at = NULL,
                     last_error = $4,
                     updated_at = NOW()
                 WHERE id = $1
@@ -428,12 +504,12 @@ struct UploadOutcome {
 
 async fn upload_job(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
 ) -> AppResult<UploadOutcome> {
     let chunk_size = state.settings.config.transfer.chunk_size_bytes.max(1);
     let response = state
-        .http_client
+        .transfer_http_client
         .get(&job.fetch_url)
         .header(RANGE, range_header_value(0, chunk_size as u64 - 1))
         .send()
@@ -447,21 +523,40 @@ async fn upload_job(
     }
 
     let content_type = response_content_type(&response, &job.content_type_hint);
+    let first_buffer_permit = acquire_buffer_permit(runtime).await?;
     if response.status() == StatusCode::PARTIAL_CONTENT {
-        return upload_from_ranged_probe(state, client, job, response, &content_type, chunk_size)
-            .await;
+        return upload_from_ranged_probe(
+            state,
+            runtime,
+            job,
+            response,
+            &content_type,
+            chunk_size,
+            first_buffer_permit,
+        )
+        .await;
     }
 
-    upload_from_full_response(state, client, job, response, &content_type, chunk_size).await
+    upload_from_full_response(
+        state,
+        runtime,
+        job,
+        response,
+        &content_type,
+        chunk_size,
+        first_buffer_permit,
+    )
+    .await
 }
 
 async fn upload_from_ranged_probe(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     response: Response,
     content_type: &str,
     chunk_size: usize,
+    first_buffer_permit: OwnedSemaphorePermit,
 ) -> AppResult<UploadOutcome> {
     let total_size = parse_total_size_from_content_range(&response);
     let first_part = response
@@ -471,19 +566,36 @@ async fn upload_from_ranged_probe(
         .to_vec();
 
     if first_part.len() < chunk_size {
-        return upload_single_object(state, client, job, first_part, content_type).await;
+        return upload_single_object(
+            state,
+            runtime,
+            job,
+            first_part,
+            first_buffer_permit,
+            content_type,
+        )
+        .await;
     }
 
     if let Some(total_size) = total_size {
         if total_size < chunk_size as u64 {
-            return upload_single_object(state, client, job, first_part, content_type).await;
+            return upload_single_object(
+                state,
+                runtime,
+                job,
+                first_part,
+                first_buffer_permit,
+                content_type,
+            )
+            .await;
         }
 
         return upload_multipart_parallel_from_ranges(
             state,
-            client,
+            runtime,
             job,
             first_part,
+            first_buffer_permit,
             total_size,
             content_type,
             chunk_size,
@@ -491,17 +603,26 @@ async fn upload_from_ranged_probe(
         .await;
     }
 
-    upload_multipart_from_unknown_ranges(state, client, job, first_part, content_type, chunk_size)
-        .await
+    upload_multipart_from_unknown_ranges(
+        state,
+        runtime,
+        job,
+        first_part,
+        first_buffer_permit,
+        content_type,
+        chunk_size,
+    )
+    .await
 }
 
 async fn upload_from_full_response(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     response: Response,
     content_type: &str,
     chunk_size: usize,
+    first_buffer_permit: OwnedSemaphorePermit,
 ) -> AppResult<UploadOutcome> {
     let mut stream = response.bytes_stream();
     let mut first_buffer = Vec::with_capacity(chunk_size);
@@ -515,7 +636,15 @@ async fn upload_from_full_response(
                 first_buffer.extend_from_slice(&chunk);
             }
             None => {
-                return upload_single_object(state, client, job, first_buffer, content_type).await;
+                return upload_single_object(
+                    state,
+                    runtime,
+                    job,
+                    first_buffer,
+                    first_buffer_permit,
+                    content_type,
+                )
+                .await;
             }
         }
     }
@@ -523,9 +652,10 @@ async fn upload_from_full_response(
     let remainder = first_buffer.split_off(chunk_size);
     upload_multipart_from_stream(
         state,
-        client,
+        runtime,
         job,
         first_buffer,
+        first_buffer_permit,
         remainder,
         stream,
         content_type,
@@ -536,13 +666,15 @@ async fn upload_from_full_response(
 
 async fn upload_single_object(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     bytes: Vec<u8>,
+    _buffer_permit: OwnedSemaphorePermit,
     content_type: &str,
 ) -> AppResult<UploadOutcome> {
     let object_key = build_object_key(job, content_type)?;
-    let response = client
+    let response = runtime
+        .s3_client
         .put_object()
         .bucket(&state.settings.config.storage.bucket)
         .key(&object_key)
@@ -564,26 +696,37 @@ async fn upload_single_object(
 
 async fn upload_multipart_parallel_from_ranges(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
+    _first_part_permit: OwnedSemaphorePermit,
     total_size: u64,
     content_type: &str,
     chunk_size: usize,
 ) -> AppResult<UploadOutcome> {
     let object_key = build_object_key(job, content_type)?;
-    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let upload_id =
+        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut completed_parts = Vec::new();
 
-    let first_completed =
-        match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
-            Ok(part) => part,
-            Err(error) => {
-                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
-                return Err(error);
-            }
-        };
+    let first_completed = match upload_part(
+        &runtime.s3_client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        1,
+        first_part,
+    )
+    .await
+    {
+        Ok(part) => part,
+        Err(error) => {
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    };
+    drop(_first_part_permit);
     completed_parts.push(NumberedCompletedPart {
         part_number: 1,
         part: first_completed,
@@ -599,8 +742,9 @@ async fn upload_multipart_parallel_from_ranges(
     ));
 
     let fetch_url = job.fetch_url.clone();
-    let http_client = state.http_client.clone();
-    let upload_client = client.clone();
+    let http_client = state.transfer_http_client.clone();
+    let upload_client = runtime.s3_client.clone();
+    let buffer_permits = runtime.buffer_permits.clone();
 
     let mut tasks = stream::iter(2..=total_parts)
         .map(|part_number| {
@@ -612,6 +756,7 @@ async fn upload_multipart_parallel_from_ranges(
             let upload_id = upload_id.clone();
             let download_limit = download_limit.clone();
             let upload_limit = upload_limit.clone();
+            let buffer_permits = buffer_permits.clone();
 
             async move {
                 let _download_permit = download_limit
@@ -620,6 +765,10 @@ async fn upload_multipart_parallel_from_ranges(
                     .map_err(|_| AppError::upstream("download semaphore closed"))?;
                 let start = ((part_number - 1) as u64) * chunk_size as u64;
                 let end = cmp::min(total_size, start + chunk_size as u64) - 1;
+                let _buffer_permit = buffer_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::upstream("buffer semaphore closed"))?;
                 let bytes = download_range_bytes(&http_client, &fetch_url, start, end).await?;
                 drop(_download_permit);
 
@@ -646,7 +795,7 @@ async fn upload_multipart_parallel_from_ranges(
         match result {
             Ok(part) => completed_parts.push(part),
             Err(error) => {
-                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
                 return Err(error);
             }
         }
@@ -661,7 +810,7 @@ async fn upload_multipart_parallel_from_ranges(
         .build();
 
     let response = match complete_multipart_upload(
-        client,
+        &runtime.s3_client,
         &bucket,
         &object_key,
         &upload_id,
@@ -671,7 +820,7 @@ async fn upload_multipart_parallel_from_ranges(
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
             return Err(error);
         }
     };
@@ -688,32 +837,45 @@ async fn upload_multipart_parallel_from_ranges(
 
 async fn upload_multipart_from_unknown_ranges(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
+    _first_part_permit: OwnedSemaphorePermit,
     content_type: &str,
     chunk_size: usize,
 ) -> AppResult<UploadOutcome> {
     let object_key = build_object_key(job, content_type)?;
-    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let upload_id =
+        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut parts = Vec::new();
     let mut total_bytes = first_part.len() as i64;
 
-    match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
+    match upload_part(
+        &runtime.s3_client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        1,
+        first_part,
+    )
+    .await
+    {
         Ok(part) => parts.push(part),
         Err(error) => {
-            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
             return Err(error);
         }
     }
+    drop(_first_part_permit);
 
     let mut next_start = chunk_size as u64;
     let mut part_number = 2_i32;
     loop {
         let end = next_start + chunk_size as u64 - 1;
+        let _buffer_permit = acquire_buffer_permit(runtime).await?;
         let bytes = match download_range_bytes_optional(
-            &state.http_client,
+            &state.transfer_http_client,
             &job.fetch_url,
             next_start,
             end,
@@ -723,17 +885,26 @@ async fn upload_multipart_from_unknown_ranges(
             Ok(Some(bytes)) => bytes,
             Ok(None) => break,
             Err(error) => {
-                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
                 return Err(error);
             }
         };
 
         total_bytes += bytes.len() as i64;
         let is_last = bytes.len() < chunk_size;
-        match upload_part(client, &bucket, &object_key, &upload_id, part_number, bytes).await {
+        match upload_part(
+            &runtime.s3_client,
+            &bucket,
+            &object_key,
+            &upload_id,
+            part_number,
+            bytes,
+        )
+        .await
+        {
             Ok(part) => parts.push(part),
             Err(error) => {
-                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
                 return Err(error);
             }
         }
@@ -750,7 +921,7 @@ async fn upload_multipart_from_unknown_ranges(
         .set_parts(Some(parts))
         .build();
     let response = match complete_multipart_upload(
-        client,
+        &runtime.s3_client,
         &bucket,
         &object_key,
         &upload_id,
@@ -760,7 +931,7 @@ async fn upload_multipart_from_unknown_ranges(
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
             return Err(error);
         }
     };
@@ -777,9 +948,10 @@ async fn upload_multipart_from_unknown_ranges(
 
 async fn upload_multipart_from_stream<S>(
     state: &AppState,
-    client: &Client,
+    runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
+    _stream_buffer_permit: OwnedSemaphorePermit,
     remainder: Vec<u8>,
     mut stream: S,
     content_type: &str,
@@ -789,15 +961,25 @@ where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
     let object_key = build_object_key(job, content_type)?;
-    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let upload_id =
+        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut parts = Vec::new();
     let mut total_bytes = first_part.len() as i64;
 
-    match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
+    match upload_part(
+        &runtime.s3_client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        1,
+        first_part,
+    )
+    .await
+    {
         Ok(part) => parts.push(part),
         Err(error) => {
-            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
             return Err(error);
         }
     }
@@ -814,7 +996,7 @@ where
             let current = std::mem::replace(&mut buffer, tail);
             total_bytes += current.len() as i64;
             match upload_part(
-                client,
+                &runtime.s3_client,
                 &bucket,
                 &object_key,
                 &upload_id,
@@ -825,7 +1007,8 @@ where
             {
                 Ok(part) => parts.push(part),
                 Err(error) => {
-                    let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                    let _ =
+                        abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
                     return Err(error);
                 }
             }
@@ -836,7 +1019,7 @@ where
     if !buffer.is_empty() {
         total_bytes += buffer.len() as i64;
         match upload_part(
-            client,
+            &runtime.s3_client,
             &bucket,
             &object_key,
             &upload_id,
@@ -847,7 +1030,7 @@ where
         {
             Ok(part) => parts.push(part),
             Err(error) => {
-                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
                 return Err(error);
             }
         }
@@ -858,7 +1041,7 @@ where
         .set_parts(Some(parts))
         .build();
     let response = match complete_multipart_upload(
-        client,
+        &runtime.s3_client,
         &bucket,
         &object_key,
         &upload_id,
@@ -868,7 +1051,7 @@ where
     {
         Ok(response) => response,
         Err(error) => {
-            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            let _ = abort_upload(&runtime.s3_client, &bucket, &object_key, &upload_id).await;
             return Err(error);
         }
     };
@@ -1082,6 +1265,34 @@ async fn download_range_bytes_optional(
         .map_err(|error| AppError::upstream(format!("failed to read range body: {error}")))
 }
 
+fn buffer_permit_count(state: &AppState) -> usize {
+    buffer_permit_count_for(
+        state.settings.config.transfer.memory_budget_bytes,
+        state.settings.config.transfer.chunk_size_bytes,
+    )
+}
+
+fn buffer_permit_count_for(memory_budget_bytes: usize, chunk_size_bytes: usize) -> usize {
+    let chunk_size = chunk_size_bytes.max(1);
+    let permits = memory_budget_bytes / chunk_size;
+    permits.max(1)
+}
+
+fn lease_duration(state: &AppState) -> time::Duration {
+    time::Duration::seconds(
+        i64::try_from(state.settings.config.transfer.attempt_timeout_seconds).unwrap_or(i64::MAX),
+    )
+}
+
+async fn acquire_buffer_permit(runtime: &TransferRuntime) -> AppResult<OwnedSemaphorePermit> {
+    runtime
+        .buffer_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::upstream("buffer semaphore closed"))
+}
+
 fn build_object_key(job: &TransferJob, content_type: &str) -> AppResult<String> {
     let now = OffsetDateTime::now_utc();
     let digest = hex_digest(&job.fetch_url);
@@ -1181,4 +1392,25 @@ fn response_content_type(response: &Response, hint: &str) -> String {
 struct NumberedCompletedPart {
     part_number: i32,
     part: CompletedPart,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_permit_count_has_floor_of_one() {
+        assert_eq!(buffer_permit_count_for(0, 1024), 1);
+        assert_eq!(buffer_permit_count_for(512, 1024), 1);
+        assert_eq!(buffer_permit_count_for(4096, 1024), 4);
+    }
+
+    #[test]
+    fn extension_for_object_prefers_query_format() {
+        let ext = extension_for_object(
+            "https://pbs.twimg.com/media/demo?format=png&name=orig",
+            "image/jpeg",
+        );
+        assert_eq!(ext, "png");
+    }
 }

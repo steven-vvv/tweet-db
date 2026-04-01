@@ -513,7 +513,7 @@ async fn exchange_code(
     code_verifier: &str,
 ) -> AppResult<SsoExchangeResponse> {
     let response = state
-        .http_client
+        .auth_http_client
         .post(format!(
             "{}/sso/exchange",
             state.settings.config.sso.issuer.trim_end_matches('/')
@@ -545,7 +545,7 @@ async fn check_authorization(
     authorization_id: Uuid,
 ) -> AppResult<Option<AuthorizationStatusResponse>> {
     let response = state
-        .http_client
+        .auth_http_client
         .get(format!(
             "{}/sso/authorizations/{}",
             state.settings.config.sso.issuer.trim_end_matches('/'),
@@ -573,7 +573,7 @@ async fn check_authorization(
 
 async fn revoke_authorization(state: &AppState, authorization_id: Uuid) -> AppResult<()> {
     let response = state
-        .http_client
+        .auth_http_client
         .delete(format!(
             "{}/sso/authorizations/{}",
             state.settings.config.sso.issuer.trim_end_matches('/'),
@@ -602,7 +602,7 @@ async fn register_revocation_webhook(state: &AppState) {
         state.settings.config.app.base_url.trim_end_matches('/')
     );
     match state
-        .http_client
+        .auth_http_client
         .put(format!(
             "{}/sso/authorizations/webhook",
             state.settings.config.sso.issuer.trim_end_matches('/')
