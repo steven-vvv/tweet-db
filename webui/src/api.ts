@@ -27,13 +27,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function fetchSession(): Promise<SessionMeResponse> {
-  return request<SessionMeResponse>('/api/session/me', {
+  return request<SessionMeResponse>('/api/v1/session', {
     method: 'GET',
   })
 }
 
 export async function fetchLoginUrl(): Promise<string> {
-  const response = await request<{ login_url: string }>('/api/auth/login-url', {
+  const response = await request<{ login_url: string }>('/api/v1/auth/login-url', {
     method: 'POST',
     body: JSON.stringify({}),
   })
@@ -41,15 +41,14 @@ export async function fetchLoginUrl(): Promise<string> {
 }
 
 export function completeRegistration(username: string) {
-  return request<{ user_id: string; username: string }>('/api/auth/register/complete', {
+  return request<{ user_id: string; username: string }>('/api/v1/auth/registration', {
     method: 'POST',
     body: JSON.stringify({ username }),
   })
 }
 
 export function logout() {
-  return request<{ ok: boolean }>('/api/session/logout', {
-    method: 'POST',
-    body: JSON.stringify({}),
+  return request<{ ok: boolean }>('/api/v1/session', {
+    method: 'DELETE',
   })
 }

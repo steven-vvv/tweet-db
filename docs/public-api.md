@@ -2,26 +2,71 @@
 
 本文档仅覆盖当前仓库已经实现、且面向前端或采集端直接调用的接口：
 
+- 登录引导与本地注册
 - 当前身份状态检查
 - 帖子数据接入
 - 帖子状态查询
 
-未纳入本文档的接口包括 SSO 回调、注销、注册完成、吊销回调，以及内部专用会话明细端点。
+未纳入本文档的接口包括内部专用 API，以及面向外部系统的 SSO 回调与 webhook。
 
 说明：
-内部一方功能如需读取 `user_id`、`subject_id`、`authorization_id` 等内部标识，请改用 `GET /api/internal/session/me`，不要继续依赖公开端点 `GET /api/session/me`。
+所有公开业务接口统一使用 `/api/v1/...` 前缀。内部接口请参见 `docs/internal-api.md`，集成入口请参见 `docs/integrations.md`。
 
 ## 通用约定
 
 - 服务默认监听地址为 `http://127.0.0.1:3001`。
 - 认证方式为基于 Cookie 的会话认证，默认会话 Cookie 名称为 `tweet_db_sid`。
-- 除 `GET /api/session/me` 外，本文档中的帖子类接口均要求“已登录且已完成注册绑定”的会话。
+- 除 `GET /api/v1/session` 外，本文档中的帖子类接口均要求“已登录且已完成注册绑定”的会话。
 - 错误响应统一为 JSON 结构：`{"error":"<message>"}`。
 - 帖子类接口中的 `sourceKind` 会在服务端做去空格并转小写处理。
 
 ## 1. 当前身份状态检查
 
-### `GET /api/session/me`
+### `POST /api/v1/auth/login-url`
+
+用于创建一次 SSO 登录跳转地址，并写入待完成登录的短期状态 Cookie。
+
+认证要求：
+无。
+
+成功响应示例：
+
+```json
+{
+  "login_url": "http://127.0.0.1:3000/sso/authorize?client_id=tweet-db&code_challenge=..."
+}
+```
+
+### `POST /api/v1/auth/registration`
+
+用于首登后完成本地用户名绑定。
+
+认证要求：
+需要有效会话，且当前会话处于“待注册绑定”状态。
+
+请求体示例：
+
+```json
+{
+  "username": "demo_user"
+}
+```
+
+成功响应示例：
+
+```json
+{
+  "user_id": "0195f1df-0d69-7f7d-8c24-0c1af2d75001",
+  "username": "demo_user"
+}
+```
+
+常见失败：
+
+- `400`：用户名长度或字符集不合法，或当前会话并非待注册状态。
+- `401`：`session required`。
+
+### `GET /api/v1/session`
 
 用于查询当前请求对应的登录状态、注册绑定状态，以及源站登录、注册、身份管理入口 URL。
 
@@ -66,9 +111,24 @@
 }
 ```
 
+### `DELETE /api/v1/session`
+
+用于注销当前会话，并尝试撤销对应 SSO 授权。
+
+认证要求：
+无。未登录时也允许调用。
+
+成功响应示例：
+
+```json
+{
+  "ok": true
+}
+```
+
 ## 2. 帖子数据接入
 
-### `POST /api/ingest/submissions`
+### `POST /api/v1/ingest/submissions`
 
 用于将一次采集批次中的帖子相关数据写入服务端，包括用户、帖子、媒体、抓包记录和时间线观测结果。
 
@@ -135,7 +195,7 @@
 
 ## 3. 帖子状态查询
 
-### `POST /api/posts/status/query`
+### `POST /api/v1/posts/status/query`
 
 用于按帖子 ID 批量查询服务端已保存的帖子、作者、媒体、时间线命中情况，以及媒体转存进度。
 

@@ -605,7 +605,7 @@ async fn revoke_authorization(state: &AppState, authorization_id: Uuid) -> AppRe
 
 async fn register_revocation_webhook(state: &AppState) {
     let callback_url = format!(
-        "{}/auth/sso/webhooks/revocations",
+        "{}/integrations/sso/webhooks/revocations",
         state.settings.config.app.base_url.trim_end_matches('/')
     );
     match state

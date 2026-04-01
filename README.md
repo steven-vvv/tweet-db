@@ -4,7 +4,9 @@ Centralized post capture storage and status service built with Axum, PostgreSQL,
 
 ## API Docs
 
-- [`docs/public-api.md`](docs/public-api.md): concise external API reference for session status and post-related operations
+- [`docs/public-api.md`](docs/public-api.md): public business API under `/api/v1/...`
+- [`docs/internal-api.md`](docs/internal-api.md): internal-only API under `/internal/v1/...`
+- [`docs/integrations.md`](docs/integrations.md): external integration entrypoints under `/integrations/...`
 
 ## Layout
 
