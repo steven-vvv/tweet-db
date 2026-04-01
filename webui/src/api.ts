@@ -1,11 +1,11 @@
 export type SessionMeResponse = {
   authenticated: boolean
   registered: boolean
-  user_id: string | null
   username: string | null
-  subject_id: string | null
-  authorization_id: string | null
   expires_at: string | null
+  source_login_url: string
+  source_register_url: string
+  source_manage_url: string
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -53,4 +53,3 @@ export function logout() {
     body: JSON.stringify({}),
   })
 }
-

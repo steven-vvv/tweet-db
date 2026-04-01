@@ -33,12 +33,27 @@ pub struct ActiveSession {
 pub struct SessionMeResponse {
     pub authenticated: bool,
     pub registered: bool,
+    pub username: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    pub source_login_url: String,
+    pub source_register_url: String,
+    pub source_manage_url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InternalSessionMeResponse {
+    pub authenticated: bool,
+    pub registered: bool,
     pub user_id: Option<Uuid>,
     pub username: Option<String>,
     pub subject_id: Option<Uuid>,
     pub authorization_id: Option<Uuid>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    pub source_login_url: String,
+    pub source_register_url: String,
+    pub source_manage_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,29 +249,17 @@ pub async fn sso_callback(
 }
 
 pub async fn session_me(
+    State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
 ) -> AppResult<Json<SessionMeResponse>> {
-    let Some(Extension(session)) = session else {
-        return Ok(Json(SessionMeResponse {
-            authenticated: false,
-            registered: false,
-            user_id: None,
-            username: None,
-            subject_id: None,
-            authorization_id: None,
-            expires_at: None,
-        }));
-    };
+    Ok(Json(build_public_session_me_response(&state, session)))
+}
 
-    Ok(Json(SessionMeResponse {
-        authenticated: true,
-        registered: session.record.registration_state == "active",
-        user_id: session.record.user_id,
-        username: session.record.username.clone(),
-        subject_id: Some(session.record.sso_subject_id),
-        authorization_id: Some(session.record.authorization_id),
-        expires_at: Some(session.record.expires_at),
-    }))
+pub async fn internal_session_me(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+) -> AppResult<Json<InternalSessionMeResponse>> {
+    Ok(Json(build_internal_session_me_response(&state, session)))
 }
 
 pub async fn register_complete(
@@ -645,6 +648,74 @@ fn normalize_username(raw: &str) -> AppResult<String> {
         ));
     }
     Ok(username.to_owned())
+}
+
+fn build_public_session_me_response(
+    state: &AppState,
+    session: Option<Extension<ActiveSession>>,
+) -> SessionMeResponse {
+    let source_login_url = state.settings.config.sso.source_login_url.clone();
+    let source_register_url = state.settings.config.sso.source_register_url.clone();
+    let source_manage_url = state.settings.config.sso.source_manage_url.clone();
+
+    let Some(Extension(session)) = session else {
+        return SessionMeResponse {
+            authenticated: false,
+            registered: false,
+            username: None,
+            expires_at: None,
+            source_login_url,
+            source_register_url,
+            source_manage_url,
+        };
+    };
+
+    SessionMeResponse {
+        authenticated: true,
+        registered: session.record.registration_state == "active",
+        username: session.record.username.clone(),
+        expires_at: Some(session.record.expires_at),
+        source_login_url,
+        source_register_url,
+        source_manage_url,
+    }
+}
+
+fn build_internal_session_me_response(
+    state: &AppState,
+    session: Option<Extension<ActiveSession>>,
+) -> InternalSessionMeResponse {
+    let source_login_url = state.settings.config.sso.source_login_url.clone();
+    let source_register_url = state.settings.config.sso.source_register_url.clone();
+    let source_manage_url = state.settings.config.sso.source_manage_url.clone();
+
+    let Some(Extension(session)) = session else {
+        return InternalSessionMeResponse {
+            authenticated: false,
+            registered: false,
+            user_id: None,
+            username: None,
+            subject_id: None,
+            authorization_id: None,
+            expires_at: None,
+            source_login_url,
+            source_register_url,
+            source_manage_url,
+        };
+    };
+
+    InternalSessionMeResponse {
+        authenticated: true,
+        registered: session.record.registration_state == "active",
+        user_id: session.record.user_id,
+        username: session.record.username.clone(),
+        subject_id: Some(session.record.sso_subject_id),
+        authorization_id: Some(session.record.authorization_id),
+        expires_at: Some(session.record.expires_at),
+        source_login_url,
+        source_register_url,
+        source_manage_url,
+    }
 }
 
 fn session_expires_at(

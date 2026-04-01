@@ -19,6 +19,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/api/auth/login-url", post(auth::login_url))
         .route("/auth/sso/callback", get(auth::sso_callback))
         .route("/api/session/me", get(auth::session_me))
+        .route("/api/internal/session/me", get(auth::internal_session_me))
         .route("/api/auth/register/complete", post(auth::register_complete))
         .route("/api/session/logout", post(auth::logout))
         .route("/api/ingest/submissions", post(content::ingest_submission))

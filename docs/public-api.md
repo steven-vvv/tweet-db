@@ -6,7 +6,10 @@
 - 帖子数据接入
 - 帖子状态查询
 
-未纳入本文档的接口包括 SSO 回调、注销、注册完成、吊销回调等辅助流程端点。
+未纳入本文档的接口包括 SSO 回调、注销、注册完成、吊销回调，以及内部专用会话明细端点。
+
+说明：
+内部一方功能如需读取 `user_id`、`subject_id`、`authorization_id` 等内部标识，请改用 `GET /api/internal/session/me`，不要继续依赖公开端点 `GET /api/session/me`。
 
 ## 通用约定
 
@@ -20,7 +23,7 @@
 
 ### `GET /api/session/me`
 
-用于查询当前请求对应的登录状态、注册绑定状态，以及与 SSO 会话关联的身份信息。
+用于查询当前请求对应的登录状态、注册绑定状态，以及源站登录、注册、身份管理入口 URL。
 
 认证要求：
 无。未登录时也会返回 `200`，但 `authenticated=false`。
@@ -31,11 +34,11 @@
 {
   "authenticated": true,
   "registered": true,
-  "user_id": "0195f1df-0d69-7f7d-8c24-0c1af2d75001",
   "username": "demo_user",
-  "subject_id": "0195f1de-fce0-7d91-b86d-7d7e8f2c1001",
-  "authorization_id": "0195f1df-0730-7f69-9a92-cd8e4eb4d001",
-  "expires_at": "2026-04-01T08:00:00Z"
+  "expires_at": "2026-04-01T08:00:00Z",
+  "source_login_url": "http://127.0.0.1:3000/login",
+  "source_register_url": "http://127.0.0.1:3000/register",
+  "source_manage_url": "http://127.0.0.1:3000/account"
 }
 ```
 
@@ -43,10 +46,11 @@
 
 - `authenticated`：当前是否存在有效会话。
 - `registered`：当前会话是否已经完成本地账号绑定。帖子类接口要求该值为 `true`。
-- `user_id` / `username`：本地用户信息。未完成注册时为 `null`。
-- `subject_id`：SSO 侧主体标识。
-- `authorization_id`：当前授权记录标识。
+- `username`：本地用户名。未完成注册或未登录时为 `null`。
 - `expires_at`：会话过期时间，RFC 3339 格式。
+- `source_login_url`：源站登录入口。
+- `source_register_url`：源站注册入口。
+- `source_manage_url`：源站身份管理入口。
 
 未登录时返回：
 
@@ -54,11 +58,11 @@
 {
   "authenticated": false,
   "registered": false,
-  "user_id": null,
   "username": null,
-  "subject_id": null,
-  "authorization_id": null,
-  "expires_at": null
+  "expires_at": null,
+  "source_login_url": "http://127.0.0.1:3000/login",
+  "source_register_url": "http://127.0.0.1:3000/register",
+  "source_manage_url": "http://127.0.0.1:3000/account"
 }
 ```
 

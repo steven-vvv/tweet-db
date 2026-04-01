@@ -17,12 +17,8 @@
         <strong>{{ session?.registered ? 'Yes' : 'Pending' }}</strong>
       </div>
       <div class="row mono">
-        <span>Subject ID</span>
-        <strong>{{ session?.subject_id ?? '-' }}</strong>
-      </div>
-      <div class="row mono">
-        <span>Authorization ID</span>
-        <strong>{{ session?.authorization_id ?? '-' }}</strong>
+        <span>Expires At</span>
+        <strong>{{ session?.expires_at ?? '-' }}</strong>
       </div>
     </div>
     <button type="button" class="secondary" :disabled="loading || submitting" @click="signOut">
