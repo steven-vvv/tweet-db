@@ -73,7 +73,7 @@
 
 ### `POST /api/v1/ingest/submissions`
 
-用于将一次采集批次中的帖子相关数据写入服务端，包括用户、帖子、媒体、抓包记录和时间线观测结果。
+用于将一次采集批次中的帖子相关数据写入服务端。公开接入协议仅接受解析后的用户、帖子和媒体实体，不接受原始响应、客户端上下文或时间线命中数据。
 
 认证要求：
 需要有效且已完成注册绑定的会话。否则返回 `401`。
@@ -83,31 +83,27 @@
 ```json
 {
   "sourceKind": "x",
-  "clientContext": {},
-  "captures": [],
   "users": [],
   "tweets": [],
-  "media": [],
-  "timelineEvents": []
+  "media": []
 }
 ```
 
 关键字段说明：
 
 - `sourceKind`：来源标识，必填，例如 `x`。
-- `clientContext`：客户端上下文，原样入库。
 - `users`：用户资料数组。
 - `tweets`：帖子数组。
 - `media`：媒体数组。
-- `captures`：采集到的 XHR 报文数组。
-- `timelineEvents`：时间线命中数组。
 
 当前实现要点：
 
 - 单批次数量限制由 `ingest.max_items_per_batch` 控制，默认配置为 `5000`。
-- 数量统计口径为 `users + tweets + media + captures + timelineEvents` 的总和。
+- 数量统计口径为 `users + tweets + media` 的总和。
+- 顶层请求体包含未声明字段时会直接返回 `400`。
 - 各数组元素中的关键标识为空时，服务端会跳过该条并在 `warnings` 中记录原因，不会中断整批处理。
 - 媒体自动转存任务仅对 `video` 和 `animated_gif` 类型触发，且要求 `sourceUrl` 非空。
+- 服务端会保留站内 submission 台账，但不会落库存储原始响应或客户端上下文。
 
 成功响应示例：
 
@@ -140,7 +136,7 @@
 
 ### `POST /api/v1/posts/status/query`
 
-用于按帖子 ID 批量查询服务端已保存的帖子、作者、媒体、时间线命中情况，以及媒体转存进度。
+用于按帖子 ID 批量查询服务端已保存的帖子、作者、媒体和媒体转存进度。帖子中的互动计数字段取自该帖子最新一条指标观测记录。
 
 认证要求：
 需要有效且已完成注册绑定的会话。否则返回 `401`。
@@ -205,8 +201,6 @@
       },
       "media": [],
       "missingMediaSourceIds": [],
-      "timelineHits": [],
-      "captureSummary": null,
       "transferSummary": {
         "pending": 0,
         "processing": 0,
