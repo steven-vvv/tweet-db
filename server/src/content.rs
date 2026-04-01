@@ -3,10 +3,9 @@ use axum::{
     extract::{Extension, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
@@ -17,35 +16,16 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubmissionEnvelope {
     pub source_kind: String,
-    pub client_context: Value,
-    pub captures: Vec<CapturedXhrInput>,
     pub users: Vec<XUserInput>,
     pub tweets: Vec<XTweetInput>,
     pub media: Vec<XMediaInput>,
-    pub timeline_events: Vec<TimelineObservationInput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-pub struct CapturedXhrInput {
-    pub id: String,
-    pub timestamp: i64,
-    pub method: String,
-    pub url: String,
-    pub graphql_id: String,
-    pub operation_name: String,
-    pub status: i32,
-    pub status_text: String,
-    pub response_headers: String,
-    pub response_body: String,
-    pub response_size: i64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct XUserInput {
     pub id: String,
     pub name: String,
@@ -71,7 +51,7 @@ pub struct XUserInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct XTweetInput {
     pub id: String,
     pub author_id: String,
@@ -97,7 +77,7 @@ pub struct XTweetInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct VideoVariantInput {
     pub bitrate: Option<i64>,
     pub content_type: String,
@@ -105,7 +85,7 @@ pub struct VideoVariantInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct XMediaInput {
     pub id: String,
     pub media_key: String,
@@ -122,16 +102,6 @@ pub struct XMediaInput {
     pub source_user_id: Option<String>,
     pub duration_ms: Option<i64>,
     pub video_variants: Vec<VideoVariantInput>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-pub struct TimelineObservationInput {
-    pub timeline_kind: String,
-    pub timeline_key: String,
-    pub post_ids: Vec<String>,
-    pub observed_at_ms: Option<i64>,
-    pub raw: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -167,8 +137,6 @@ pub struct PostStatusAggregate {
     pub author: Option<ActorView>,
     pub media: Vec<MediaStatusView>,
     pub missing_media_source_ids: Vec<String>,
-    pub timeline_hits: Vec<TimelineHit>,
-    pub capture_summary: Option<CaptureSummary>,
     pub transfer_summary: TransferSummary,
 }
 
@@ -231,26 +199,6 @@ pub struct MediaStatusView {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TimelineHit {
-    pub timeline_kind: String,
-    pub timeline_key: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub observed_at: OffsetDateTime,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CaptureSummary {
-    pub first_submission_id: Option<Uuid>,
-    pub last_submission_id: Option<Uuid>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub first_observed_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub last_observed_at: OffsetDateTime,
-}
-
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferSummary {
@@ -258,6 +206,11 @@ pub struct TransferSummary {
     pub processing: u32,
     pub succeeded: u32,
     pub failed: u32,
+}
+
+struct NormalizedItems<T> {
+    items: Vec<T>,
+    skipped_empty: usize,
 }
 
 pub async fn ingest_submission(
@@ -271,52 +224,65 @@ pub async fn ingest_submission(
 
     let submission_id = Uuid::now_v7();
     let now = OffsetDateTime::now_utc();
-    let request_body = serde_json::to_value(&payload)?;
     insert_submission(
         &state.db,
         submission_id,
         session.record.user_id,
         &source_kind,
         &payload,
-        request_body,
     )
     .await?;
+
+    let users = normalize_entities(&payload.users, |item| &item.id);
+    let tweets = normalize_entities(&payload.tweets, |item| &item.id);
+    let media = normalize_entities(&payload.media, |item| &item.id);
 
     let mut accepted_count = 0_i32;
     let mut transfer_jobs_enqueued = 0_i32;
     let mut warnings = Vec::new();
 
-    for user in &payload.users {
-        match upsert_actor(&state.db, submission_id, &source_kind, user, now).await {
+    extend_skip_warnings(
+        &mut warnings,
+        users.skipped_empty,
+        "skipped user with empty id",
+    );
+    extend_skip_warnings(
+        &mut warnings,
+        tweets.skipped_empty,
+        "skipped tweet with empty id",
+    );
+    extend_skip_warnings(
+        &mut warnings,
+        media.skipped_empty,
+        "skipped media with empty id",
+    );
+
+    for user in &users.items {
+        match process_actor(&state.db, submission_id, &source_kind, user, now).await {
             Ok(true) => accepted_count += 1,
             Ok(false) => warnings.push("skipped user with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert user {}: {error}", user.id)),
         }
     }
 
-    for tweet in &payload.tweets {
-        match upsert_post(&state.db, submission_id, &source_kind, tweet, now).await {
-            Ok(true) => {
-                accepted_count += 1;
-                insert_post_metric_observation(&state.db, submission_id, &source_kind, tweet, now)
-                    .await?;
-            }
+    for tweet in &tweets.items {
+        match process_post(&state.db, submission_id, &source_kind, tweet, now).await {
+            Ok(true) => accepted_count += 1,
             Ok(false) => warnings.push("skipped tweet with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert tweet {}: {error}", tweet.id)),
         }
     }
 
-    for media in &payload.media {
-        match upsert_media(&state.db, submission_id, &source_kind, media, now).await {
+    for item in &media.items {
+        match process_media(&state.db, submission_id, &source_kind, item, now).await {
             Ok(true) => {
                 accepted_count += 1;
-                insert_media_variants(&state.db, submission_id, &source_kind, media, now).await?;
-                if let Some((source_url, content_type)) = transfer_candidate(media) {
+                if let Some((source_url, content_type)) = transfer_candidate(item) {
                     match transfer::enqueue_media_transfer(
                         &state.db,
                         &source_kind,
-                        &media.id,
-                        &media.tweet_id,
+                        item.id.trim(),
+                        item.tweet_id.trim(),
                         &source_url,
                         &content_type,
                     )
@@ -326,36 +292,13 @@ pub async fn ingest_submission(
                         Ok(false) => {}
                         Err(error) => warnings.push(format!(
                             "failed to enqueue transfer for media {}: {error}",
-                            media.id
+                            item.id
                         )),
                     }
                 }
             }
             Ok(false) => warnings.push("skipped media with empty id".to_owned()),
-            Err(error) => warnings.push(format!("failed to upsert media {}: {error}", media.id)),
-        }
-    }
-
-    for capture in &payload.captures {
-        match insert_capture(&state.db, submission_id, &source_kind, capture).await {
-            Ok(true) => accepted_count += 1,
-            Ok(false) => warnings.push("skipped capture with empty id".to_owned()),
-            Err(error) => {
-                warnings.push(format!("failed to insert capture {}: {error}", capture.id))
-            }
-        }
-    }
-
-    for timeline in &payload.timeline_events {
-        match insert_timeline_observation(&state.db, submission_id, &source_kind, timeline, now)
-            .await
-        {
-            Ok(true) => accepted_count += 1,
-            Ok(false) => warnings.push("skipped timeline observation with empty key".to_owned()),
-            Err(error) => warnings.push(format!(
-                "failed to insert timeline observation {}: {error}",
-                timeline.timeline_key
-            )),
+            Err(error) => warnings.push(format!("failed to upsert media {}: {error}", item.id)),
         }
     }
 
@@ -428,9 +371,10 @@ pub async fn query_post_status(
         .map(|actor| (actor.source_actor_id.clone(), actor))
         .collect::<HashMap<_, _>>();
 
-    let media_ids = posts
-        .iter()
-        .flat_map(|post| post.media_source_ids.clone())
+    let media_ids_by_post = fetch_post_media_ids(&state.db, &source_kind, &unique_post_ids).await?;
+    let media_ids = media_ids_by_post
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -442,11 +386,11 @@ pub async fn query_post_status(
     let transfer_statuses =
         transfer::fetch_transfer_statuses(&state.db, &source_kind, &media_ids).await?;
 
-    let timeline_hits = fetch_timeline_hits(&state.db, &source_kind, &unique_post_ids).await?;
-    let mut timeline_hits_by_post: HashMap<String, Vec<TimelineHit>> = HashMap::new();
-    for (post_id, hit) in timeline_hits {
-        timeline_hits_by_post.entry(post_id).or_default().push(hit);
-    }
+    let metrics = fetch_latest_post_metrics(&state.db, &source_kind, &unique_post_ids).await?;
+    let metrics_by_post = metrics
+        .into_iter()
+        .map(|item| (item.source_post_id.clone(), item))
+        .collect::<HashMap<_, _>>();
 
     let items = payload
         .post_ids
@@ -458,9 +402,10 @@ pub async fn query_post_status(
                 requested_id,
                 posts_by_id.get(&lookup_id),
                 &actors_by_id,
+                media_ids_by_post.get(&lookup_id),
                 &media_by_id,
+                &metrics_by_post,
                 &transfer_statuses,
-                timeline_hits_by_post.remove(&lookup_id).unwrap_or_default(),
             )
         })
         .collect();
@@ -477,11 +422,7 @@ fn validate_source_kind(raw: &str) -> AppResult<String> {
 }
 
 fn validate_batch_size(state: &AppState, payload: &SubmissionEnvelope) -> AppResult<()> {
-    let total = payload.users.len()
-        + payload.tweets.len()
-        + payload.media.len()
-        + payload.captures.len()
-        + payload.timeline_events.len();
+    let total = payload.users.len() + payload.tweets.len() + payload.media.len();
     if total > state.settings.config.ingest.max_items_per_batch {
         return Err(AppError::bad_request(format!(
             "batch exceeds max_items_per_batch ({})",
@@ -491,13 +432,90 @@ fn validate_batch_size(state: &AppState, payload: &SubmissionEnvelope) -> AppRes
     Ok(())
 }
 
+fn normalize_entities<T, F>(items: &[T], key_fn: F) -> NormalizedItems<T>
+where
+    T: Clone,
+    F: Fn(&T) -> &str,
+{
+    let mut skipped_empty = 0_usize;
+    let mut keys = Vec::new();
+    let mut items_by_key = HashMap::new();
+
+    for item in items {
+        let key = key_fn(item).trim();
+        if key.is_empty() {
+            skipped_empty += 1;
+            continue;
+        }
+
+        let key = key.to_owned();
+        if !items_by_key.contains_key(&key) {
+            keys.push(key.clone());
+        }
+        items_by_key.insert(key, item.clone());
+    }
+
+    NormalizedItems {
+        items: keys
+            .into_iter()
+            .filter_map(|key| items_by_key.remove(&key))
+            .collect(),
+        skipped_empty,
+    }
+}
+
+fn extend_skip_warnings(target: &mut Vec<String>, count: usize, message: &str) {
+    for _ in 0..count {
+        target.push(message.to_owned());
+    }
+}
+
+fn unique_nonempty_strings(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for value in values {
+        let normalized = value.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let normalized = normalized.to_owned();
+        if seen.insert(normalized.clone()) {
+            result.push(normalized);
+        }
+    }
+
+    result
+}
+
+fn unique_video_variants(values: &[VideoVariantInput]) -> Vec<VideoVariantInput> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+
+    for value in values {
+        let url = value.url.trim();
+        if url.is_empty() {
+            continue;
+        }
+
+        let normalized = url.to_owned();
+        if seen.insert(normalized.clone()) {
+            let mut cloned = value.clone();
+            cloned.url = normalized;
+            result.push(cloned);
+        }
+    }
+
+    result
+}
+
 async fn insert_submission(
     pool: &PgPool,
     submission_id: Uuid,
     submitter_user_id: Option<Uuid>,
     source_kind: &str,
     payload: &SubmissionEnvelope,
-    request_body: Value,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
@@ -505,28 +523,20 @@ async fn insert_submission(
             id,
             submitter_user_id,
             source_kind,
-            client_context,
-            request_body,
             users_count,
             tweets_count,
             media_count,
-            captures_count,
-            timeline_events_count,
             status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'processing')
+        VALUES ($1, $2, $3, $4, $5, $6, 'processing')
         "#,
     )
     .bind(submission_id)
     .bind(submitter_user_id)
     .bind(source_kind)
-    .bind(&payload.client_context)
-    .bind(request_body)
     .bind(payload.users.len() as i32)
     .bind(payload.tweets.len() as i32)
     .bind(payload.media.len() as i32)
-    .bind(payload.captures.len() as i32)
-    .bind(payload.timeline_events.len() as i32)
     .execute(pool)
     .await?;
     Ok(())
@@ -563,7 +573,7 @@ async fn finalize_submission(
     Ok(())
 }
 
-async fn upsert_actor(
+async fn process_actor(
     pool: &PgPool,
     submission_id: Uuid,
     source_kind: &str,
@@ -574,10 +584,55 @@ async fn upsert_actor(
         return Ok(false);
     }
 
+    upsert_actor(pool, submission_id, source_kind, item, observed_at).await?;
+    insert_actor_profile_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    insert_actor_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    Ok(true)
+}
+
+async fn process_post(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XTweetInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<bool> {
+    if item.id.trim().is_empty() {
+        return Ok(false);
+    }
+
+    upsert_post(pool, submission_id, source_kind, item, observed_at).await?;
+    replace_post_media(pool, source_kind, item).await?;
+    insert_post_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    Ok(true)
+}
+
+async fn process_media(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XMediaInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<bool> {
+    if item.id.trim().is_empty() {
+        return Ok(false);
+    }
+
+    upsert_media(pool, submission_id, source_kind, item, observed_at).await?;
+    replace_media_variants(pool, source_kind, item).await?;
+    Ok(true)
+}
+
+async fn upsert_actor(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
     sqlx::query(
         r#"
         INSERT INTO actors (
-            id,
             source_kind,
             source_actor_id,
             name,
@@ -592,24 +647,16 @@ async fn upsert_actor(
             is_protected,
             profile_image_shape,
             professional_type,
-            followers_count,
-            friends_count,
-            favourites_count,
-            statuses_count,
-            media_count,
-            listed_count,
             pinned_post_source_ids,
             source_created_at_raw,
             first_submission_id,
             last_submission_id,
             first_observed_at,
-            last_observed_at,
-            raw_json
+            last_observed_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-            $21, $22, $23, $24, $24, $25, $25, $26
+            $11, $12, $13, $14, $15, $16, $17, $17, $18, $18
         )
         ON CONFLICT (source_kind, source_actor_id) DO UPDATE
         SET name = EXCLUDED.name,
@@ -624,50 +671,158 @@ async fn upsert_actor(
             is_protected = EXCLUDED.is_protected,
             profile_image_shape = EXCLUDED.profile_image_shape,
             professional_type = EXCLUDED.professional_type,
-            followers_count = EXCLUDED.followers_count,
-            friends_count = EXCLUDED.friends_count,
-            favourites_count = EXCLUDED.favourites_count,
-            statuses_count = EXCLUDED.statuses_count,
-            media_count = EXCLUDED.media_count,
-            listed_count = EXCLUDED.listed_count,
             pinned_post_source_ids = EXCLUDED.pinned_post_source_ids,
             source_created_at_raw = EXCLUDED.source_created_at_raw,
             last_submission_id = EXCLUDED.last_submission_id,
             last_observed_at = EXCLUDED.last_observed_at,
-            raw_json = EXCLUDED.raw_json,
             updated_at = NOW()
         "#,
     )
-    .bind(Uuid::now_v7())
     .bind(source_kind)
-    .bind(&item.id)
+    .bind(item.id.trim())
     .bind(&item.name)
     .bind(&item.screen_name)
     .bind(&item.description)
     .bind(&item.location)
     .bind(&item.avatar_url)
-    .bind(&item.profile_url)
-    .bind(&item.banner_url)
+    .bind(trimmed_option(&item.profile_url))
+    .bind(trimmed_option(&item.banner_url))
     .bind(item.is_blue_verified)
-    .bind(&item.verified_type)
+    .bind(trimmed_option(&item.verified_type))
     .bind(item.is_protected)
     .bind(&item.profile_image_shape)
-    .bind(&item.professional_type)
+    .bind(trimmed_option(&item.professional_type))
+    .bind(unique_nonempty_strings(&item.pinned_tweet_ids))
+    .bind(&item.created_at)
+    .bind(submission_id)
+    .bind(observed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_actor_profile_observation(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO actor_profile_observations (
+            submission_id,
+            source_kind,
+            source_actor_id,
+            observed_at,
+            name,
+            screen_name,
+            description,
+            location,
+            avatar_url,
+            profile_url,
+            banner_url,
+            is_blue_verified,
+            verified_type,
+            is_protected,
+            profile_image_shape,
+            professional_type,
+            pinned_post_source_ids,
+            source_created_at_raw
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            $11, $12, $13, $14, $15, $16, $17, $18
+        )
+        ON CONFLICT (submission_id, source_kind, source_actor_id) DO UPDATE
+        SET observed_at = EXCLUDED.observed_at,
+            name = EXCLUDED.name,
+            screen_name = EXCLUDED.screen_name,
+            description = EXCLUDED.description,
+            location = EXCLUDED.location,
+            avatar_url = EXCLUDED.avatar_url,
+            profile_url = EXCLUDED.profile_url,
+            banner_url = EXCLUDED.banner_url,
+            is_blue_verified = EXCLUDED.is_blue_verified,
+            verified_type = EXCLUDED.verified_type,
+            is_protected = EXCLUDED.is_protected,
+            profile_image_shape = EXCLUDED.profile_image_shape,
+            professional_type = EXCLUDED.professional_type,
+            pinned_post_source_ids = EXCLUDED.pinned_post_source_ids,
+            source_created_at_raw = EXCLUDED.source_created_at_raw
+        "#,
+    )
+    .bind(submission_id)
+    .bind(source_kind)
+    .bind(item.id.trim())
+    .bind(observed_at)
+    .bind(&item.name)
+    .bind(&item.screen_name)
+    .bind(&item.description)
+    .bind(&item.location)
+    .bind(&item.avatar_url)
+    .bind(trimmed_option(&item.profile_url))
+    .bind(trimmed_option(&item.banner_url))
+    .bind(item.is_blue_verified)
+    .bind(trimmed_option(&item.verified_type))
+    .bind(item.is_protected)
+    .bind(&item.profile_image_shape)
+    .bind(trimmed_option(&item.professional_type))
+    .bind(unique_nonempty_strings(&item.pinned_tweet_ids))
+    .bind(&item.created_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn insert_actor_metric_observation(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO actor_metric_observations (
+            submission_id,
+            source_kind,
+            source_actor_id,
+            observed_at,
+            followers_count,
+            friends_count,
+            favourites_count,
+            statuses_count,
+            media_count,
+            listed_count
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (submission_id, source_kind, source_actor_id) DO UPDATE
+        SET observed_at = EXCLUDED.observed_at,
+            followers_count = EXCLUDED.followers_count,
+            friends_count = EXCLUDED.friends_count,
+            favourites_count = EXCLUDED.favourites_count,
+            statuses_count = EXCLUDED.statuses_count,
+            media_count = EXCLUDED.media_count,
+            listed_count = EXCLUDED.listed_count
+        "#,
+    )
+    .bind(submission_id)
+    .bind(source_kind)
+    .bind(item.id.trim())
+    .bind(observed_at)
     .bind(item.followers_count)
     .bind(item.friends_count)
     .bind(item.favourites_count)
     .bind(item.statuses_count)
     .bind(item.media_count)
     .bind(item.listed_count)
-    .bind(&item.pinned_tweet_ids)
-    .bind(&item.created_at)
-    .bind(submission_id)
-    .bind(observed_at)
-    .bind(serde_json::to_value(item)?)
     .execute(pool)
     .await?;
 
-    Ok(true)
+    Ok(())
 }
 
 async fn upsert_post(
@@ -676,15 +831,10 @@ async fn upsert_post(
     source_kind: &str,
     item: &XTweetInput,
     observed_at: OffsetDateTime,
-) -> AppResult<bool> {
-    if item.id.trim().is_empty() {
-        return Ok(false);
-    }
-
+) -> AppResult<()> {
     sqlx::query(
         r#"
         INSERT INTO posts (
-            id,
             source_kind,
             source_post_id,
             author_source_actor_id,
@@ -698,25 +848,16 @@ async fn upsert_post(
             in_reply_to_source_actor_id,
             quoted_source_post_id,
             retweeted_source_post_id,
-            view_count,
             possibly_sensitive,
-            favorite_count,
-            retweet_count,
-            reply_count,
-            quote_count,
-            bookmark_count,
-            media_source_ids,
             source_label,
             first_submission_id,
             last_submission_id,
             first_observed_at,
-            last_observed_at,
-            raw_json
+            last_observed_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-            $21, $22, $23, $24, $24, $25, $25, $26
+            $11, $12, $13, $14, $15, $16, $16, $17, $17
         )
         ON CONFLICT (source_kind, source_post_id) DO UPDATE
         SET author_source_actor_id = EXCLUDED.author_source_actor_id,
@@ -730,51 +871,119 @@ async fn upsert_post(
             in_reply_to_source_actor_id = EXCLUDED.in_reply_to_source_actor_id,
             quoted_source_post_id = EXCLUDED.quoted_source_post_id,
             retweeted_source_post_id = EXCLUDED.retweeted_source_post_id,
-            view_count = EXCLUDED.view_count,
             possibly_sensitive = EXCLUDED.possibly_sensitive,
-            favorite_count = EXCLUDED.favorite_count,
-            retweet_count = EXCLUDED.retweet_count,
-            reply_count = EXCLUDED.reply_count,
-            quote_count = EXCLUDED.quote_count,
-            bookmark_count = EXCLUDED.bookmark_count,
-            media_source_ids = EXCLUDED.media_source_ids,
             source_label = EXCLUDED.source_label,
             last_submission_id = EXCLUDED.last_submission_id,
             last_observed_at = EXCLUDED.last_observed_at,
-            raw_json = EXCLUDED.raw_json,
             updated_at = NOW()
         "#,
     )
-    .bind(Uuid::now_v7())
     .bind(source_kind)
-    .bind(&item.id)
-    .bind(&item.author_id)
-    .bind(&item.conversation_id)
+    .bind(item.id.trim())
+    .bind(item.author_id.trim())
+    .bind(item.conversation_id.trim())
     .bind(&item.full_text)
     .bind(&item.legacy_full_text)
     .bind(&item.note_text)
     .bind(&item.lang)
     .bind(&item.created_at)
-    .bind(&item.in_reply_to_tweet_id)
-    .bind(&item.in_reply_to_user_id)
-    .bind(&item.quoted_tweet_id)
-    .bind(&item.retweeted_tweet_id)
-    .bind(item.view_count)
+    .bind(trimmed_option(&item.in_reply_to_tweet_id))
+    .bind(trimmed_option(&item.in_reply_to_user_id))
+    .bind(trimmed_option(&item.quoted_tweet_id))
+    .bind(trimmed_option(&item.retweeted_tweet_id))
     .bind(item.possibly_sensitive)
+    .bind(&item.source)
+    .bind(submission_id)
+    .bind(observed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn replace_post_media(pool: &PgPool, source_kind: &str, item: &XTweetInput) -> AppResult<()> {
+    let post_id = item.id.trim();
+    sqlx::query(
+        r#"
+        DELETE FROM post_media
+        WHERE source_kind = $1
+          AND source_post_id = $2
+        "#,
+    )
+    .bind(source_kind)
+    .bind(post_id)
+    .execute(pool)
+    .await?;
+
+    let media_ids = unique_nonempty_strings(&item.media_ids);
+    for (position, media_id) in media_ids.into_iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO post_media (
+                source_kind,
+                source_post_id,
+                source_media_id,
+                position
+            )
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(source_kind)
+        .bind(post_id)
+        .bind(media_id)
+        .bind(position as i32)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn insert_post_metric_observation(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XTweetInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO post_metric_observations (
+            submission_id,
+            source_kind,
+            source_post_id,
+            observed_at,
+            view_count,
+            favorite_count,
+            retweet_count,
+            reply_count,
+            quote_count,
+            bookmark_count
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (submission_id, source_kind, source_post_id) DO UPDATE
+        SET observed_at = EXCLUDED.observed_at,
+            view_count = EXCLUDED.view_count,
+            favorite_count = EXCLUDED.favorite_count,
+            retweet_count = EXCLUDED.retweet_count,
+            reply_count = EXCLUDED.reply_count,
+            quote_count = EXCLUDED.quote_count,
+            bookmark_count = EXCLUDED.bookmark_count
+        "#,
+    )
+    .bind(submission_id)
+    .bind(source_kind)
+    .bind(item.id.trim())
+    .bind(observed_at)
+    .bind(item.view_count)
     .bind(item.favorite_count)
     .bind(item.retweet_count)
     .bind(item.reply_count)
     .bind(item.quote_count)
     .bind(item.bookmark_count)
-    .bind(&item.media_ids)
-    .bind(&item.source)
-    .bind(submission_id)
-    .bind(observed_at)
-    .bind(serde_json::to_value(item)?)
     .execute(pool)
     .await?;
-
-    Ok(true)
+    Ok(())
 }
 
 async fn upsert_media(
@@ -783,15 +992,10 @@ async fn upsert_media(
     source_kind: &str,
     item: &XMediaInput,
     observed_at: OffsetDateTime,
-) -> AppResult<bool> {
-    if item.id.trim().is_empty() {
-        return Ok(false);
-    }
-
+) -> AppResult<()> {
     sqlx::query(
         r#"
         INSERT INTO media (
-            id,
             source_kind,
             source_media_id,
             media_key,
@@ -810,12 +1014,11 @@ async fn upsert_media(
             first_submission_id,
             last_submission_id,
             first_observed_at,
-            last_observed_at,
-            raw_json
+            last_observed_at
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $17, $18, $18, $19
+            $11, $12, $13, $14, $15, $16, $16, $17, $17
         )
         ON CONFLICT (source_kind, source_media_id) DO UPDATE
         SET media_key = EXCLUDED.media_key,
@@ -833,15 +1036,13 @@ async fn upsert_media(
             duration_ms = EXCLUDED.duration_ms,
             last_submission_id = EXCLUDED.last_submission_id,
             last_observed_at = EXCLUDED.last_observed_at,
-            raw_json = EXCLUDED.raw_json,
             updated_at = NOW()
         "#,
     )
-    .bind(Uuid::now_v7())
     .bind(source_kind)
-    .bind(&item.id)
+    .bind(item.id.trim())
     .bind(&item.media_key)
-    .bind(&item.tweet_id)
+    .bind(item.tweet_id.trim())
     .bind(&item.r#type)
     .bind(&item.media_url)
     .bind(&item.thumb_url)
@@ -850,219 +1051,61 @@ async fn upsert_media(
     .bind(item.height)
     .bind(&item.alt_text)
     .bind(item.allow_download)
-    .bind(&item.source_status_id)
-    .bind(&item.source_user_id)
+    .bind(trimmed_option(&item.source_status_id))
+    .bind(trimmed_option(&item.source_user_id))
     .bind(item.duration_ms)
     .bind(submission_id)
     .bind(observed_at)
-    .bind(serde_json::to_value(item)?)
     .execute(pool)
     .await?;
 
-    Ok(true)
-}
-
-async fn insert_capture(
-    pool: &PgPool,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &CapturedXhrInput,
-) -> AppResult<bool> {
-    if item.id.trim().is_empty() {
-        return Ok(false);
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO capture_events (
-            id,
-            submission_id,
-            source_kind,
-            capture_id,
-            captured_at,
-            method,
-            url,
-            graphql_id,
-            operation_name,
-            status,
-            status_text,
-            response_headers,
-            response_body,
-            response_size,
-            raw_json
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(submission_id)
-    .bind(source_kind)
-    .bind(&item.id)
-    .bind(ms_to_time(item.timestamp).unwrap_or_else(OffsetDateTime::now_utc))
-    .bind(&item.method)
-    .bind(&item.url)
-    .bind(&item.graphql_id)
-    .bind(&item.operation_name)
-    .bind(item.status)
-    .bind(&item.status_text)
-    .bind(&item.response_headers)
-    .bind(&item.response_body)
-    .bind(item.response_size)
-    .bind(serde_json::to_value(item)?)
-    .execute(pool)
-    .await?;
-
-    Ok(true)
-}
-
-async fn insert_post_metric_observation(
-    pool: &PgPool,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XTweetInput,
-    observed_at: OffsetDateTime,
-) -> AppResult<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO post_metric_observations (
-            id,
-            submission_id,
-            source_kind,
-            source_post_id,
-            observed_at,
-            view_count,
-            favorite_count,
-            retweet_count,
-            reply_count,
-            quote_count,
-            bookmark_count,
-            raw_json
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(submission_id)
-    .bind(source_kind)
-    .bind(&item.id)
-    .bind(observed_at)
-    .bind(item.view_count)
-    .bind(item.favorite_count)
-    .bind(item.retweet_count)
-    .bind(item.reply_count)
-    .bind(item.quote_count)
-    .bind(item.bookmark_count)
-    .bind(serde_json::to_value(item)?)
-    .execute(pool)
-    .await?;
     Ok(())
 }
 
-async fn insert_media_variants(
+async fn replace_media_variants(
     pool: &PgPool,
-    submission_id: Uuid,
     source_kind: &str,
     item: &XMediaInput,
-    observed_at: OffsetDateTime,
 ) -> AppResult<()> {
-    for variant in &item.video_variants {
-        if variant.url.trim().is_empty() {
-            continue;
-        }
+    let media_id = item.id.trim();
+    sqlx::query(
+        r#"
+        DELETE FROM media_variants
+        WHERE source_kind = $1
+          AND source_media_id = $2
+        "#,
+    )
+    .bind(source_kind)
+    .bind(media_id)
+    .execute(pool)
+    .await?;
 
+    let variants = unique_video_variants(&item.video_variants);
+    for (position, variant) in variants.into_iter().enumerate() {
         sqlx::query(
             r#"
-            INSERT INTO media_variant_observations (
-                id,
-                submission_id,
+            INSERT INTO media_variants (
                 source_kind,
                 source_media_id,
-                bitrate,
-                content_type,
                 url,
-                observed_at,
-                raw_json
+                position,
+                bitrate,
+                content_type
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
-        .bind(Uuid::now_v7())
-        .bind(submission_id)
         .bind(source_kind)
-        .bind(&item.id)
+        .bind(media_id)
+        .bind(variant.url)
+        .bind(position as i32)
         .bind(variant.bitrate)
-        .bind(&variant.content_type)
-        .bind(&variant.url)
-        .bind(observed_at)
-        .bind(serde_json::to_value(variant)?)
+        .bind(variant.content_type)
         .execute(pool)
         .await?;
     }
 
     Ok(())
-}
-
-async fn insert_timeline_observation(
-    pool: &PgPool,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &TimelineObservationInput,
-    fallback_observed_at: OffsetDateTime,
-) -> AppResult<bool> {
-    if item.timeline_kind.trim().is_empty() || item.timeline_key.trim().is_empty() {
-        return Ok(false);
-    }
-
-    let raw_json = if item.raw.is_null() {
-        serde_json::json!({
-            "timelineKind": item.timeline_kind,
-            "timelineKey": item.timeline_key,
-            "postIds": item.post_ids,
-            "observedAtMs": item.observed_at_ms,
-        })
-    } else {
-        item.raw.clone()
-    };
-
-    sqlx::query(
-        r#"
-        INSERT INTO timeline_observations (
-            id,
-            submission_id,
-            source_kind,
-            timeline_kind,
-            timeline_key,
-            post_source_ids,
-            observed_at,
-            raw_json
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        "#,
-    )
-    .bind(Uuid::now_v7())
-    .bind(submission_id)
-    .bind(source_kind)
-    .bind(&item.timeline_kind)
-    .bind(&item.timeline_key)
-    .bind(&item.post_ids)
-    .bind(
-        item.observed_at_ms
-            .and_then(ms_to_time)
-            .unwrap_or(fallback_observed_at),
-    )
-    .bind(raw_json)
-    .execute(pool)
-    .await?;
-
-    Ok(true)
-}
-
-fn ms_to_time(value: i64) -> Option<OffsetDateTime> {
-    let seconds = value.div_euclid(1000);
-    let millis = value.rem_euclid(1000);
-    OffsetDateTime::from_unix_timestamp(seconds)
-        .ok()
-        .map(|time| time + Duration::milliseconds(millis))
 }
 
 fn transfer_candidate(item: &XMediaInput) -> Option<(String, String)> {
@@ -1075,7 +1118,7 @@ fn transfer_candidate(item: &XMediaInput) -> Option<(String, String)> {
     let content_type = item
         .video_variants
         .iter()
-        .find(|variant| variant.url == item.source_url)
+        .find(|variant| variant.url.trim() == item.source_url.trim())
         .map(|variant| variant.content_type.clone())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
@@ -1087,6 +1130,14 @@ fn transfer_candidate(item: &XMediaInput) -> Option<(String, String)> {
         });
 
     Some((item.source_url.clone(), content_type))
+}
+
+fn trimmed_option(value: &Option<String>) -> Option<String> {
+    value
+        .as_ref()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Debug, Clone)]
@@ -1103,19 +1154,19 @@ struct PostRow {
     in_reply_to_source_actor_id: Option<String>,
     quoted_source_post_id: Option<String>,
     retweeted_source_post_id: Option<String>,
-    view_count: Option<i64>,
     possibly_sensitive: Option<bool>,
+    source_label: String,
+}
+
+#[derive(Debug, Clone)]
+struct PostMetricRow {
+    source_post_id: String,
+    view_count: Option<i64>,
     favorite_count: i64,
     retweet_count: i64,
     reply_count: i64,
     quote_count: i64,
     bookmark_count: i64,
-    media_source_ids: Vec<String>,
-    source_label: String,
-    first_submission_id: Option<Uuid>,
-    last_submission_id: Option<Uuid>,
-    first_observed_at: OffsetDateTime,
-    last_observed_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
@@ -1170,19 +1221,8 @@ async fn fetch_posts(
             in_reply_to_source_actor_id,
             quoted_source_post_id,
             retweeted_source_post_id,
-            view_count,
             possibly_sensitive,
-            favorite_count,
-            retweet_count,
-            reply_count,
-            quote_count,
-            bookmark_count,
-            media_source_ids,
-            source_label,
-            first_submission_id,
-            last_submission_id,
-            first_observed_at,
-            last_observed_at
+            source_label
         FROM posts
         WHERE source_kind = $1
           AND source_post_id = ANY($2)
@@ -1208,21 +1248,88 @@ async fn fetch_posts(
             in_reply_to_source_actor_id: row.get("in_reply_to_source_actor_id"),
             quoted_source_post_id: row.get("quoted_source_post_id"),
             retweeted_source_post_id: row.get("retweeted_source_post_id"),
-            view_count: row.get("view_count"),
             possibly_sensitive: row.get("possibly_sensitive"),
+            source_label: row.get("source_label"),
+        })
+        .collect())
+}
+
+async fn fetch_latest_post_metrics(
+    pool: &PgPool,
+    source_kind: &str,
+    post_ids: &[String],
+) -> AppResult<Vec<PostMetricRow>> {
+    if post_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT ON (source_post_id)
+            source_post_id,
+            view_count,
+            favorite_count,
+            retweet_count,
+            reply_count,
+            quote_count,
+            bookmark_count
+        FROM post_metric_observations
+        WHERE source_kind = $1
+          AND source_post_id = ANY($2)
+        ORDER BY source_post_id, observed_at DESC, created_at DESC
+        "#,
+    )
+    .bind(source_kind)
+    .bind(post_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| PostMetricRow {
+            source_post_id: row.get("source_post_id"),
+            view_count: row.get("view_count"),
             favorite_count: row.get("favorite_count"),
             retweet_count: row.get("retweet_count"),
             reply_count: row.get("reply_count"),
             quote_count: row.get("quote_count"),
             bookmark_count: row.get("bookmark_count"),
-            media_source_ids: row.get("media_source_ids"),
-            source_label: row.get("source_label"),
-            first_submission_id: row.get("first_submission_id"),
-            last_submission_id: row.get("last_submission_id"),
-            first_observed_at: row.get("first_observed_at"),
-            last_observed_at: row.get("last_observed_at"),
         })
         .collect())
+}
+
+async fn fetch_post_media_ids(
+    pool: &PgPool,
+    source_kind: &str,
+    post_ids: &[String],
+) -> AppResult<HashMap<String, Vec<String>>> {
+    if post_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT source_post_id, source_media_id
+        FROM post_media
+        WHERE source_kind = $1
+          AND source_post_id = ANY($2)
+        ORDER BY source_post_id ASC, position ASC, source_media_id ASC
+        "#,
+    )
+    .bind(source_kind)
+    .bind(post_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut media_ids_by_post: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        media_ids_by_post
+            .entry(row.get("source_post_id"))
+            .or_default()
+            .push(row.get("source_media_id"));
+    }
+
+    Ok(media_ids_by_post)
 }
 
 async fn fetch_actors(
@@ -1323,58 +1430,15 @@ async fn fetch_media(
         .collect())
 }
 
-async fn fetch_timeline_hits(
-    pool: &PgPool,
-    source_kind: &str,
-    post_ids: &[String],
-) -> AppResult<Vec<(String, TimelineHit)>> {
-    if post_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let rows = sqlx::query(
-        r#"
-        SELECT timeline_kind, timeline_key, post_source_ids, observed_at
-        FROM timeline_observations
-        WHERE source_kind = $1
-          AND post_source_ids && $2
-        ORDER BY observed_at DESC
-        LIMIT 500
-        "#,
-    )
-    .bind(source_kind)
-    .bind(post_ids)
-    .fetch_all(pool)
-    .await?;
-
-    let requested = post_ids.iter().cloned().collect::<HashSet<_>>();
-    let mut hits = Vec::new();
-
-    for row in rows {
-        let hit = TimelineHit {
-            timeline_kind: row.get("timeline_kind"),
-            timeline_key: row.get("timeline_key"),
-            observed_at: row.get("observed_at"),
-        };
-        let post_source_ids: Vec<String> = row.get("post_source_ids");
-        for post_id in post_source_ids {
-            if requested.contains(&post_id) {
-                hits.push((post_id, hit.clone()));
-            }
-        }
-    }
-
-    Ok(hits)
-}
-
 fn build_post_status_aggregate(
     source_kind: &str,
     requested_id: String,
     post: Option<&PostRow>,
     actors_by_id: &HashMap<String, ActorRow>,
+    media_ids: Option<&Vec<String>>,
     media_by_id: &HashMap<String, MediaRow>,
+    metrics_by_post: &HashMap<String, PostMetricRow>,
     transfer_statuses: &HashMap<String, TransferStatusInfo>,
-    timeline_hits: Vec<TimelineHit>,
 ) -> PostStatusAggregate {
     let Some(post) = post else {
         return PostStatusAggregate {
@@ -1385,8 +1449,6 @@ fn build_post_status_aggregate(
             author: None,
             media: Vec::new(),
             missing_media_source_ids: Vec::new(),
-            timeline_hits,
-            capture_summary: None,
             transfer_summary: TransferSummary::default(),
         };
     };
@@ -1405,10 +1467,13 @@ fn build_post_status_aggregate(
             verified_type: actor.verified_type.clone(),
         });
 
+    let media_source_ids = media_ids.cloned().unwrap_or_default();
+    let metrics = metrics_by_post.get(&post.source_post_id);
+
     let mut media = Vec::new();
     let mut missing_media_source_ids = Vec::new();
     let mut transfer_summary = TransferSummary::default();
-    for media_id in &post.media_source_ids {
+    for media_id in &media_source_ids {
         if let Some(item) = media_by_id.get(media_id) {
             let transfer = transfer_statuses.get(media_id);
             match transfer.and_then(|status| status.status.as_deref()) {
@@ -1456,26 +1521,190 @@ fn build_post_status_aggregate(
             in_reply_to_source_actor_id: post.in_reply_to_source_actor_id.clone(),
             quoted_source_post_id: post.quoted_source_post_id.clone(),
             retweeted_source_post_id: post.retweeted_source_post_id.clone(),
-            view_count: post.view_count,
+            view_count: metrics.and_then(|item| item.view_count),
             possibly_sensitive: post.possibly_sensitive,
-            favorite_count: post.favorite_count,
-            retweet_count: post.retweet_count,
-            reply_count: post.reply_count,
-            quote_count: post.quote_count,
-            bookmark_count: post.bookmark_count,
-            media_source_ids: post.media_source_ids.clone(),
+            favorite_count: metrics.map(|item| item.favorite_count).unwrap_or_default(),
+            retweet_count: metrics.map(|item| item.retweet_count).unwrap_or_default(),
+            reply_count: metrics.map(|item| item.reply_count).unwrap_or_default(),
+            quote_count: metrics.map(|item| item.quote_count).unwrap_or_default(),
+            bookmark_count: metrics.map(|item| item.bookmark_count).unwrap_or_default(),
+            media_source_ids,
             source_label: post.source_label.clone(),
         }),
         author,
         media,
         missing_media_source_ids,
-        timeline_hits,
-        capture_summary: Some(CaptureSummary {
-            first_submission_id: post.first_submission_id,
-            last_submission_id: post.last_submission_id,
-            first_observed_at: post.first_observed_at,
-            last_observed_at: post.last_observed_at,
-        }),
         transfer_summary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn submission_envelope_rejects_unknown_fields() {
+        let payload = json!({
+            "sourceKind": "x",
+            "users": [],
+            "tweets": [],
+            "media": [],
+            "captures": []
+        });
+
+        let error = serde_json::from_value::<SubmissionEnvelope>(payload).unwrap_err();
+        assert!(error.to_string().contains("unknown field `captures`"));
+    }
+
+    #[test]
+    fn normalize_entities_keeps_last_duplicate_and_counts_empty() {
+        let first = XUserInput {
+            id: "u1".to_owned(),
+            name: "first".to_owned(),
+            ..Default::default()
+        };
+        let second = XUserInput {
+            id: "u1".to_owned(),
+            name: "second".to_owned(),
+            ..Default::default()
+        };
+        let empty = XUserInput::default();
+
+        let normalized = normalize_entities(&[first, empty, second], |item| &item.id);
+
+        assert_eq!(normalized.skipped_empty, 1);
+        assert_eq!(normalized.items.len(), 1);
+        assert_eq!(normalized.items[0].name, "second");
+    }
+
+    #[test]
+    fn build_post_status_aggregate_uses_latest_metrics_and_media_order() {
+        let post = PostRow {
+            source_post_id: "p1".to_owned(),
+            author_source_actor_id: "a1".to_owned(),
+            conversation_source_post_id: "c1".to_owned(),
+            full_text: "full".to_owned(),
+            legacy_full_text: "legacy".to_owned(),
+            note_text: None,
+            lang: "en".to_owned(),
+            source_created_at_raw: "created".to_owned(),
+            in_reply_to_source_post_id: None,
+            in_reply_to_source_actor_id: None,
+            quoted_source_post_id: None,
+            retweeted_source_post_id: None,
+            possibly_sensitive: Some(false),
+            source_label: "web".to_owned(),
+        };
+
+        let mut actors = HashMap::new();
+        actors.insert(
+            "a1".to_owned(),
+            ActorRow {
+                source_actor_id: "a1".to_owned(),
+                name: "demo".to_owned(),
+                screen_name: "demo_user".to_owned(),
+                description: String::new(),
+                location: String::new(),
+                avatar_url: "avatar".to_owned(),
+                profile_url: None,
+                banner_url: None,
+                verified_type: None,
+            },
+        );
+
+        let media_ids = vec!["m2".to_owned(), "missing".to_owned(), "m1".to_owned()];
+        let mut media_by_id = HashMap::new();
+        media_by_id.insert(
+            "m1".to_owned(),
+            MediaRow {
+                source_media_id: "m1".to_owned(),
+                media_key: "mk1".to_owned(),
+                source_post_id: "p1".to_owned(),
+                media_type: "photo".to_owned(),
+                source_url: "source1".to_owned(),
+                thumb_url: "thumb1".to_owned(),
+                width: 1,
+                height: 1,
+                alt_text: None,
+                allow_download: false,
+                duration_ms: None,
+            },
+        );
+        media_by_id.insert(
+            "m2".to_owned(),
+            MediaRow {
+                source_media_id: "m2".to_owned(),
+                media_key: "mk2".to_owned(),
+                source_post_id: "p1".to_owned(),
+                media_type: "video".to_owned(),
+                source_url: "source2".to_owned(),
+                thumb_url: "thumb2".to_owned(),
+                width: 2,
+                height: 2,
+                alt_text: Some("alt".to_owned()),
+                allow_download: true,
+                duration_ms: Some(20),
+            },
+        );
+
+        let mut metrics = HashMap::new();
+        metrics.insert(
+            "p1".to_owned(),
+            PostMetricRow {
+                source_post_id: "p1".to_owned(),
+                view_count: Some(10),
+                favorite_count: 1,
+                retweet_count: 2,
+                reply_count: 3,
+                quote_count: 4,
+                bookmark_count: 5,
+            },
+        );
+
+        let mut transfers = HashMap::new();
+        transfers.insert(
+            "m2".to_owned(),
+            TransferStatusInfo {
+                status: Some("processing".to_owned()),
+                storage_object_key: None,
+                last_error: None,
+            },
+        );
+        transfers.insert(
+            "m1".to_owned(),
+            TransferStatusInfo {
+                status: Some("succeeded".to_owned()),
+                storage_object_key: Some("object".to_owned()),
+                last_error: None,
+            },
+        );
+
+        let aggregate = build_post_status_aggregate(
+            "x",
+            "p1".to_owned(),
+            Some(&post),
+            &actors,
+            Some(&media_ids),
+            &media_by_id,
+            &metrics,
+            &transfers,
+        );
+
+        assert!(aggregate.found);
+        assert_eq!(aggregate.post.as_ref().unwrap().view_count, Some(10));
+        assert_eq!(aggregate.post.as_ref().unwrap().media_source_ids, media_ids);
+        assert_eq!(aggregate.media.len(), 2);
+        assert_eq!(aggregate.media[0].source_media_id, "m2");
+        assert_eq!(aggregate.media[1].source_media_id, "m1");
+        assert_eq!(
+            aggregate.missing_media_source_ids,
+            vec!["missing".to_owned()]
+        );
+        assert_eq!(aggregate.transfer_summary.processing, 1);
+        assert_eq!(aggregate.transfer_summary.succeeded, 1);
     }
 }
