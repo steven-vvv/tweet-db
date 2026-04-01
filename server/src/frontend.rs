@@ -112,7 +112,10 @@ mod tests {
                 },
                 transfer: TransferSection {
                     enabled: false,
-                    part_size_bytes: 1,
+                    chunk_size_bytes: 1,
+                    download_parallelism: 1,
+                    upload_parallelism: 1,
+                    max_in_flight_parts: 1,
                     worker_poll_interval_seconds: 5,
                     max_attempts: 1,
                 },

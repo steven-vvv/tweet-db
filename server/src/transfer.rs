@@ -1,4 +1,4 @@
-use std::{cmp, collections::HashMap};
+use std::{cmp, collections::HashMap, sync::Arc};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -7,10 +7,15 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt, stream};
+use reqwest::{
+    Client as HttpClient, Response, StatusCode,
+    header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
+};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 
@@ -22,11 +27,10 @@ use crate::{
 #[derive(Debug, Clone)]
 struct TransferJob {
     id: Uuid,
+    media_id: Uuid,
     source_kind: String,
-    source_media_id: String,
-    source_post_id: String,
-    source_url: String,
-    content_type: String,
+    fetch_url: String,
+    content_type_hint: String,
     attempt_count: i32,
 }
 
@@ -35,6 +39,21 @@ pub struct TransferStatusInfo {
     pub status: Option<String>,
     pub storage_object_key: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UploadMode {
+    SinglePut,
+    Multipart,
+}
+
+impl UploadMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SinglePut => "single_put",
+            Self::Multipart => "multipart",
+        }
+    }
 }
 
 pub fn spawn_worker(state: AppState) {
@@ -79,63 +98,109 @@ pub fn spawn_worker(state: AppState) {
 
 pub async fn enqueue_media_transfer(
     pool: &PgPool,
+    media_id: Uuid,
     source_kind: &str,
-    source_media_id: &str,
-    source_post_id: &str,
-    source_url: &str,
-    content_type: &str,
+    fetch_url: &str,
+    content_type_hint: Option<&str>,
 ) -> AppResult<bool> {
-    if source_media_id.trim().is_empty() || source_url.trim().is_empty() {
+    let fetch_url = fetch_url.trim();
+    if fetch_url.is_empty() {
         return Ok(false);
     }
 
-    let result = sqlx::query(
+    let existing = sqlx::query(
         r#"
-        INSERT INTO transfer_jobs (
-            id,
-            source_kind,
-            source_media_id,
-            source_post_id,
-            source_url,
-            content_type,
-            status,
-            next_run_at,
-            created_at,
-            updated_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW(), NOW(), NOW())
-        ON CONFLICT (source_kind, source_media_id) DO UPDATE
-        SET source_post_id = EXCLUDED.source_post_id,
-            source_url = EXCLUDED.source_url,
-            content_type = EXCLUDED.content_type,
-            status = CASE
-                WHEN transfer_jobs.status = 'succeeded' THEN transfer_jobs.status
-                ELSE 'pending'
-            END,
-            next_run_at = CASE
-                WHEN transfer_jobs.status = 'succeeded' THEN transfer_jobs.next_run_at
-                ELSE NOW()
-            END,
-            updated_at = NOW()
+        SELECT status, fetch_url
+        FROM media_transfer_jobs
+        WHERE media_id = $1
         "#,
     )
-    .bind(Uuid::now_v7())
+    .bind(media_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let should_enqueue = match existing.as_ref() {
+        None => true,
+        Some(row) => {
+            let status: String = row.get("status");
+            let existing_fetch_url: String = row.get("fetch_url");
+            status != "succeeded" || existing_fetch_url != fetch_url
+        }
+    };
+
+    if existing.is_none() {
+        sqlx::query(
+            r#"
+            INSERT INTO media_transfer_jobs (
+                id,
+                media_id,
+                source_kind,
+                fetch_url,
+                content_type_hint,
+                status,
+                next_run_at,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, 'pending', NOW(), NOW(), NOW())
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(media_id)
+        .bind(source_kind)
+        .bind(fetch_url)
+        .bind(content_type_hint.unwrap_or_default().trim())
+        .execute(pool)
+        .await?;
+        return Ok(true);
+    }
+
+    let status = if should_enqueue {
+        "pending"
+    } else {
+        "succeeded"
+    };
+    sqlx::query(
+        r#"
+        UPDATE media_transfer_jobs
+        SET source_kind = $2,
+            fetch_url = $3,
+            content_type_hint = CASE
+                WHEN $4 = '' THEN content_type_hint
+                ELSE $4
+            END,
+            status = $5,
+            next_run_at = CASE
+                WHEN $5 = 'pending' THEN NOW()
+                ELSE next_run_at
+            END,
+            leased_at = CASE
+                WHEN $5 = 'pending' THEN NULL
+                ELSE leased_at
+            END,
+            last_error = CASE
+                WHEN $5 = 'pending' THEN NULL
+                ELSE last_error
+            END,
+            updated_at = NOW()
+        WHERE media_id = $1
+        "#,
+    )
+    .bind(media_id)
     .bind(source_kind)
-    .bind(source_media_id)
-    .bind(source_post_id)
-    .bind(source_url)
-    .bind(content_type)
+    .bind(fetch_url)
+    .bind(content_type_hint.unwrap_or_default().trim())
+    .bind(status)
     .execute(pool)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    Ok(should_enqueue)
 }
 
 pub async fn fetch_transfer_statuses(
     pool: &PgPool,
-    source_kind: &str,
-    media_ids: &[String],
-) -> AppResult<HashMap<String, TransferStatusInfo>> {
+    media_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, TransferStatusInfo>> {
     if media_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -143,21 +208,18 @@ pub async fn fetch_transfer_statuses(
     let rows = sqlx::query(
         r#"
         SELECT
-            j.source_media_id,
+            j.media_id,
             j.status,
             j.last_error,
             o.object_key
-        FROM transfer_jobs j
+        FROM media_transfer_jobs j
         LEFT JOIN media_storage_bindings b
-            ON b.source_kind = j.source_kind
-           AND b.source_media_id = j.source_media_id
-           AND b.variant_role = 'primary'
+            ON b.media_id = j.media_id
+           AND b.object_role = 'original'
         LEFT JOIN storage_objects o ON o.id = b.storage_object_id
-        WHERE j.source_kind = $1
-          AND j.source_media_id = ANY($2)
+        WHERE j.media_id = ANY($1)
         "#,
     )
-    .bind(source_kind)
     .bind(media_ids)
     .fetch_all(pool)
     .await?;
@@ -165,7 +227,7 @@ pub async fn fetch_transfer_statuses(
     let mut map = HashMap::new();
     for row in rows {
         map.insert(
-            row.get::<String, _>("source_media_id"),
+            row.get::<Uuid, _>("media_id"),
             TransferStatusInfo {
                 status: row.get("status"),
                 storage_object_key: row.get("object_key"),
@@ -209,14 +271,14 @@ async fn claim_next_job(pool: &PgPool) -> AppResult<Option<TransferJob>> {
         r#"
         WITH picked AS (
             SELECT id
-            FROM transfer_jobs
+            FROM media_transfer_jobs
             WHERE status IN ('pending', 'retryable')
               AND next_run_at <= NOW()
             ORDER BY next_run_at ASC, created_at ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        UPDATE transfer_jobs j
+        UPDATE media_transfer_jobs j
         SET status = 'processing',
             leased_at = NOW(),
             updated_at = NOW()
@@ -224,11 +286,10 @@ async fn claim_next_job(pool: &PgPool) -> AppResult<Option<TransferJob>> {
         WHERE j.id = picked.id
         RETURNING
             j.id,
+            j.media_id,
             j.source_kind,
-            j.source_media_id,
-            j.source_post_id,
-            j.source_url,
-            j.content_type,
+            j.fetch_url,
+            j.content_type_hint,
             j.attempt_count
         "#,
     )
@@ -237,11 +298,10 @@ async fn claim_next_job(pool: &PgPool) -> AppResult<Option<TransferJob>> {
 
     Ok(row.map(|row| TransferJob {
         id: row.get("id"),
+        media_id: row.get("media_id"),
         source_kind: row.get("source_kind"),
-        source_media_id: row.get("source_media_id"),
-        source_post_id: row.get("source_post_id"),
-        source_url: row.get("source_url"),
-        content_type: row.get("content_type"),
+        fetch_url: row.get("fetch_url"),
+        content_type_hint: row.get("content_type_hint"),
         attempt_count: row.get("attempt_count"),
     }))
 }
@@ -250,8 +310,10 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
     let attempt_id = Uuid::now_v7();
     sqlx::query(
         r#"
-        INSERT INTO transfer_attempts (id, job_id, status, started_at)
-        VALUES ($1, $2, 'running', NOW())
+        INSERT INTO media_transfer_attempts (
+            id, job_id, status, upload_mode, started_at
+        )
+        VALUES ($1, $2, 'running', 'single_put', NOW())
         "#,
     )
     .bind(attempt_id)
@@ -269,20 +331,14 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
                 &outcome.object_key,
                 outcome.etag,
                 outcome.size_bytes,
-                &job.content_type,
+                &outcome.content_type,
             )
             .await?;
-            bind_storage_object(
-                &state.db,
-                &job.source_kind,
-                &job.source_media_id,
-                storage_object_id,
-            )
-            .await?;
+            bind_storage_object(&state.db, job.media_id, storage_object_id).await?;
 
             sqlx::query(
                 r#"
-                UPDATE transfer_jobs
+                UPDATE media_transfer_jobs
                 SET status = 'succeeded',
                     attempt_count = attempt_count + 1,
                     storage_object_id = $2,
@@ -299,15 +355,17 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
 
             sqlx::query(
                 r#"
-                UPDATE transfer_attempts
+                UPDATE media_transfer_attempts
                 SET status = 'succeeded',
-                    bytes_uploaded = $2,
-                    parts_uploaded = $3,
+                    upload_mode = $2,
+                    bytes_uploaded = $3,
+                    parts_uploaded = $4,
                     finished_at = NOW()
                 WHERE id = $1
                 "#,
             )
             .bind(attempt_id)
+            .bind(outcome.upload_mode.as_str())
             .bind(outcome.size_bytes)
             .bind(outcome.parts_uploaded)
             .execute(&state.db)
@@ -323,7 +381,7 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
 
             sqlx::query(
                 r#"
-                UPDATE transfer_jobs
+                UPDATE media_transfer_jobs
                 SET status = $2,
                     attempt_count = attempt_count + 1,
                     next_run_at = $3,
@@ -342,7 +400,7 @@ async fn process_job(state: &AppState, client: &Client, job: TransferJob) -> App
 
             sqlx::query(
                 r#"
-                UPDATE transfer_attempts
+                UPDATE media_transfer_attempts
                 SET status = 'failed',
                     error = $2,
                     finished_at = NOW()
@@ -364,6 +422,8 @@ struct UploadOutcome {
     etag: Option<String>,
     size_bytes: i64,
     parts_uploaded: i32,
+    content_type: String,
+    upload_mode: UploadMode,
 }
 
 async fn upload_job(
@@ -371,91 +431,504 @@ async fn upload_job(
     client: &Client,
     job: &TransferJob,
 ) -> AppResult<UploadOutcome> {
-    let object_key = build_object_key(job)?;
-    let create = client
-        .create_multipart_upload()
-        .bucket(&state.settings.config.storage.bucket)
-        .key(&object_key)
-        .content_type(&job.content_type)
+    let chunk_size = state.settings.config.transfer.chunk_size_bytes.max(1);
+    let response = state
+        .http_client
+        .get(&job.fetch_url)
+        .header(RANGE, range_header_value(0, chunk_size as u64 - 1))
         .send()
-        .await
-        .map_err(|error| {
-            AppError::upstream(format!("failed to create multipart upload: {error}"))
-        })?;
-    let upload_id = create
-        .upload_id()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| AppError::upstream("multipart upload id missing"))?;
+        .await?;
 
-    let response = state.http_client.get(&job.source_url).send().await?;
     if !response.status().is_success() {
-        let _ = abort_upload(client, state, &object_key, &upload_id).await;
         return Err(AppError::upstream(format!(
             "source download failed with status {}",
             response.status()
         )));
     }
 
-    let mut stream = response.bytes_stream();
-    let part_size = state.settings.config.transfer.part_size_bytes;
-    let mut buffer = Vec::with_capacity(part_size);
-    let mut parts = Vec::new();
-    let mut part_number = 1_i32;
-    let mut total_bytes = 0_i64;
+    let content_type = response_content_type(&response, &job.content_type_hint);
+    if response.status() == StatusCode::PARTIAL_CONTENT {
+        return upload_from_ranged_probe(state, client, job, response, &content_type, chunk_size)
+            .await;
+    }
 
+    upload_from_full_response(state, client, job, response, &content_type, chunk_size).await
+}
+
+async fn upload_from_ranged_probe(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    response: Response,
+    content_type: &str,
+    chunk_size: usize,
+) -> AppResult<UploadOutcome> {
+    let total_size = parse_total_size_from_content_range(&response);
+    let first_part = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::upstream(format!("failed to read ranged probe: {error}")))?
+        .to_vec();
+
+    if first_part.len() < chunk_size {
+        return upload_single_object(state, client, job, first_part, content_type).await;
+    }
+
+    if let Some(total_size) = total_size {
+        if total_size < chunk_size as u64 {
+            return upload_single_object(state, client, job, first_part, content_type).await;
+        }
+
+        return upload_multipart_parallel_from_ranges(
+            state,
+            client,
+            job,
+            first_part,
+            total_size,
+            content_type,
+            chunk_size,
+        )
+        .await;
+    }
+
+    upload_multipart_from_unknown_ranges(state, client, job, first_part, content_type, chunk_size)
+        .await
+}
+
+async fn upload_from_full_response(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    response: Response,
+    content_type: &str,
+    chunk_size: usize,
+) -> AppResult<UploadOutcome> {
+    let mut stream = response.bytes_stream();
+    let mut first_buffer = Vec::with_capacity(chunk_size);
+
+    while first_buffer.len() < chunk_size {
+        match stream.next().await {
+            Some(chunk) => {
+                let chunk = chunk.map_err(|error| {
+                    AppError::upstream(format!("source stream failed during probe: {error}"))
+                })?;
+                first_buffer.extend_from_slice(&chunk);
+            }
+            None => {
+                return upload_single_object(state, client, job, first_buffer, content_type).await;
+            }
+        }
+    }
+
+    let remainder = first_buffer.split_off(chunk_size);
+    upload_multipart_from_stream(
+        state,
+        client,
+        job,
+        first_buffer,
+        remainder,
+        stream,
+        content_type,
+        chunk_size,
+    )
+    .await
+}
+
+async fn upload_single_object(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    bytes: Vec<u8>,
+    content_type: &str,
+) -> AppResult<UploadOutcome> {
+    let object_key = build_object_key(job, content_type)?;
+    let response = client
+        .put_object()
+        .bucket(&state.settings.config.storage.bucket)
+        .key(&object_key)
+        .content_type(content_type)
+        .body(ByteStream::from(bytes.clone()))
+        .send()
+        .await
+        .map_err(|error| AppError::upstream(format!("failed to upload object: {error}")))?;
+
+    Ok(UploadOutcome {
+        object_key,
+        etag: response.e_tag().map(ToOwned::to_owned),
+        size_bytes: bytes.len() as i64,
+        parts_uploaded: 1,
+        content_type: content_type.to_owned(),
+        upload_mode: UploadMode::SinglePut,
+    })
+}
+
+async fn upload_multipart_parallel_from_ranges(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    first_part: Vec<u8>,
+    total_size: u64,
+    content_type: &str,
+    chunk_size: usize,
+) -> AppResult<UploadOutcome> {
+    let object_key = build_object_key(job, content_type)?;
+    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let bucket = state.settings.config.storage.bucket.clone();
+    let mut completed_parts = Vec::new();
+
+    let first_completed =
+        match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
+            Ok(part) => part,
+            Err(error) => {
+                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                return Err(error);
+            }
+        };
+    completed_parts.push(NumberedCompletedPart {
+        part_number: 1,
+        part: first_completed,
+    });
+
+    let total_parts = total_size.div_ceil(chunk_size as u64) as i32;
+    let in_flight = state.settings.config.transfer.max_in_flight_parts.max(1);
+    let download_limit = Arc::new(Semaphore::new(
+        state.settings.config.transfer.download_parallelism.max(1),
+    ));
+    let upload_limit = Arc::new(Semaphore::new(
+        state.settings.config.transfer.upload_parallelism.max(1),
+    ));
+
+    let fetch_url = job.fetch_url.clone();
+    let http_client = state.http_client.clone();
+    let upload_client = client.clone();
+
+    let mut tasks = stream::iter(2..=total_parts)
+        .map(|part_number| {
+            let fetch_url = fetch_url.clone();
+            let http_client = http_client.clone();
+            let upload_client = upload_client.clone();
+            let bucket = bucket.clone();
+            let object_key = object_key.clone();
+            let upload_id = upload_id.clone();
+            let download_limit = download_limit.clone();
+            let upload_limit = upload_limit.clone();
+
+            async move {
+                let _download_permit = download_limit
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::upstream("download semaphore closed"))?;
+                let start = ((part_number - 1) as u64) * chunk_size as u64;
+                let end = cmp::min(total_size, start + chunk_size as u64) - 1;
+                let bytes = download_range_bytes(&http_client, &fetch_url, start, end).await?;
+                drop(_download_permit);
+
+                let _upload_permit = upload_limit
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::upstream("upload semaphore closed"))?;
+                let part = upload_part(
+                    &upload_client,
+                    &bucket,
+                    &object_key,
+                    &upload_id,
+                    part_number,
+                    bytes,
+                )
+                .await?;
+
+                Ok::<NumberedCompletedPart, AppError>(NumberedCompletedPart { part_number, part })
+            }
+        })
+        .buffer_unordered(in_flight);
+
+    while let Some(result) = tasks.next().await {
+        match result {
+            Ok(part) => completed_parts.push(part),
+            Err(error) => {
+                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                return Err(error);
+            }
+        }
+    }
+    drop(tasks);
+
+    completed_parts.sort_by_key(|item| item.part_number);
+    let completed = CompletedMultipartUpload::builder()
+        .set_parts(Some(
+            completed_parts.into_iter().map(|item| item.part).collect(),
+        ))
+        .build();
+
+    let response = match complete_multipart_upload(
+        client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        completed,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    };
+
+    Ok(UploadOutcome {
+        object_key,
+        etag: response.e_tag().map(ToOwned::to_owned),
+        size_bytes: total_size as i64,
+        parts_uploaded: total_parts,
+        content_type: content_type.to_owned(),
+        upload_mode: UploadMode::Multipart,
+    })
+}
+
+async fn upload_multipart_from_unknown_ranges(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    first_part: Vec<u8>,
+    content_type: &str,
+    chunk_size: usize,
+) -> AppResult<UploadOutcome> {
+    let object_key = build_object_key(job, content_type)?;
+    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let bucket = state.settings.config.storage.bucket.clone();
+    let mut parts = Vec::new();
+    let mut total_bytes = first_part.len() as i64;
+
+    match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
+        Ok(part) => parts.push(part),
+        Err(error) => {
+            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    }
+
+    let mut next_start = chunk_size as u64;
+    let mut part_number = 2_i32;
+    loop {
+        let end = next_start + chunk_size as u64 - 1;
+        let bytes = match download_range_bytes_optional(
+            &state.http_client,
+            &job.fetch_url,
+            next_start,
+            end,
+        )
+        .await
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            Err(error) => {
+                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                return Err(error);
+            }
+        };
+
+        total_bytes += bytes.len() as i64;
+        let is_last = bytes.len() < chunk_size;
+        match upload_part(client, &bucket, &object_key, &upload_id, part_number, bytes).await {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                return Err(error);
+            }
+        }
+
+        if is_last {
+            break;
+        }
+        next_start += chunk_size as u64;
+        part_number += 1;
+    }
+
+    let parts_uploaded = parts.len() as i32;
+    let completed = CompletedMultipartUpload::builder()
+        .set_parts(Some(parts))
+        .build();
+    let response = match complete_multipart_upload(
+        client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        completed,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    };
+
+    Ok(UploadOutcome {
+        object_key,
+        etag: response.e_tag().map(ToOwned::to_owned),
+        size_bytes: total_bytes,
+        parts_uploaded,
+        content_type: content_type.to_owned(),
+        upload_mode: UploadMode::Multipart,
+    })
+}
+
+async fn upload_multipart_from_stream<S>(
+    state: &AppState,
+    client: &Client,
+    job: &TransferJob,
+    first_part: Vec<u8>,
+    remainder: Vec<u8>,
+    mut stream: S,
+    content_type: &str,
+    chunk_size: usize,
+) -> AppResult<UploadOutcome>
+where
+    S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    let object_key = build_object_key(job, content_type)?;
+    let upload_id = create_multipart_upload(state, client, &object_key, content_type).await?;
+    let bucket = state.settings.config.storage.bucket.clone();
+    let mut parts = Vec::new();
+    let mut total_bytes = first_part.len() as i64;
+
+    match upload_part(client, &bucket, &object_key, &upload_id, 1, first_part).await {
+        Ok(part) => parts.push(part),
+        Err(error) => {
+            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    }
+
+    let mut buffer = remainder;
+    let mut part_number = 2_i32;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|error| AppError::upstream(format!("source stream failed: {error}")))?;
-        total_bytes += chunk.len() as i64;
         buffer.extend_from_slice(&chunk);
 
-        while buffer.len() >= part_size {
-            let tail = buffer.split_off(part_size);
+        while buffer.len() >= chunk_size {
+            let tail = buffer.split_off(chunk_size);
             let current = std::mem::replace(&mut buffer, tail);
-            let part =
-                upload_part(client, state, &object_key, &upload_id, part_number, current).await?;
-            parts.push(part);
+            total_bytes += current.len() as i64;
+            match upload_part(
+                client,
+                &bucket,
+                &object_key,
+                &upload_id,
+                part_number,
+                current,
+            )
+            .await
+            {
+                Ok(part) => parts.push(part),
+                Err(error) => {
+                    let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                    return Err(error);
+                }
+            }
             part_number += 1;
         }
     }
 
     if !buffer.is_empty() {
-        let part = upload_part(client, state, &object_key, &upload_id, part_number, buffer).await?;
-        parts.push(part);
+        total_bytes += buffer.len() as i64;
+        match upload_part(
+            client,
+            &bucket,
+            &object_key,
+            &upload_id,
+            part_number,
+            buffer,
+        )
+        .await
+        {
+            Ok(part) => parts.push(part),
+            Err(error) => {
+                let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+                return Err(error);
+            }
+        }
     }
 
-    if parts.is_empty() {
-        let _ = abort_upload(client, state, &object_key, &upload_id).await;
-        return Err(AppError::upstream("multipart upload produced no parts"));
-    }
-
+    let parts_uploaded = parts.len() as i32;
     let completed = CompletedMultipartUpload::builder()
-        .set_parts(Some(parts.clone()))
+        .set_parts(Some(parts))
         .build();
+    let response = match complete_multipart_upload(
+        client,
+        &bucket,
+        &object_key,
+        &upload_id,
+        completed,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = abort_upload(client, &bucket, &object_key, &upload_id).await;
+            return Err(error);
+        }
+    };
 
-    let complete = client
-        .complete_multipart_upload()
+    Ok(UploadOutcome {
+        object_key,
+        etag: response.e_tag().map(ToOwned::to_owned),
+        size_bytes: total_bytes,
+        parts_uploaded,
+        content_type: content_type.to_owned(),
+        upload_mode: UploadMode::Multipart,
+    })
+}
+
+async fn create_multipart_upload(
+    state: &AppState,
+    client: &Client,
+    object_key: &str,
+    content_type: &str,
+) -> AppResult<String> {
+    let create = client
+        .create_multipart_upload()
         .bucket(&state.settings.config.storage.bucket)
-        .key(&object_key)
-        .upload_id(&upload_id)
+        .key(object_key)
+        .content_type(content_type)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::upstream(format!("failed to create multipart upload: {error}"))
+        })?;
+
+    create
+        .upload_id()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::upstream("multipart upload id missing"))
+}
+
+async fn complete_multipart_upload(
+    client: &Client,
+    bucket: &str,
+    object_key: &str,
+    upload_id: &str,
+    completed: CompletedMultipartUpload,
+) -> AppResult<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(object_key)
+        .upload_id(upload_id)
         .multipart_upload(completed)
         .send()
         .await
         .map_err(|error| {
             AppError::upstream(format!("failed to complete multipart upload: {error}"))
-        })?;
-
-    Ok(UploadOutcome {
-        object_key,
-        etag: complete.e_tag().map(ToOwned::to_owned),
-        size_bytes: total_bytes,
-        parts_uploaded: parts.len() as i32,
-    })
+        })
 }
 
 async fn upload_part(
     client: &Client,
-    state: &AppState,
+    bucket: &str,
     object_key: &str,
     upload_id: &str,
     part_number: i32,
@@ -463,7 +936,7 @@ async fn upload_part(
 ) -> AppResult<CompletedPart> {
     let response = client
         .upload_part()
-        .bucket(&state.settings.config.storage.bucket)
+        .bucket(bucket)
         .key(object_key)
         .upload_id(upload_id)
         .part_number(part_number)
@@ -480,13 +953,13 @@ async fn upload_part(
 
 async fn abort_upload(
     client: &Client,
-    state: &AppState,
+    bucket: &str,
     object_key: &str,
     upload_id: &str,
 ) -> AppResult<()> {
     client
         .abort_multipart_upload()
-        .bucket(&state.settings.config.storage.bucket)
+        .bucket(bucket)
         .key(object_key)
         .upload_id(upload_id)
         .send()
@@ -533,41 +1006,93 @@ async fn upsert_storage_object(
 
 async fn bind_storage_object(
     pool: &PgPool,
-    source_kind: &str,
-    source_media_id: &str,
+    media_id: Uuid,
     storage_object_id: Uuid,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
         INSERT INTO media_storage_bindings (
-            id, source_kind, source_media_id, storage_object_id, variant_role
+            id, media_id, storage_object_id, object_role
         )
-        VALUES ($1, $2, $3, $4, 'primary')
-        ON CONFLICT (source_kind, source_media_id, variant_role) DO UPDATE
+        VALUES ($1, $2, $3, 'original')
+        ON CONFLICT (media_id, object_role) DO UPDATE
         SET storage_object_id = EXCLUDED.storage_object_id
         "#,
     )
     .bind(Uuid::now_v7())
-    .bind(source_kind)
-    .bind(source_media_id)
+    .bind(media_id)
     .bind(storage_object_id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-fn build_object_key(job: &TransferJob) -> AppResult<String> {
+async fn download_range_bytes(
+    client: &HttpClient,
+    url: &str,
+    start: u64,
+    end: u64,
+) -> AppResult<Vec<u8>> {
+    let response = client
+        .get(url)
+        .header(RANGE, range_header_value(start, end))
+        .send()
+        .await?;
+
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::upstream(format!(
+            "range download failed with status {}",
+            response.status()
+        )));
+    }
+
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| AppError::upstream(format!("failed to read range body: {error}")))
+}
+
+async fn download_range_bytes_optional(
+    client: &HttpClient,
+    url: &str,
+    start: u64,
+    end: u64,
+) -> AppResult<Option<Vec<u8>>> {
+    let response = client
+        .get(url)
+        .header(RANGE, range_header_value(start, end))
+        .send()
+        .await?;
+
+    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+        return Ok(None);
+    }
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::upstream(format!(
+            "range download failed with status {}",
+            response.status()
+        )));
+    }
+
+    response
+        .bytes()
+        .await
+        .map(|bytes| Some(bytes.to_vec()))
+        .map_err(|error| AppError::upstream(format!("failed to read range body: {error}")))
+}
+
+fn build_object_key(job: &TransferJob, content_type: &str) -> AppResult<String> {
     let now = OffsetDateTime::now_utc();
-    let digest = hex_digest(&job.source_url);
-    let ext = extension_for_object(&job.source_url, &job.content_type);
+    let digest = hex_digest(&job.fetch_url);
+    let ext = extension_for_object(&job.fetch_url, content_type);
     Ok(format!(
-        "{}/{}/{:02}/{:02}/{}/{}/{}.{}",
+        "{}/{}/{:02}/{:02}/{}/{}.{}",
         job.source_kind,
         now.year(),
         u8::from(now.month()),
         now.day(),
-        sanitize_key_segment(&job.source_post_id),
-        sanitize_key_segment(&job.source_media_id),
+        sanitize_key_segment(&job.media_id.to_string()),
         digest,
         ext
     ))
@@ -575,9 +1100,18 @@ fn build_object_key(job: &TransferJob) -> AppResult<String> {
 
 fn extension_for_object(source_url: &str, content_type: &str) -> String {
     if let Ok(url) = Url::parse(source_url) {
+        if let Some(format) = url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "format").then(|| value.into_owned()))
+        {
+            if !format.trim().is_empty() {
+                return format.to_ascii_lowercase();
+            }
+        }
+
         if let Some(last) = url.path_segments().and_then(|segments| segments.last()) {
-            if let Some(ext) = last.rsplit('.').next() {
-                if ext != last && !ext.is_empty() {
+            if let Some((_, ext)) = last.rsplit_once('.') {
+                if !ext.is_empty() {
                     return ext.to_ascii_lowercase();
                 }
             }
@@ -587,6 +1121,9 @@ fn extension_for_object(source_url: &str, content_type: &str) -> String {
     match content_type {
         "video/mp4" => "mp4".to_owned(),
         "image/gif" => "gif".to_owned(),
+        "image/png" => "png".to_owned(),
+        "image/webp" => "webp".to_owned(),
+        "image/jpeg" => "jpg".to_owned(),
         _ => "bin".to_owned(),
     }
 }
@@ -611,4 +1148,37 @@ fn sanitize_key_segment(value: &str) -> String {
 fn hex_digest(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn range_header_value(start: u64, end: u64) -> String {
+    format!("bytes={start}-{end}")
+}
+
+fn parse_total_size_from_content_range(response: &Response) -> Option<u64> {
+    let value = response.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let (_, total) = value.rsplit_once('/')?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+fn response_content_type(response: &Response, hint: &str) -> String {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let hint = hint.trim();
+            (!hint.is_empty()).then(|| hint.to_owned())
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_owned())
+}
+
+#[derive(Debug)]
+struct NumberedCompletedPart {
+    part_number: i32,
+    part: CompletedPart,
 }

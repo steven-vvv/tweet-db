@@ -3,6 +3,7 @@ use axum::{
     extract::{Extension, State},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use time::OffsetDateTime;
@@ -11,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     auth::{self, ActiveSession},
     error::{AppError, AppResult},
+    media::{self, ManagedIdentityKind, ManagedMediaFamily, ManagedMediaSpec},
     state::AppState,
     transfer::{self, TransferStatusInfo},
 };
@@ -213,6 +215,12 @@ struct NormalizedItems<T> {
     skipped_empty: usize,
 }
 
+#[derive(Debug, Default)]
+struct ProcessOutcome {
+    accepted: bool,
+    transfer_jobs_enqueued: i32,
+}
+
 pub async fn ingest_submission(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -259,45 +267,30 @@ pub async fn ingest_submission(
 
     for user in &users.items {
         match process_actor(&state.db, submission_id, &source_kind, user, now).await {
-            Ok(true) => accepted_count += 1,
-            Ok(false) => warnings.push("skipped user with empty id".to_owned()),
+            Ok(outcome) if outcome.accepted => {
+                accepted_count += 1;
+                transfer_jobs_enqueued += outcome.transfer_jobs_enqueued;
+            }
+            Ok(_) => warnings.push("skipped user with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert user {}: {error}", user.id)),
         }
     }
 
     for tweet in &tweets.items {
         match process_post(&state.db, submission_id, &source_kind, tweet, now).await {
-            Ok(true) => accepted_count += 1,
-            Ok(false) => warnings.push("skipped tweet with empty id".to_owned()),
+            Ok(outcome) if outcome.accepted => accepted_count += 1,
+            Ok(_) => warnings.push("skipped tweet with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert tweet {}: {error}", tweet.id)),
         }
     }
 
     for item in &media.items {
         match process_media(&state.db, submission_id, &source_kind, item, now).await {
-            Ok(true) => {
+            Ok(outcome) if outcome.accepted => {
                 accepted_count += 1;
-                if let Some((source_url, content_type)) = transfer_candidate(item) {
-                    match transfer::enqueue_media_transfer(
-                        &state.db,
-                        &source_kind,
-                        item.id.trim(),
-                        item.tweet_id.trim(),
-                        &source_url,
-                        &content_type,
-                    )
-                    .await
-                    {
-                        Ok(true) => transfer_jobs_enqueued += 1,
-                        Ok(false) => {}
-                        Err(error) => warnings.push(format!(
-                            "failed to enqueue transfer for media {}: {error}",
-                            item.id
-                        )),
-                    }
-                }
+                transfer_jobs_enqueued += outcome.transfer_jobs_enqueued;
             }
-            Ok(false) => warnings.push("skipped media with empty id".to_owned()),
+            Ok(_) => warnings.push("skipped media with empty id".to_owned()),
             Err(error) => warnings.push(format!("failed to upsert media {}: {error}", item.id)),
         }
     }
@@ -383,8 +376,15 @@ pub async fn query_post_status(
         .into_iter()
         .map(|item| (item.source_media_id.clone(), item))
         .collect::<HashMap<_, _>>();
+
+    let managed_media_ids = media_by_id
+        .values()
+        .map(|item| item.managed_media_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let transfer_statuses =
-        transfer::fetch_transfer_statuses(&state.db, &source_kind, &media_ids).await?;
+        transfer::fetch_transfer_statuses(&state.db, &managed_media_ids).await?;
 
     let metrics = fetch_latest_post_metrics(&state.db, &source_kind, &unique_post_ids).await?;
     let metrics_by_post = metrics
@@ -579,15 +579,46 @@ async fn process_actor(
     source_kind: &str,
     item: &XUserInput,
     observed_at: OffsetDateTime,
-) -> AppResult<bool> {
-    if item.id.trim().is_empty() {
-        return Ok(false);
+) -> AppResult<ProcessOutcome> {
+    let actor_id = item.id.trim();
+    if actor_id.is_empty() {
+        return Ok(ProcessOutcome::default());
     }
 
-    upsert_actor(pool, submission_id, source_kind, item, observed_at).await?;
-    insert_actor_profile_observation(pool, submission_id, source_kind, item, observed_at).await?;
+    upsert_actor_head(pool, submission_id, source_kind, actor_id, observed_at).await?;
+
+    let avatar_media =
+        register_actor_avatar_media(pool, submission_id, source_kind, item, observed_at).await?;
+    let banner_media =
+        register_actor_banner_media(pool, submission_id, source_kind, item, observed_at).await?;
+
+    sync_actor_profile_version(
+        pool,
+        submission_id,
+        source_kind,
+        item,
+        avatar_media.as_ref().map(|item| item.id),
+        banner_media.as_ref().map(|item| item.id),
+        observed_at,
+    )
+    .await?;
+
     insert_actor_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
-    Ok(true)
+
+    Ok(ProcessOutcome {
+        accepted: true,
+        transfer_jobs_enqueued: i32::from(
+            avatar_media
+                .as_ref()
+                .map(|item| item.transfer_enqueued)
+                .unwrap_or(false),
+        ) + i32::from(
+            banner_media
+                .as_ref()
+                .map(|item| item.transfer_enqueued)
+                .unwrap_or(false),
+        ),
+    })
 }
 
 async fn process_post(
@@ -596,15 +627,19 @@ async fn process_post(
     source_kind: &str,
     item: &XTweetInput,
     observed_at: OffsetDateTime,
-) -> AppResult<bool> {
+) -> AppResult<ProcessOutcome> {
     if item.id.trim().is_empty() {
-        return Ok(false);
+        return Ok(ProcessOutcome::default());
     }
 
     upsert_post(pool, submission_id, source_kind, item, observed_at).await?;
     replace_post_media(pool, source_kind, item).await?;
     insert_post_metric_observation(pool, submission_id, source_kind, item, observed_at).await?;
-    Ok(true)
+
+    Ok(ProcessOutcome {
+        accepted: true,
+        transfer_jobs_enqueued: 0,
+    })
 }
 
 async fn process_media(
@@ -613,21 +648,35 @@ async fn process_media(
     source_kind: &str,
     item: &XMediaInput,
     observed_at: OffsetDateTime,
-) -> AppResult<bool> {
+) -> AppResult<ProcessOutcome> {
     if item.id.trim().is_empty() {
-        return Ok(false);
+        return Ok(ProcessOutcome::default());
     }
 
-    upsert_media(pool, submission_id, source_kind, item, observed_at).await?;
+    let managed_media =
+        register_post_media(pool, submission_id, source_kind, item, observed_at).await?;
+    upsert_post_media_source(
+        pool,
+        submission_id,
+        source_kind,
+        item,
+        managed_media.id,
+        observed_at,
+    )
+    .await?;
     replace_media_variants(pool, source_kind, item).await?;
-    Ok(true)
+
+    Ok(ProcessOutcome {
+        accepted: true,
+        transfer_jobs_enqueued: i32::from(managed_media.transfer_enqueued),
+    })
 }
 
-async fn upsert_actor(
+async fn upsert_actor_head(
     pool: &PgPool,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XUserInput,
+    actor_id: &str,
     observed_at: OffsetDateTime,
 ) -> AppResult<()> {
     sqlx::query(
@@ -635,6 +684,154 @@ async fn upsert_actor(
         INSERT INTO actors (
             source_kind,
             source_actor_id,
+            first_submission_id,
+            last_submission_id,
+            first_observed_at,
+            last_observed_at
+        )
+        VALUES ($1, $2, $3, $3, $4, $4)
+        ON CONFLICT (source_kind, source_actor_id) DO UPDATE
+        SET last_submission_id = EXCLUDED.last_submission_id,
+            last_observed_at = EXCLUDED.last_observed_at,
+            updated_at = NOW()
+        "#,
+    )
+    .bind(source_kind)
+    .bind(actor_id)
+    .bind(submission_id)
+    .bind(observed_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn sync_actor_profile_version(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    avatar_media_id: Option<Uuid>,
+    banner_media_id: Option<Uuid>,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
+    let actor_id = item.id.trim();
+    let fingerprint = actor_profile_fingerprint(item)?;
+    let current = fetch_current_actor_profile_version(pool, source_kind, actor_id).await?;
+
+    if let Some(current) = current.as_ref() {
+        if current.profile_fingerprint == fingerprint {
+            return Ok(());
+        }
+
+        close_actor_profile_version(pool, current.id, observed_at).await?;
+    }
+
+    let version_id = Uuid::now_v7();
+    let version_no = current.map(|item| item.version_no + 1).unwrap_or(1);
+    insert_actor_profile_version(
+        pool,
+        version_id,
+        submission_id,
+        source_kind,
+        item,
+        version_no,
+        &fingerprint,
+        avatar_media_id,
+        banner_media_id,
+        observed_at,
+    )
+    .await?;
+    set_actor_current_profile_version(
+        pool,
+        source_kind,
+        actor_id,
+        version_id,
+        submission_id,
+        observed_at,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn fetch_current_actor_profile_version(
+    pool: &PgPool,
+    source_kind: &str,
+    actor_id: &str,
+) -> AppResult<Option<CurrentActorProfileVersionRow>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            v.id,
+            v.version_no,
+            v.profile_fingerprint
+        FROM actors a
+        LEFT JOIN actor_profile_versions v ON v.id = a.current_profile_version_id
+        WHERE a.source_kind = $1
+          AND a.source_actor_id = $2
+        "#,
+    )
+    .bind(source_kind)
+    .bind(actor_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|row| {
+        row.try_get("id")
+            .ok()
+            .map(|id| CurrentActorProfileVersionRow {
+                id,
+                version_no: row.get("version_no"),
+                profile_fingerprint: row.get("profile_fingerprint"),
+            })
+    }))
+}
+
+async fn close_actor_profile_version(
+    pool: &PgPool,
+    version_id: Uuid,
+    effective_to: OffsetDateTime,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE actor_profile_versions
+        SET effective_to = $2
+        WHERE id = $1
+          AND effective_to IS NULL
+        "#,
+    )
+    .bind(version_id)
+    .bind(effective_to)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_actor_profile_version(
+    pool: &PgPool,
+    version_id: Uuid,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    version_no: i64,
+    fingerprint: &str,
+    avatar_media_id: Option<Uuid>,
+    banner_media_id: Option<Uuid>,
+    observed_at: OffsetDateTime,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO actor_profile_versions (
+            id,
+            submission_id,
+            source_kind,
+            source_actor_id,
+            version_no,
+            effective_from,
+            profile_fingerprint,
             name,
             screen_name,
             description,
@@ -649,128 +846,69 @@ async fn upsert_actor(
             professional_type,
             pinned_post_source_ids,
             source_created_at_raw,
-            first_submission_id,
-            last_submission_id,
-            first_observed_at,
-            last_observed_at
+            avatar_media_id,
+            banner_media_id
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $17, $18, $18
+            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+            $21, $22, $23
         )
-        ON CONFLICT (source_kind, source_actor_id) DO UPDATE
-        SET name = EXCLUDED.name,
-            screen_name = EXCLUDED.screen_name,
-            description = EXCLUDED.description,
-            location = EXCLUDED.location,
-            avatar_url = EXCLUDED.avatar_url,
-            profile_url = EXCLUDED.profile_url,
-            banner_url = EXCLUDED.banner_url,
-            is_blue_verified = EXCLUDED.is_blue_verified,
-            verified_type = EXCLUDED.verified_type,
-            is_protected = EXCLUDED.is_protected,
-            profile_image_shape = EXCLUDED.profile_image_shape,
-            professional_type = EXCLUDED.professional_type,
-            pinned_post_source_ids = EXCLUDED.pinned_post_source_ids,
-            source_created_at_raw = EXCLUDED.source_created_at_raw,
-            last_submission_id = EXCLUDED.last_submission_id,
-            last_observed_at = EXCLUDED.last_observed_at,
-            updated_at = NOW()
         "#,
     )
+    .bind(version_id)
+    .bind(submission_id)
     .bind(source_kind)
     .bind(item.id.trim())
-    .bind(&item.name)
-    .bind(&item.screen_name)
-    .bind(&item.description)
-    .bind(&item.location)
-    .bind(&item.avatar_url)
+    .bind(version_no)
+    .bind(observed_at)
+    .bind(fingerprint)
+    .bind(item.name.trim())
+    .bind(item.screen_name.trim())
+    .bind(item.description.trim())
+    .bind(item.location.trim())
+    .bind(item.avatar_url.trim())
     .bind(trimmed_option(&item.profile_url))
     .bind(trimmed_option(&item.banner_url))
     .bind(item.is_blue_verified)
     .bind(trimmed_option(&item.verified_type))
     .bind(item.is_protected)
-    .bind(&item.profile_image_shape)
+    .bind(item.profile_image_shape.trim())
     .bind(trimmed_option(&item.professional_type))
     .bind(unique_nonempty_strings(&item.pinned_tweet_ids))
-    .bind(&item.created_at)
-    .bind(submission_id)
-    .bind(observed_at)
+    .bind(item.created_at.trim())
+    .bind(avatar_media_id)
+    .bind(banner_media_id)
     .execute(pool)
     .await?;
 
     Ok(())
 }
 
-async fn insert_actor_profile_observation(
+async fn set_actor_current_profile_version(
     pool: &PgPool,
-    submission_id: Uuid,
     source_kind: &str,
-    item: &XUserInput,
+    actor_id: &str,
+    version_id: Uuid,
+    submission_id: Uuid,
     observed_at: OffsetDateTime,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO actor_profile_observations (
-            submission_id,
-            source_kind,
-            source_actor_id,
-            observed_at,
-            name,
-            screen_name,
-            description,
-            location,
-            avatar_url,
-            profile_url,
-            banner_url,
-            is_blue_verified,
-            verified_type,
-            is_protected,
-            profile_image_shape,
-            professional_type,
-            pinned_post_source_ids,
-            source_created_at_raw
-        )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18
-        )
-        ON CONFLICT (submission_id, source_kind, source_actor_id) DO UPDATE
-        SET observed_at = EXCLUDED.observed_at,
-            name = EXCLUDED.name,
-            screen_name = EXCLUDED.screen_name,
-            description = EXCLUDED.description,
-            location = EXCLUDED.location,
-            avatar_url = EXCLUDED.avatar_url,
-            profile_url = EXCLUDED.profile_url,
-            banner_url = EXCLUDED.banner_url,
-            is_blue_verified = EXCLUDED.is_blue_verified,
-            verified_type = EXCLUDED.verified_type,
-            is_protected = EXCLUDED.is_protected,
-            profile_image_shape = EXCLUDED.profile_image_shape,
-            professional_type = EXCLUDED.professional_type,
-            pinned_post_source_ids = EXCLUDED.pinned_post_source_ids,
-            source_created_at_raw = EXCLUDED.source_created_at_raw
+        UPDATE actors
+        SET current_profile_version_id = $3,
+            last_submission_id = $4,
+            last_observed_at = $5,
+            updated_at = NOW()
+        WHERE source_kind = $1
+          AND source_actor_id = $2
         "#,
     )
-    .bind(submission_id)
     .bind(source_kind)
-    .bind(item.id.trim())
+    .bind(actor_id)
+    .bind(version_id)
+    .bind(submission_id)
     .bind(observed_at)
-    .bind(&item.name)
-    .bind(&item.screen_name)
-    .bind(&item.description)
-    .bind(&item.location)
-    .bind(&item.avatar_url)
-    .bind(trimmed_option(&item.profile_url))
-    .bind(trimmed_option(&item.banner_url))
-    .bind(item.is_blue_verified)
-    .bind(trimmed_option(&item.verified_type))
-    .bind(item.is_protected)
-    .bind(&item.profile_image_shape)
-    .bind(trimmed_option(&item.professional_type))
-    .bind(unique_nonempty_strings(&item.pinned_tweet_ids))
-    .bind(&item.created_at)
     .execute(pool)
     .await?;
 
@@ -882,17 +1020,17 @@ async fn upsert_post(
     .bind(item.id.trim())
     .bind(item.author_id.trim())
     .bind(item.conversation_id.trim())
-    .bind(&item.full_text)
-    .bind(&item.legacy_full_text)
-    .bind(&item.note_text)
-    .bind(&item.lang)
-    .bind(&item.created_at)
+    .bind(item.full_text.trim())
+    .bind(item.legacy_full_text.trim())
+    .bind(trimmed_option(&item.note_text))
+    .bind(item.lang.trim())
+    .bind(item.created_at.trim())
     .bind(trimmed_option(&item.in_reply_to_tweet_id))
     .bind(trimmed_option(&item.in_reply_to_user_id))
     .bind(trimmed_option(&item.quoted_tweet_id))
     .bind(trimmed_option(&item.retweeted_tweet_id))
     .bind(item.possibly_sensitive)
-    .bind(&item.source)
+    .bind(item.source.trim())
     .bind(submission_id)
     .bind(observed_at)
     .execute(pool)
@@ -986,18 +1124,109 @@ async fn insert_post_metric_observation(
     Ok(())
 }
 
-async fn upsert_media(
+async fn register_post_media(
     pool: &PgPool,
     submission_id: Uuid,
     source_kind: &str,
     item: &XMediaInput,
     observed_at: OffsetDateTime,
+) -> AppResult<media::ManagedMediaRecord> {
+    let fetch_url = media::normalize_post_source_url(&item.source_url).ok_or_else(|| {
+        AppError::bad_request(format!("media {} sourceUrl is required", item.id.trim()))
+    })?;
+    let display_url = if item.media_url.trim().is_empty() {
+        fetch_url.clone()
+    } else {
+        item.media_url.trim().to_owned()
+    };
+
+    let spec = ManagedMediaSpec {
+        source_kind: source_kind.to_owned(),
+        media_family: media_family_for_type(&item.r#type)?,
+        identity_kind: ManagedIdentityKind::PostSourceUrl,
+        identity_value: fetch_url.clone(),
+        fetch_url,
+        display_url,
+        thumb_url: trimmed_option(&Some(item.thumb_url.clone())),
+        content_type_hint: media_content_type_hint(item),
+        submission_id,
+        observed_at,
+    };
+
+    media::register_managed_media(pool, &spec).await
+}
+
+async fn register_actor_avatar_media(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<Option<media::ManagedMediaRecord>> {
+    let Some(fetch_url) = media::normalize_actor_avatar_fetch_url(&item.avatar_url) else {
+        return Ok(None);
+    };
+
+    let spec = ManagedMediaSpec {
+        source_kind: source_kind.to_owned(),
+        media_family: ManagedMediaFamily::Image,
+        identity_kind: ManagedIdentityKind::ActorAvatarUrl,
+        identity_value: fetch_url.clone(),
+        fetch_url,
+        display_url: item.avatar_url.trim().to_owned(),
+        thumb_url: None,
+        content_type_hint: media::infer_content_type_from_url(&item.avatar_url),
+        submission_id,
+        observed_at,
+    };
+
+    media::register_managed_media(pool, &spec).await.map(Some)
+}
+
+async fn register_actor_banner_media(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<Option<media::ManagedMediaRecord>> {
+    let Some(raw_banner_url) = trimmed_option(&item.banner_url) else {
+        return Ok(None);
+    };
+    let Some(fetch_url) = media::normalize_actor_banner_fetch_url(&raw_banner_url) else {
+        return Ok(None);
+    };
+
+    let spec = ManagedMediaSpec {
+        source_kind: source_kind.to_owned(),
+        media_family: ManagedMediaFamily::Image,
+        identity_kind: ManagedIdentityKind::ActorBannerUrl,
+        identity_value: fetch_url.clone(),
+        fetch_url,
+        display_url: raw_banner_url.clone(),
+        thumb_url: None,
+        content_type_hint: media::infer_content_type_from_url(&raw_banner_url),
+        submission_id,
+        observed_at,
+    };
+
+    media::register_managed_media(pool, &spec).await.map(Some)
+}
+
+async fn upsert_post_media_source(
+    pool: &PgPool,
+    submission_id: Uuid,
+    source_kind: &str,
+    item: &XMediaInput,
+    managed_media_id: Uuid,
+    observed_at: OffsetDateTime,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO media (
+        INSERT INTO post_media_sources (
             source_kind,
             source_media_id,
+            managed_media_id,
             media_key,
             source_post_id,
             media_type,
@@ -1018,10 +1247,11 @@ async fn upsert_media(
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $16, $17, $17
+            $11, $12, $13, $14, $15, $16, $17, $17, $18, $18
         )
         ON CONFLICT (source_kind, source_media_id) DO UPDATE
-        SET media_key = EXCLUDED.media_key,
+        SET managed_media_id = EXCLUDED.managed_media_id,
+            media_key = EXCLUDED.media_key,
             source_post_id = EXCLUDED.source_post_id,
             media_type = EXCLUDED.media_type,
             media_url = EXCLUDED.media_url,
@@ -1041,15 +1271,16 @@ async fn upsert_media(
     )
     .bind(source_kind)
     .bind(item.id.trim())
-    .bind(&item.media_key)
+    .bind(managed_media_id)
+    .bind(item.media_key.trim())
     .bind(item.tweet_id.trim())
-    .bind(&item.r#type)
-    .bind(&item.media_url)
-    .bind(&item.thumb_url)
-    .bind(&item.source_url)
+    .bind(item.r#type.trim())
+    .bind(item.media_url.trim())
+    .bind(item.thumb_url.trim())
+    .bind(item.source_url.trim())
     .bind(item.width)
     .bind(item.height)
-    .bind(&item.alt_text)
+    .bind(trimmed_option(&item.alt_text))
     .bind(item.allow_download)
     .bind(trimmed_option(&item.source_status_id))
     .bind(trimmed_option(&item.source_user_id))
@@ -1100,7 +1331,7 @@ async fn replace_media_variants(
         .bind(variant.url)
         .bind(position as i32)
         .bind(variant.bitrate)
-        .bind(variant.content_type)
+        .bind(variant.content_type.trim())
         .execute(pool)
         .await?;
     }
@@ -1108,28 +1339,82 @@ async fn replace_media_variants(
     Ok(())
 }
 
-fn transfer_candidate(item: &XMediaInput) -> Option<(String, String)> {
-    if !matches!(item.r#type.as_str(), "video" | "animated_gif")
-        || item.source_url.trim().is_empty()
-    {
+fn media_family_for_type(value: &str) -> AppResult<ManagedMediaFamily> {
+    match value.trim() {
+        "photo" => Ok(ManagedMediaFamily::Image),
+        "video" => Ok(ManagedMediaFamily::Video),
+        "animated_gif" => Ok(ManagedMediaFamily::AnimatedGif),
+        other => Err(AppError::bad_request(format!(
+            "unsupported media type `{other}`"
+        ))),
+    }
+}
+
+fn media_content_type_hint(item: &XMediaInput) -> Option<String> {
+    let source_url = item.source_url.trim();
+    if source_url.is_empty() {
         return None;
     }
 
-    let content_type = item
+    if let Some(value) = item
         .video_variants
         .iter()
-        .find(|variant| variant.url.trim() == item.source_url.trim())
-        .map(|variant| variant.content_type.clone())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if item.r#type == "animated_gif" {
-                "image/gif".to_owned()
-            } else {
-                "video/mp4".to_owned()
-            }
-        });
+        .find(|variant| variant.url.trim() == source_url)
+        .map(|variant| variant.content_type.trim())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_owned());
+    }
 
-    Some((item.source_url.clone(), content_type))
+    media::infer_content_type_from_url(source_url)
+        .or_else(|| media::infer_content_type_from_url(&item.media_url))
+        .or_else(|| match item.r#type.trim() {
+            "photo" => Some("image/jpeg".to_owned()),
+            "video" => Some("video/mp4".to_owned()),
+            "animated_gif" => Some("video/mp4".to_owned()),
+            _ => None,
+        })
+}
+
+fn actor_profile_fingerprint(item: &XUserInput) -> AppResult<String> {
+    #[derive(Serialize)]
+    struct FingerprintPayload<'a> {
+        name: &'a str,
+        screen_name: &'a str,
+        description: &'a str,
+        location: &'a str,
+        avatar_url: &'a str,
+        profile_url: Option<String>,
+        banner_url: Option<String>,
+        is_blue_verified: bool,
+        verified_type: Option<String>,
+        is_protected: bool,
+        profile_image_shape: &'a str,
+        professional_type: Option<String>,
+        pinned_post_source_ids: Vec<String>,
+        source_created_at_raw: &'a str,
+    }
+
+    let payload = FingerprintPayload {
+        name: item.name.trim(),
+        screen_name: item.screen_name.trim(),
+        description: item.description.trim(),
+        location: item.location.trim(),
+        avatar_url: item.avatar_url.trim(),
+        profile_url: trimmed_option(&item.profile_url),
+        banner_url: trimmed_option(&item.banner_url),
+        is_blue_verified: item.is_blue_verified,
+        verified_type: trimmed_option(&item.verified_type),
+        is_protected: item.is_protected,
+        profile_image_shape: item.profile_image_shape.trim(),
+        professional_type: trimmed_option(&item.professional_type),
+        pinned_post_source_ids: unique_nonempty_strings(&item.pinned_tweet_ids),
+        source_created_at_raw: item.created_at.trim(),
+    };
+
+    let bytes = serde_json::to_vec(&payload)?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn trimmed_option(value: &Option<String>) -> Option<String> {
@@ -1138,6 +1423,13 @@ fn trimmed_option(value: &Option<String>) -> Option<String> {
         .map(|item| item.trim())
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[derive(Debug, Clone)]
+struct CurrentActorProfileVersionRow {
+    id: Uuid,
+    version_no: i64,
+    profile_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1185,6 +1477,7 @@ struct ActorRow {
 #[derive(Debug, Clone)]
 struct MediaRow {
     source_media_id: String,
+    managed_media_id: Uuid,
     media_key: String,
     source_post_id: String,
     media_type: String,
@@ -1344,18 +1637,19 @@ async fn fetch_actors(
     let rows = sqlx::query(
         r#"
         SELECT
-            source_actor_id,
-            name,
-            screen_name,
-            description,
-            location,
-            avatar_url,
-            profile_url,
-            banner_url,
-            verified_type
-        FROM actors
-        WHERE source_kind = $1
-          AND source_actor_id = ANY($2)
+            a.source_actor_id,
+            v.name,
+            v.screen_name,
+            v.description,
+            v.location,
+            v.avatar_url,
+            v.profile_url,
+            v.banner_url,
+            v.verified_type
+        FROM actors a
+        JOIN actor_profile_versions v ON v.id = a.current_profile_version_id
+        WHERE a.source_kind = $1
+          AND a.source_actor_id = ANY($2)
         "#,
     )
     .bind(source_kind)
@@ -1392,6 +1686,7 @@ async fn fetch_media(
         r#"
         SELECT
             source_media_id,
+            managed_media_id,
             media_key,
             source_post_id,
             media_type,
@@ -1402,7 +1697,7 @@ async fn fetch_media(
             alt_text,
             allow_download,
             duration_ms
-        FROM media
+        FROM post_media_sources
         WHERE source_kind = $1
           AND source_media_id = ANY($2)
         "#,
@@ -1416,6 +1711,7 @@ async fn fetch_media(
         .into_iter()
         .map(|row| MediaRow {
             source_media_id: row.get("source_media_id"),
+            managed_media_id: row.get("managed_media_id"),
             media_key: row.get("media_key"),
             source_post_id: row.get("source_post_id"),
             media_type: row.get("media_type"),
@@ -1438,7 +1734,7 @@ fn build_post_status_aggregate(
     media_ids: Option<&Vec<String>>,
     media_by_id: &HashMap<String, MediaRow>,
     metrics_by_post: &HashMap<String, PostMetricRow>,
-    transfer_statuses: &HashMap<String, TransferStatusInfo>,
+    transfer_statuses: &HashMap<Uuid, TransferStatusInfo>,
 ) -> PostStatusAggregate {
     let Some(post) = post else {
         return PostStatusAggregate {
@@ -1475,7 +1771,7 @@ fn build_post_status_aggregate(
     let mut transfer_summary = TransferSummary::default();
     for media_id in &media_source_ids {
         if let Some(item) = media_by_id.get(media_id) {
-            let transfer = transfer_statuses.get(media_id);
+            let transfer = transfer_statuses.get(&item.managed_media_id);
             match transfer.and_then(|status| status.status.as_deref()) {
                 Some("pending") | Some("retryable") => transfer_summary.pending += 1,
                 Some("processing") => transfer_summary.processing += 1,
@@ -1582,6 +1878,30 @@ mod tests {
     }
 
     #[test]
+    fn actor_profile_fingerprint_ignores_metric_only_changes() {
+        let base = XUserInput {
+            id: "u1".to_owned(),
+            name: "demo".to_owned(),
+            screen_name: "demo_user".to_owned(),
+            avatar_url: "https://example.com/avatar_normal.jpg".to_owned(),
+            banner_url: Some("https://example.com/banner".to_owned()),
+            followers_count: 10,
+            ..Default::default()
+        };
+        let mut changed = base.clone();
+        changed.followers_count = 999;
+        changed.statuses_count = 77;
+
+        let left = actor_profile_fingerprint(&base).unwrap();
+        let right = actor_profile_fingerprint(&changed).unwrap();
+        assert_eq!(left, right);
+
+        changed.avatar_url = "https://example.com/avatar2_normal.jpg".to_owned();
+        let changed_avatar = actor_profile_fingerprint(&changed).unwrap();
+        assert_ne!(left, changed_avatar);
+    }
+
+    #[test]
     fn build_post_status_aggregate_uses_latest_metrics_and_media_order() {
         let post = PostRow {
             source_post_id: "p1".to_owned(),
@@ -1616,12 +1936,15 @@ mod tests {
             },
         );
 
+        let managed_1 = Uuid::now_v7();
+        let managed_2 = Uuid::now_v7();
         let media_ids = vec!["m2".to_owned(), "missing".to_owned(), "m1".to_owned()];
         let mut media_by_id = HashMap::new();
         media_by_id.insert(
             "m1".to_owned(),
             MediaRow {
                 source_media_id: "m1".to_owned(),
+                managed_media_id: managed_1,
                 media_key: "mk1".to_owned(),
                 source_post_id: "p1".to_owned(),
                 media_type: "photo".to_owned(),
@@ -1638,6 +1961,7 @@ mod tests {
             "m2".to_owned(),
             MediaRow {
                 source_media_id: "m2".to_owned(),
+                managed_media_id: managed_2,
                 media_key: "mk2".to_owned(),
                 source_post_id: "p1".to_owned(),
                 media_type: "video".to_owned(),
@@ -1667,7 +1991,7 @@ mod tests {
 
         let mut transfers = HashMap::new();
         transfers.insert(
-            "m2".to_owned(),
+            managed_2,
             TransferStatusInfo {
                 status: Some("processing".to_owned()),
                 storage_object_key: None,
@@ -1675,7 +1999,7 @@ mod tests {
             },
         );
         transfers.insert(
-            "m1".to_owned(),
+            managed_1,
             TransferStatusInfo {
                 status: Some("succeeded".to_owned()),
                 storage_object_key: Some("object".to_owned()),

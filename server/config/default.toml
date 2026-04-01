@@ -33,7 +33,10 @@ path_style = true
 
 [transfer]
 enabled = true
-part_size_bytes = 10485760
+chunk_size_bytes = 10485760
+download_parallelism = 4
+upload_parallelism = 4
+max_in_flight_parts = 8
 worker_poll_interval_seconds = 5
 max_attempts = 8
 

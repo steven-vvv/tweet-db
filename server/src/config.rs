@@ -145,7 +145,10 @@ pub struct StorageSection {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TransferSection {
     pub enabled: bool,
-    pub part_size_bytes: usize,
+    pub chunk_size_bytes: usize,
+    pub download_parallelism: usize,
+    pub upload_parallelism: usize,
+    pub max_in_flight_parts: usize,
     pub worker_poll_interval_seconds: u64,
     pub max_attempts: i32,
 }

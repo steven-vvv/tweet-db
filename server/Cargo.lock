@@ -3441,6 +3441,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64",
+ "bytes",
  "clap",
  "dotenvy",
  "futures-util",

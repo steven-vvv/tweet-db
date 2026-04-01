@@ -9,13 +9,12 @@ CREATE TABLE storage_objects (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE transfer_jobs (
+CREATE TABLE media_transfer_jobs (
     id UUID PRIMARY KEY,
+    media_id UUID NOT NULL REFERENCES managed_media(id) ON DELETE CASCADE,
     source_kind TEXT NOT NULL,
-    source_media_id TEXT NOT NULL,
-    source_post_id TEXT NOT NULL DEFAULT '',
-    source_url TEXT NOT NULL,
-    content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    fetch_url TEXT NOT NULL,
+    content_type_hint TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'retryable', 'succeeded', 'failed')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -24,16 +23,17 @@ CREATE TABLE transfer_jobs (
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (source_kind, source_media_id)
+    UNIQUE (media_id)
 );
 
-CREATE INDEX idx_transfer_jobs_status_next_run_at
-ON transfer_jobs (status, next_run_at);
+CREATE INDEX idx_media_transfer_jobs_status_next_run_at
+ON media_transfer_jobs (status, next_run_at);
 
-CREATE TABLE transfer_attempts (
+CREATE TABLE media_transfer_attempts (
     id UUID PRIMARY KEY,
-    job_id UUID NOT NULL REFERENCES transfer_jobs(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES media_transfer_jobs(id) ON DELETE CASCADE,
     status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    upload_mode TEXT NOT NULL CHECK (upload_mode IN ('single_put', 'multipart')),
     error TEXT,
     bytes_uploaded BIGINT NOT NULL DEFAULT 0,
     parts_uploaded INTEGER NOT NULL DEFAULT 0,
@@ -41,15 +41,14 @@ CREATE TABLE transfer_attempts (
     finished_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_transfer_attempts_job_id_started_at
-ON transfer_attempts (job_id, started_at DESC);
+CREATE INDEX idx_media_transfer_attempts_job_id_started_at
+ON media_transfer_attempts (job_id, started_at DESC);
 
 CREATE TABLE media_storage_bindings (
     id UUID PRIMARY KEY,
-    source_kind TEXT NOT NULL,
-    source_media_id TEXT NOT NULL,
+    media_id UUID NOT NULL REFERENCES managed_media(id) ON DELETE CASCADE,
     storage_object_id UUID NOT NULL REFERENCES storage_objects(id) ON DELETE CASCADE,
-    variant_role TEXT NOT NULL DEFAULT 'primary',
+    object_role TEXT NOT NULL DEFAULT 'original',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (source_kind, source_media_id, variant_role)
+    UNIQUE (media_id, object_role)
 );
