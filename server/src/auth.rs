@@ -43,6 +43,8 @@ pub struct SessionMeResponse {
 pub struct InternalSessionMeResponse {
     pub authenticated: bool,
     pub registered: bool,
+    pub is_admin: bool,
+    pub disabled: bool,
     pub user_id: Option<Uuid>,
     pub username: Option<String>,
     pub subject_id: Option<Uuid>,
@@ -322,6 +324,16 @@ pub fn require_registered_session(
     Ok(session)
 }
 
+pub fn require_admin_session(
+    session: Option<Extension<ActiveSession>>,
+) -> AppResult<ActiveSession> {
+    let session = require_registered_session(session)?;
+    if !session.record.user_is_admin {
+        return Err(AppError::forbidden("admin access required"));
+    }
+    Ok(session)
+}
+
 fn require_pending_registration(
     session: Option<Extension<ActiveSession>>,
 ) -> AppResult<ActiveSession> {
@@ -396,6 +408,11 @@ async fn resolve_request_session(
         return Ok(CookieAction::Clear);
     }
 
+    if session.user_disabled_at.is_some() {
+        db::delete_session(&state.db, selector).await?;
+        return Ok(CookieAction::Clear);
+    }
+
     if session.expires_at <= now || session.authorization_status != "active" {
         db::delete_session(&state.db, selector).await?;
         return Ok(CookieAction::Clear);
@@ -406,6 +423,11 @@ async fn resolve_request_session(
         Some(record) => record,
         None => return Ok(CookieAction::Clear),
     };
+
+    if session.user_disabled_at.is_some() {
+        db::delete_session(&state.db, selector).await?;
+        return Ok(CookieAction::Clear);
+    }
 
     if session.authorization_status != "active" {
         db::delete_session(&state.db, selector).await?;
@@ -678,6 +700,8 @@ fn build_internal_session_me_response(
         return InternalSessionMeResponse {
             authenticated: false,
             registered: false,
+            is_admin: false,
+            disabled: false,
             user_id: None,
             username: None,
             subject_id: None,
@@ -689,6 +713,8 @@ fn build_internal_session_me_response(
     InternalSessionMeResponse {
         authenticated: true,
         registered: session.record.registration_state == "active",
+        is_admin: session.record.user_is_admin,
+        disabled: session.record.user_disabled_at.is_some(),
         user_id: session.record.user_id,
         username: session.record.username.clone(),
         subject_id: Some(session.record.sso_subject_id),
@@ -773,6 +799,8 @@ mod tests {
             verifier_hash: vec![1, 2, 3],
             user_id: username.map(|_| Uuid::now_v7()),
             username: username.map(ToOwned::to_owned),
+            user_is_admin: false,
+            user_disabled_at: None,
             sso_subject_id: Uuid::now_v7(),
             authorization_id: Uuid::now_v7(),
             registration_state: registration_state.to_owned(),
@@ -828,5 +856,27 @@ mod tests {
         let error = require_registered_session(Some(Extension(session))).unwrap_err();
         assert!(matches!(error, AppError::Unauthorized(_)));
         assert_eq!(error.to_string(), "registration must be completed");
+    }
+
+    #[test]
+    fn require_admin_session_rejects_non_admin_user() {
+        let session = ActiveSession {
+            record: sample_session("active", Some("demo_user")),
+        };
+        let error = require_admin_session(Some(Extension(session))).unwrap_err();
+        assert!(matches!(error, AppError::Forbidden(_)));
+        assert_eq!(error.to_string(), "admin access required");
+    }
+
+    #[test]
+    fn internal_session_reports_admin_state() {
+        let mut record = sample_session("active", Some("demo_user"));
+        record.user_is_admin = true;
+        let response =
+            build_internal_session_me_response(Some(Extension(ActiveSession { record })));
+        assert!(response.authenticated);
+        assert!(response.registered);
+        assert!(response.is_admin);
+        assert!(!response.disabled);
     }
 }
