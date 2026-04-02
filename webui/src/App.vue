@@ -1,14 +1,22 @@
 <template>
-  <main class="shell">
-    <section class="card">
+  <main class="shell" :class="{ wide: isWide }">
+    <section class="card" :class="{ wide: isWide }">
       <header class="hero">
         <p class="eyebrow">tweet-db</p>
-        <h1>Capture storage and status control plane</h1>
+        <h1>{{ isWide ? 'Internal operations console' : 'Capture storage and status control plane' }}</h1>
       </header>
       <RouterView />
     </section>
   </main>
 </template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import { RouterView, useRoute } from 'vue-router'
+
+const route = useRoute()
+const isWide = computed(() => Boolean(route.meta.wide))
+</script>
 
 <style scoped>
 :global(body) {
@@ -16,8 +24,8 @@
   min-height: 100vh;
   font-family: "IBM Plex Sans", "Helvetica Neue", sans-serif;
   background:
-    radial-gradient(circle at top left, rgba(84, 129, 255, 0.22), transparent 28%),
-    linear-gradient(135deg, #0d1627 0%, #172740 45%, #f2f5f9 45%, #f2f5f9 100%);
+    radial-gradient(circle at top left, rgba(84, 129, 255, 0.2), transparent 26%),
+    linear-gradient(145deg, #08101c 0%, #13233a 38%, #eef3f8 38%, #eef3f8 100%);
   color: #10203a;
 }
 
@@ -32,14 +40,22 @@
   padding: 32px 16px;
 }
 
+.shell.wide {
+  place-items: start center;
+}
+
 .card {
-  width: min(720px, 100%);
-  background: rgba(255, 255, 255, 0.95);
+  width: min(760px, 100%);
+  background: rgba(255, 255, 255, 0.96);
   border: 1px solid rgba(16, 32, 58, 0.08);
   border-radius: 24px;
   padding: 32px;
-  box-shadow: 0 24px 80px rgba(13, 22, 39, 0.18);
+  box-shadow: 0 24px 80px rgba(13, 22, 39, 0.16);
   backdrop-filter: blur(16px);
+}
+
+.card.wide {
+  width: min(1280px, 100%);
 }
 
 .hero {
@@ -49,7 +65,7 @@
 .hero h1 {
   margin: 0;
   font-size: clamp(2rem, 5vw, 3rem);
-  line-height: 1;
+  line-height: 0.96;
 }
 
 .eyebrow {
@@ -60,4 +76,3 @@
   color: #4b6589;
 }
 </style>
-

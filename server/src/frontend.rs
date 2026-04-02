@@ -2,6 +2,7 @@ use std::path::Path;
 
 use axum::{
     Router,
+    extract::State,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -11,16 +12,17 @@ use crate::state::AppState;
 
 pub fn routes(state: &AppState) -> Router<AppState> {
     let dist_dir = state.settings.config.server.webui_dist_dir.clone();
-    let index_path = dist_dir.join("index.html");
 
     Router::new()
         .route("/", get(root_redirect))
         .route("/login", get(account_redirect))
         .route("/register", get(account_redirect))
         .route("/account", get(spa_index))
+        .route("/account/{*path}", get(spa_index))
+        .route("/admin", get(spa_index))
+        .route("/admin/{*path}", get(spa_index))
         .nest_service("/assets", ServeDir::new(dist_dir.join("assets")))
         .route_service("/favicon.svg", ServeFile::new(dist_dir.join("favicon.svg")))
-        .fallback_service(ServeFile::new(index_path))
 }
 
 async fn root_redirect() -> Redirect {
@@ -31,7 +33,19 @@ async fn account_redirect() -> Redirect {
     Redirect::temporary("/account")
 }
 
-async fn spa_index() -> Response {
+async fn spa_index(State(state): State<AppState>) -> Response {
+    if dist_exists(&state) {
+        let index_path = state.settings.config.server.webui_dist_dir.join("index.html");
+        match tokio::fs::read_to_string(index_path).await {
+            Ok(contents) => Html(contents).into_response(),
+            Err(_) => placeholder_index().into_response(),
+        }
+    } else {
+        placeholder_index().into_response()
+    }
+}
+
+fn placeholder_index() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
 <html>
@@ -46,7 +60,6 @@ async fn spa_index() -> Response {
   </body>
 </html>"#,
     )
-    .into_response()
 }
 
 pub fn dist_exists(state: &AppState) -> bool {
@@ -163,5 +176,14 @@ mod tests {
             assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
             assert_eq!(response.headers().get("location").unwrap(), "/account");
         }
+    }
+
+    #[tokio::test]
+    async fn admin_entrypoint_returns_placeholder_when_dist_is_missing() {
+        let response = test_router()
+            .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

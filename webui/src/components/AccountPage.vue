@@ -62,7 +62,18 @@
         <span>Expires At</span>
         <strong>{{ session.expires_at ?? '-' }}</strong>
       </div>
+      <div v-if="session.is_admin" class="row">
+        <span>Admin console</span>
+        <RouterLink class="inline-link" to="/admin/users">Open</RouterLink>
+      </div>
     </div>
+    <RouterLink
+      v-if="session?.authenticated && session.is_admin"
+      to="/admin/users"
+      class="secondary"
+    >
+      Open admin console
+    </RouterLink>
     <button
       v-if="session?.authenticated"
       type="button"
@@ -77,6 +88,7 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 
 import {
   completeRegistration,
@@ -220,9 +232,15 @@ input {
   color: #10203a;
   padding: 12px 20px;
   font: inherit;
+  text-decoration: none;
 }
 
 .secondary:disabled {
   opacity: 0.5;
+}
+
+.inline-link {
+  color: #10203a;
+  font-weight: 600;
 }
 </style>
