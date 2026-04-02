@@ -13,4 +13,4 @@ The expected integration model is a Tampermonkey script using `GM_*` privileged 
 ## Layout
 
 - `server/`: Rust backend and database migrations
-- `webui/`: minimal Vue frontend for the single `/account` entrypoint and account state
+- `webui/`: Vue frontend for `/account` plus the internal `/admin` management console
