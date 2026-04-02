@@ -84,6 +84,10 @@ fn admin_api_routes() -> Router<AppState> {
             get(admin::get_storage_object),
         )
         .route(
+            "/internal/v1/admin/storage-objects/{object_id}/sign",
+            post(admin::sign_storage_object),
+        )
+        .route(
             "/internal/v1/admin/transfers/overview",
             get(admin::transfer_overview),
         )
@@ -94,6 +98,10 @@ fn admin_api_routes() -> Router<AppState> {
         .route(
             "/internal/v1/admin/transfers/jobs/{job_id}",
             get(admin::get_transfer_job),
+        )
+        .route(
+            "/internal/v1/admin/transfers/jobs/{job_id}/requeue",
+            post(admin::requeue_transfer_job),
         )
 }
 
@@ -240,6 +248,14 @@ mod tests {
                 Request::get("/internal/v1/admin/users")
                     .body(Body::empty())
                     .unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::post(
+                    "/internal/v1/admin/storage-objects/0195f1df-0730-7f69-9a92-cd8e4eb4d001/sign",
+                )
+                .body(Body::empty())
+                .unwrap(),
                 StatusCode::UNAUTHORIZED,
             ),
         ];

@@ -10,4 +10,5 @@ pub mod media;
 pub mod routes;
 pub mod security;
 pub mod state;
+pub mod storage;
 pub mod transfer;

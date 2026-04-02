@@ -14,6 +14,7 @@ use crate::{
     db,
     error::{AppError, AppResult},
     state::AppState,
+    storage,
 };
 
 const DEFAULT_LIMIT: usize = 50;
@@ -1036,6 +1037,56 @@ pub async fn get_storage_object(
     )))
 }
 
+pub async fn sign_storage_object(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Path(object_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let admin = auth::require_admin_session(session)?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, bucket, object_key
+        FROM storage_objects
+        WHERE id = $1
+        "#,
+    )
+    .bind(object_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let row = row.ok_or_else(|| AppError::not_found("storage object not found"))?;
+
+    let bucket: String = row.get("bucket");
+    let object_key: String = row.get("object_key");
+    let expires_at = OffsetDateTime::now_utc() + time::Duration::minutes(30);
+    let client = storage::build_s3_client(&state).await?;
+    let url = storage::presign_get_object_url(
+        &client,
+        &bucket,
+        &object_key,
+        std::time::Duration::from_secs(30 * 60),
+    )
+    .await?;
+
+    db::insert_audit_event(
+        &state.db,
+        admin.record.user_id,
+        "storage.signed_url_requested",
+        "storage_object",
+        Some(object_id.to_string()),
+        json!({
+            "bucket": bucket,
+            "object_key": object_key,
+            "expires_at": format_time(expires_at),
+        }),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "url": url,
+        "expiresAt": format_time(expires_at),
+    })))
+}
+
 pub async fn transfer_overview(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -1269,12 +1320,77 @@ pub async fn get_transfer_job(
     )))
 }
 
+pub async fn requeue_transfer_job(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Path(job_id): Path<Uuid>,
+) -> AppResult<Json<Value>> {
+    let admin = auth::require_admin_session(session)?;
+    let mut tx = state.db.begin().await?;
+    let row = sqlx::query(
+        r#"
+        SELECT id, media_id, status
+        FROM media_transfer_jobs
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = row.ok_or_else(|| AppError::not_found("transfer job not found"))?;
+    let previous_status: String = row.get("status");
+
+    match previous_status.as_str() {
+        "failed" | "retryable" | "succeeded" => {}
+        _ => return Err(AppError::bad_request("job status does not support requeue")),
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE media_transfer_jobs
+        SET status = 'pending',
+            next_run_at = NOW(),
+            leased_at = NULL,
+            lease_expires_at = NULL,
+            last_error = NULL,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
+
+    db::insert_audit_event_tx(
+        &mut tx,
+        admin.record.user_id,
+        "transfer.requeued",
+        "media_transfer_job",
+        Some(job_id.to_string()),
+        json!({
+            "previous_status": previous_status,
+            "media_id": row.get::<Uuid, _>("media_id"),
+        }),
+    )
+    .await?;
+
+    tx.commit().await?;
+    let job = fetch_transfer_job_summary(&state.db, job_id).await?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "job": job,
+    })))
+}
+
 fn transfer_job_json_from_row(row: &sqlx::postgres::PgRow) -> Value {
+    let status = row.get::<String, _>("status");
     json!({
         "id": row.get::<Uuid, _>("id"),
         "mediaId": row.get::<Uuid, _>("media_id"),
         "sourceKind": row.get::<String, _>("source_kind"),
-        "status": row.get::<String, _>("status"),
+        "status": status,
         "attemptCount": row.get::<i32, _>("attempt_count"),
         "nextRunAt": format_time(row.get("next_run_at")),
         "leaseExpiresAt": format_time_opt(row.get("lease_expires_at")),
@@ -1283,6 +1399,7 @@ fn transfer_job_json_from_row(row: &sqlx::postgres::PgRow) -> Value {
         "lastError": row.try_get::<Option<String>, _>("last_error").ok().flatten(),
         "storageObjectId": row.get::<Option<Uuid>, _>("storage_object_id"),
         "storageObjectKey": row.get::<Option<String>, _>("object_key"),
+        "canRequeue": matches!(status.as_str(), "failed" | "retryable" | "succeeded"),
     })
 }
 
@@ -1357,6 +1474,34 @@ async fn fetch_transfer_job_array(pool: &PgPool, sql: &str) -> AppResult<Value> 
             .map(|row| transfer_job_json_from_row(&row))
             .collect(),
     ))
+}
+
+async fn fetch_transfer_job_summary(pool: &PgPool, job_id: Uuid) -> AppResult<Value> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            j.id,
+            j.media_id,
+            j.source_kind,
+            j.status,
+            j.attempt_count,
+            j.next_run_at,
+            j.lease_expires_at,
+            j.updated_at,
+            j.fetch_url,
+            j.last_error,
+            o.id AS storage_object_id,
+            o.object_key
+        FROM media_transfer_jobs j
+        LEFT JOIN storage_objects o ON o.id = j.storage_object_id
+        WHERE j.id = $1
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+    let row = row.ok_or_else(|| AppError::not_found("transfer job not found"))?;
+    Ok(transfer_job_json_from_row(&row))
 }
 
 async fn fetch_user_summary_json_tx(

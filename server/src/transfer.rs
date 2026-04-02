@@ -1,7 +1,5 @@
 use std::{cmp, collections::HashMap, future::Future, sync::Arc, time::Duration as StdDuration};
 
-use aws_config::BehaviorVersion;
-use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     Client,
     primitives::ByteStream,
@@ -24,6 +22,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     state::AppState,
+    storage,
 };
 
 #[derive(Debug, Clone)]
@@ -238,37 +237,9 @@ pub async fn fetch_transfer_statuses(
     Ok(map)
 }
 
-async fn build_s3_client(state: &AppState) -> AppResult<Client> {
-    let access_key = state
-        .settings
-        .secrets
-        .storage_access_key
-        .clone()
-        .ok_or_else(|| AppError::config("STORAGE_ACCESS_KEY is required"))?;
-    let secret_key = state
-        .settings
-        .secrets
-        .storage_secret_key
-        .clone()
-        .ok_or_else(|| AppError::config("STORAGE_SECRET_KEY is required"))?;
-    let credentials = Credentials::new(access_key, secret_key, None, None, "tweet-db");
-    let shared_config = aws_config::defaults(BehaviorVersion::latest())
-        .region(aws_sdk_s3::config::Region::new(
-            state.settings.config.storage.region.clone(),
-        ))
-        .credentials_provider(credentials)
-        .load()
-        .await;
-    let config = aws_sdk_s3::config::Builder::from(&shared_config)
-        .endpoint_url(state.settings.config.storage.endpoint.clone())
-        .force_path_style(state.settings.config.storage.path_style)
-        .build();
-    Ok(Client::from_conf(config))
-}
-
 async fn build_transfer_runtime(state: &AppState) -> AppResult<TransferRuntime> {
     Ok(TransferRuntime {
-        s3_client: build_s3_client(state).await?,
+        s3_client: storage::build_s3_client(state).await?,
     })
 }
 
