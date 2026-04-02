@@ -30,19 +30,19 @@ provider = "s3_compatible"
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"
 bucket = "tweet-db"
+object_key_prefix = "media"
 path_style = true
 
 [transfer]
 enabled = true
 worker_count = 2
-chunk_size_bytes = 10485760
+chunk_size_mb = 10
 download_parallelism = 4
 upload_parallelism = 4
 max_in_flight_parts = 8
 connect_timeout_seconds = 5
 read_timeout_seconds = 30
 attempt_timeout_seconds = 300
-memory_budget_bytes = 134217728
 worker_poll_interval_seconds = 5
 max_attempts = 8
 

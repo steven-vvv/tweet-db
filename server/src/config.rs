@@ -140,6 +140,7 @@ pub struct StorageSection {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
+    pub object_key_prefix: String,
     pub path_style: bool,
 }
 
@@ -147,14 +148,13 @@ pub struct StorageSection {
 pub struct TransferSection {
     pub enabled: bool,
     pub worker_count: usize,
-    pub chunk_size_bytes: usize,
+    pub chunk_size_mb: usize,
     pub download_parallelism: usize,
     pub upload_parallelism: usize,
     pub max_in_flight_parts: usize,
     pub connect_timeout_seconds: u64,
     pub read_timeout_seconds: u64,
     pub attempt_timeout_seconds: u64,
-    pub memory_budget_bytes: usize,
     pub worker_poll_interval_seconds: u64,
     pub max_attempts: i32,
 }

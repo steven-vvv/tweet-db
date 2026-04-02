@@ -1,4 +1,4 @@
-use std::{cmp, collections::HashMap, sync::Arc, time::Duration as StdDuration};
+use std::{cmp, collections::HashMap, future::Future, sync::Arc, time::Duration as StdDuration};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
@@ -12,10 +12,12 @@ use reqwest::{
     Client as HttpClient, Response, StatusCode,
     header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
-use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use time::OffsetDateTime;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::Semaphore,
+    time::{Instant, timeout_at},
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -28,7 +30,6 @@ use crate::{
 struct TransferJob {
     id: Uuid,
     media_id: Uuid,
-    source_kind: String,
     fetch_url: String,
     content_type_hint: String,
     attempt_count: i32,
@@ -38,7 +39,12 @@ struct TransferJob {
 #[derive(Clone)]
 struct TransferRuntime {
     s3_client: Client,
-    buffer_permits: Arc<Semaphore>,
+}
+
+#[derive(Clone, Copy)]
+struct AttemptContext {
+    deadline: Instant,
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,6 +59,8 @@ enum UploadMode {
     SinglePut,
     Multipart,
 }
+
+const BYTES_PER_MB: usize = 1024 * 1024;
 
 impl UploadMode {
     fn as_str(self) -> &'static str {
@@ -261,7 +269,6 @@ async fn build_s3_client(state: &AppState) -> AppResult<Client> {
 async fn build_transfer_runtime(state: &AppState) -> AppResult<TransferRuntime> {
     Ok(TransferRuntime {
         s3_client: build_s3_client(state).await?,
-        buffer_permits: Arc::new(Semaphore::new(buffer_permit_count(state))),
     })
 }
 
@@ -317,7 +324,6 @@ async fn claim_next_job(
         RETURNING
             j.id,
             j.media_id,
-            j.source_kind,
             j.fetch_url,
             j.content_type_hint,
             j.attempt_count,
@@ -335,7 +341,6 @@ async fn claim_next_job(
     let job = TransferJob {
         id: row.get("id"),
         media_id: row.get("media_id"),
-        source_kind: row.get("source_kind"),
         fetch_url: row.get("fetch_url"),
         content_type_hint: row.get("content_type_hint"),
         attempt_count: row.get("attempt_count"),
@@ -385,17 +390,11 @@ async fn process_job(
     .await?;
 
     let attempt_timeout_seconds = state.settings.config.transfer.attempt_timeout_seconds;
-    let result = match tokio::time::timeout(
-        StdDuration::from_secs(attempt_timeout_seconds),
-        upload_job(state, runtime, &job),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(AppError::upstream(format!(
-            "transfer attempt timed out after {attempt_timeout_seconds} seconds"
-        ))),
+    let attempt = AttemptContext {
+        deadline: Instant::now() + StdDuration::from_secs(attempt_timeout_seconds),
+        timeout_seconds: attempt_timeout_seconds,
     };
+    let result = upload_job(state, runtime, &job, attempt).await;
     match result {
         Ok(outcome) => {
             let storage_object_id = upsert_storage_object(
@@ -506,14 +505,18 @@ async fn upload_job(
     state: &AppState,
     runtime: &TransferRuntime,
     job: &TransferJob,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
-    let chunk_size = state.settings.config.transfer.chunk_size_bytes.max(1);
-    let response = state
-        .transfer_http_client
-        .get(&job.fetch_url)
-        .header(RANGE, range_header_value(0, chunk_size as u64 - 1))
-        .send()
-        .await?;
+    let chunk_size = chunk_size_bytes(state);
+    let response = run_before_attempt_deadline(
+        attempt,
+        state
+            .transfer_http_client
+            .get(&job.fetch_url)
+            .header(RANGE, range_header_value(0, chunk_size as u64 - 1))
+            .send(),
+    )
+    .await??;
 
     if !response.status().is_success() {
         return Err(AppError::upstream(format!(
@@ -523,7 +526,6 @@ async fn upload_job(
     }
 
     let content_type = response_content_type(&response, &job.content_type_hint);
-    let first_buffer_permit = acquire_buffer_permit(runtime).await?;
     if response.status() == StatusCode::PARTIAL_CONTENT {
         return upload_from_ranged_probe(
             state,
@@ -532,7 +534,7 @@ async fn upload_job(
             response,
             &content_type,
             chunk_size,
-            first_buffer_permit,
+            attempt,
         )
         .await;
     }
@@ -544,7 +546,7 @@ async fn upload_job(
         response,
         &content_type,
         chunk_size,
-        first_buffer_permit,
+        attempt,
     )
     .await
 }
@@ -556,38 +558,22 @@ async fn upload_from_ranged_probe(
     response: Response,
     content_type: &str,
     chunk_size: usize,
-    first_buffer_permit: OwnedSemaphorePermit,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
     let total_size = parse_total_size_from_content_range(&response);
-    let first_part = response
-        .bytes()
-        .await
+    let first_part = run_before_attempt_deadline(attempt, response.bytes())
+        .await?
         .map_err(|error| AppError::upstream(format!("failed to read ranged probe: {error}")))?
         .to_vec();
 
     if first_part.len() < chunk_size {
-        return upload_single_object(
-            state,
-            runtime,
-            job,
-            first_part,
-            first_buffer_permit,
-            content_type,
-        )
-        .await;
+        return upload_single_object(state, runtime, job, first_part, content_type, attempt).await;
     }
 
     if let Some(total_size) = total_size {
         if total_size < chunk_size as u64 {
-            return upload_single_object(
-                state,
-                runtime,
-                job,
-                first_part,
-                first_buffer_permit,
-                content_type,
-            )
-            .await;
+            return upload_single_object(state, runtime, job, first_part, content_type, attempt)
+                .await;
         }
 
         return upload_multipart_parallel_from_ranges(
@@ -595,10 +581,10 @@ async fn upload_from_ranged_probe(
             runtime,
             job,
             first_part,
-            first_buffer_permit,
             total_size,
             content_type,
             chunk_size,
+            attempt,
         )
         .await;
     }
@@ -608,9 +594,9 @@ async fn upload_from_ranged_probe(
         runtime,
         job,
         first_part,
-        first_buffer_permit,
         content_type,
         chunk_size,
+        attempt,
     )
     .await
 }
@@ -622,13 +608,13 @@ async fn upload_from_full_response(
     response: Response,
     content_type: &str,
     chunk_size: usize,
-    first_buffer_permit: OwnedSemaphorePermit,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
     let mut stream = response.bytes_stream();
     let mut first_buffer = Vec::with_capacity(chunk_size);
 
     while first_buffer.len() < chunk_size {
-        match stream.next().await {
+        match run_before_attempt_deadline(attempt, stream.next()).await? {
             Some(chunk) => {
                 let chunk = chunk.map_err(|error| {
                     AppError::upstream(format!("source stream failed during probe: {error}"))
@@ -641,8 +627,8 @@ async fn upload_from_full_response(
                     runtime,
                     job,
                     first_buffer,
-                    first_buffer_permit,
                     content_type,
+                    attempt,
                 )
                 .await;
             }
@@ -655,11 +641,11 @@ async fn upload_from_full_response(
         runtime,
         job,
         first_buffer,
-        first_buffer_permit,
         remainder,
         stream,
         content_type,
         chunk_size,
+        attempt,
     )
     .await
 }
@@ -669,20 +655,23 @@ async fn upload_single_object(
     runtime: &TransferRuntime,
     job: &TransferJob,
     bytes: Vec<u8>,
-    _buffer_permit: OwnedSemaphorePermit,
     content_type: &str,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
-    let object_key = build_object_key(job, content_type)?;
-    let response = runtime
-        .s3_client
-        .put_object()
-        .bucket(&state.settings.config.storage.bucket)
-        .key(&object_key)
-        .content_type(content_type)
-        .body(ByteStream::from(bytes.clone()))
-        .send()
-        .await
-        .map_err(|error| AppError::upstream(format!("failed to upload object: {error}")))?;
+    let object_key = build_object_key(state, job, content_type)?;
+    let response = run_before_attempt_deadline(
+        attempt,
+        runtime
+            .s3_client
+            .put_object()
+            .bucket(&state.settings.config.storage.bucket)
+            .key(&object_key)
+            .content_type(content_type)
+            .body(ByteStream::from(bytes.clone()))
+            .send(),
+    )
+    .await?
+    .map_err(|error| AppError::upstream(format!("failed to upload object: {error}")))?;
 
     Ok(UploadOutcome {
         object_key,
@@ -699,14 +688,20 @@ async fn upload_multipart_parallel_from_ranges(
     runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
-    _first_part_permit: OwnedSemaphorePermit,
     total_size: u64,
     content_type: &str,
     chunk_size: usize,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
-    let object_key = build_object_key(job, content_type)?;
-    let upload_id =
-        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
+    let object_key = build_object_key(state, job, content_type)?;
+    let upload_id = create_multipart_upload(
+        state,
+        &runtime.s3_client,
+        &object_key,
+        content_type,
+        attempt,
+    )
+    .await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut completed_parts = Vec::new();
 
@@ -717,6 +712,7 @@ async fn upload_multipart_parallel_from_ranges(
         &upload_id,
         1,
         first_part,
+        attempt,
     )
     .await
     {
@@ -726,7 +722,6 @@ async fn upload_multipart_parallel_from_ranges(
             return Err(error);
         }
     };
-    drop(_first_part_permit);
     completed_parts.push(NumberedCompletedPart {
         part_number: 1,
         part: first_completed,
@@ -744,7 +739,6 @@ async fn upload_multipart_parallel_from_ranges(
     let fetch_url = job.fetch_url.clone();
     let http_client = state.transfer_http_client.clone();
     let upload_client = runtime.s3_client.clone();
-    let buffer_permits = runtime.buffer_permits.clone();
 
     let mut tasks = stream::iter(2..=total_parts)
         .map(|part_number| {
@@ -756,26 +750,22 @@ async fn upload_multipart_parallel_from_ranges(
             let upload_id = upload_id.clone();
             let download_limit = download_limit.clone();
             let upload_limit = upload_limit.clone();
-            let buffer_permits = buffer_permits.clone();
 
             async move {
-                let _download_permit = download_limit
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::upstream("download semaphore closed"))?;
+                let download_permit =
+                    run_before_attempt_deadline(attempt, download_limit.acquire_owned())
+                        .await?
+                        .map_err(|_| AppError::upstream("download semaphore closed"))?;
                 let start = ((part_number - 1) as u64) * chunk_size as u64;
                 let end = cmp::min(total_size, start + chunk_size as u64) - 1;
-                let _buffer_permit = buffer_permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::upstream("buffer semaphore closed"))?;
-                let bytes = download_range_bytes(&http_client, &fetch_url, start, end).await?;
-                drop(_download_permit);
+                let bytes =
+                    download_range_bytes(&http_client, &fetch_url, start, end, attempt).await?;
+                drop(download_permit);
 
-                let _upload_permit = upload_limit
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| AppError::upstream("upload semaphore closed"))?;
+                let upload_permit =
+                    run_before_attempt_deadline(attempt, upload_limit.acquire_owned())
+                        .await?
+                        .map_err(|_| AppError::upstream("upload semaphore closed"))?;
                 let part = upload_part(
                     &upload_client,
                     &bucket,
@@ -783,8 +773,10 @@ async fn upload_multipart_parallel_from_ranges(
                     &upload_id,
                     part_number,
                     bytes,
+                    attempt,
                 )
                 .await?;
+                drop(upload_permit);
 
                 Ok::<NumberedCompletedPart, AppError>(NumberedCompletedPart { part_number, part })
             }
@@ -815,6 +807,7 @@ async fn upload_multipart_parallel_from_ranges(
         &object_key,
         &upload_id,
         completed,
+        attempt,
     )
     .await
     {
@@ -840,13 +833,19 @@ async fn upload_multipart_from_unknown_ranges(
     runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
-    _first_part_permit: OwnedSemaphorePermit,
     content_type: &str,
     chunk_size: usize,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome> {
-    let object_key = build_object_key(job, content_type)?;
-    let upload_id =
-        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
+    let object_key = build_object_key(state, job, content_type)?;
+    let upload_id = create_multipart_upload(
+        state,
+        &runtime.s3_client,
+        &object_key,
+        content_type,
+        attempt,
+    )
+    .await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut parts = Vec::new();
     let mut total_bytes = first_part.len() as i64;
@@ -858,6 +857,7 @@ async fn upload_multipart_from_unknown_ranges(
         &upload_id,
         1,
         first_part,
+        attempt,
     )
     .await
     {
@@ -867,18 +867,17 @@ async fn upload_multipart_from_unknown_ranges(
             return Err(error);
         }
     }
-    drop(_first_part_permit);
 
     let mut next_start = chunk_size as u64;
     let mut part_number = 2_i32;
     loop {
         let end = next_start + chunk_size as u64 - 1;
-        let _buffer_permit = acquire_buffer_permit(runtime).await?;
         let bytes = match download_range_bytes_optional(
             &state.transfer_http_client,
             &job.fetch_url,
             next_start,
             end,
+            attempt,
         )
         .await
         {
@@ -899,6 +898,7 @@ async fn upload_multipart_from_unknown_ranges(
             &upload_id,
             part_number,
             bytes,
+            attempt,
         )
         .await
         {
@@ -926,6 +926,7 @@ async fn upload_multipart_from_unknown_ranges(
         &object_key,
         &upload_id,
         completed,
+        attempt,
     )
     .await
     {
@@ -951,18 +952,24 @@ async fn upload_multipart_from_stream<S>(
     runtime: &TransferRuntime,
     job: &TransferJob,
     first_part: Vec<u8>,
-    _stream_buffer_permit: OwnedSemaphorePermit,
     remainder: Vec<u8>,
     mut stream: S,
     content_type: &str,
     chunk_size: usize,
+    attempt: AttemptContext,
 ) -> AppResult<UploadOutcome>
 where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
-    let object_key = build_object_key(job, content_type)?;
-    let upload_id =
-        create_multipart_upload(state, &runtime.s3_client, &object_key, content_type).await?;
+    let object_key = build_object_key(state, job, content_type)?;
+    let upload_id = create_multipart_upload(
+        state,
+        &runtime.s3_client,
+        &object_key,
+        content_type,
+        attempt,
+    )
+    .await?;
     let bucket = state.settings.config.storage.bucket.clone();
     let mut parts = Vec::new();
     let mut total_bytes = first_part.len() as i64;
@@ -974,6 +981,7 @@ where
         &upload_id,
         1,
         first_part,
+        attempt,
     )
     .await
     {
@@ -986,7 +994,7 @@ where
 
     let mut buffer = remainder;
     let mut part_number = 2_i32;
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = run_before_attempt_deadline(attempt, stream.next()).await? {
         let chunk =
             chunk.map_err(|error| AppError::upstream(format!("source stream failed: {error}")))?;
         buffer.extend_from_slice(&chunk);
@@ -1002,6 +1010,7 @@ where
                 &upload_id,
                 part_number,
                 current,
+                attempt,
             )
             .await
             {
@@ -1025,6 +1034,7 @@ where
             &upload_id,
             part_number,
             buffer,
+            attempt,
         )
         .await
         {
@@ -1046,6 +1056,7 @@ where
         &object_key,
         &upload_id,
         completed,
+        attempt,
     )
     .await
     {
@@ -1071,17 +1082,19 @@ async fn create_multipart_upload(
     client: &Client,
     object_key: &str,
     content_type: &str,
+    attempt: AttemptContext,
 ) -> AppResult<String> {
-    let create = client
-        .create_multipart_upload()
-        .bucket(&state.settings.config.storage.bucket)
-        .key(object_key)
-        .content_type(content_type)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::upstream(format!("failed to create multipart upload: {error}"))
-        })?;
+    let create = run_before_attempt_deadline(
+        attempt,
+        client
+            .create_multipart_upload()
+            .bucket(&state.settings.config.storage.bucket)
+            .key(object_key)
+            .content_type(content_type)
+            .send(),
+    )
+    .await?
+    .map_err(|error| AppError::upstream(format!("failed to create multipart upload: {error}")))?;
 
     create
         .upload_id()
@@ -1095,18 +1108,20 @@ async fn complete_multipart_upload(
     object_key: &str,
     upload_id: &str,
     completed: CompletedMultipartUpload,
+    attempt: AttemptContext,
 ) -> AppResult<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput> {
-    client
-        .complete_multipart_upload()
-        .bucket(bucket)
-        .key(object_key)
-        .upload_id(upload_id)
-        .multipart_upload(completed)
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::upstream(format!("failed to complete multipart upload: {error}"))
-        })
+    run_before_attempt_deadline(
+        attempt,
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(object_key)
+            .upload_id(upload_id)
+            .multipart_upload(completed)
+            .send(),
+    )
+    .await?
+    .map_err(|error| AppError::upstream(format!("failed to complete multipart upload: {error}")))
 }
 
 async fn upload_part(
@@ -1116,17 +1131,21 @@ async fn upload_part(
     upload_id: &str,
     part_number: i32,
     bytes: Vec<u8>,
+    attempt: AttemptContext,
 ) -> AppResult<CompletedPart> {
-    let response = client
-        .upload_part()
-        .bucket(bucket)
-        .key(object_key)
-        .upload_id(upload_id)
-        .part_number(part_number)
-        .body(ByteStream::from(bytes))
-        .send()
-        .await
-        .map_err(|error| AppError::upstream(format!("failed to upload multipart part: {error}")))?;
+    let response = run_before_attempt_deadline(
+        attempt,
+        client
+            .upload_part()
+            .bucket(bucket)
+            .key(object_key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(bytes))
+            .send(),
+    )
+    .await?
+    .map_err(|error| AppError::upstream(format!("failed to upload multipart part: {error}")))?;
 
     Ok(CompletedPart::builder()
         .part_number(part_number)
@@ -1215,12 +1234,16 @@ async fn download_range_bytes(
     url: &str,
     start: u64,
     end: u64,
+    attempt: AttemptContext,
 ) -> AppResult<Vec<u8>> {
-    let response = client
-        .get(url)
-        .header(RANGE, range_header_value(start, end))
-        .send()
-        .await?;
+    let response = run_before_attempt_deadline(
+        attempt,
+        client
+            .get(url)
+            .header(RANGE, range_header_value(start, end))
+            .send(),
+    )
+    .await??;
 
     if response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(AppError::upstream(format!(
@@ -1229,9 +1252,8 @@ async fn download_range_bytes(
         )));
     }
 
-    response
-        .bytes()
-        .await
+    run_before_attempt_deadline(attempt, response.bytes())
+        .await?
         .map(|bytes| bytes.to_vec())
         .map_err(|error| AppError::upstream(format!("failed to read range body: {error}")))
 }
@@ -1241,12 +1263,16 @@ async fn download_range_bytes_optional(
     url: &str,
     start: u64,
     end: u64,
+    attempt: AttemptContext,
 ) -> AppResult<Option<Vec<u8>>> {
-    let response = client
-        .get(url)
-        .header(RANGE, range_header_value(start, end))
-        .send()
-        .await?;
+    let response = run_before_attempt_deadline(
+        attempt,
+        client
+            .get(url)
+            .header(RANGE, range_header_value(start, end))
+            .send(),
+    )
+    .await??;
 
     if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
         return Ok(None);
@@ -1258,24 +1284,10 @@ async fn download_range_bytes_optional(
         )));
     }
 
-    response
-        .bytes()
-        .await
+    run_before_attempt_deadline(attempt, response.bytes())
+        .await?
         .map(|bytes| Some(bytes.to_vec()))
         .map_err(|error| AppError::upstream(format!("failed to read range body: {error}")))
-}
-
-fn buffer_permit_count(state: &AppState) -> usize {
-    buffer_permit_count_for(
-        state.settings.config.transfer.memory_budget_bytes,
-        state.settings.config.transfer.chunk_size_bytes,
-    )
-}
-
-fn buffer_permit_count_for(memory_budget_bytes: usize, chunk_size_bytes: usize) -> usize {
-    let chunk_size = chunk_size_bytes.max(1);
-    let permits = memory_budget_bytes / chunk_size;
-    permits.max(1)
 }
 
 fn lease_duration(state: &AppState) -> time::Duration {
@@ -1284,29 +1296,35 @@ fn lease_duration(state: &AppState) -> time::Duration {
     )
 }
 
-async fn acquire_buffer_permit(runtime: &TransferRuntime) -> AppResult<OwnedSemaphorePermit> {
-    runtime
-        .buffer_permits
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| AppError::upstream("buffer semaphore closed"))
+fn chunk_size_bytes(state: &AppState) -> usize {
+    chunk_size_bytes_for(state.settings.config.transfer.chunk_size_mb)
 }
 
-fn build_object_key(job: &TransferJob, content_type: &str) -> AppResult<String> {
-    let now = OffsetDateTime::now_utc();
-    let digest = hex_digest(&job.fetch_url);
-    let ext = extension_for_object(&job.fetch_url, content_type);
-    Ok(format!(
-        "{}/{}/{:02}/{:02}/{}/{}.{}",
-        job.source_kind,
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        sanitize_key_segment(&job.media_id.to_string()),
-        digest,
-        ext
+fn build_object_key(state: &AppState, job: &TransferJob, content_type: &str) -> AppResult<String> {
+    Ok(build_object_key_for(
+        &state.settings.config.storage.object_key_prefix,
+        job.media_id,
+        &job.fetch_url,
+        content_type,
     ))
+}
+
+fn chunk_size_bytes_for(chunk_size_mb: usize) -> usize {
+    chunk_size_mb.max(1).saturating_mul(BYTES_PER_MB)
+}
+
+fn build_object_key_for(
+    object_key_prefix: &str,
+    media_id: Uuid,
+    fetch_url: &str,
+    content_type: &str,
+) -> String {
+    let ext = extension_for_object(fetch_url, content_type);
+    let resource_name = format!("{media_id}.{ext}");
+    match normalized_object_key_prefix(object_key_prefix) {
+        Some(prefix) => format!("{prefix}/{resource_name}"),
+        None => resource_name,
+    }
 }
 
 fn extension_for_object(source_url: &str, content_type: &str) -> String {
@@ -1339,26 +1357,9 @@ fn extension_for_object(source_url: &str, content_type: &str) -> String {
     }
 }
 
-fn sanitize_key_segment(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return "unknown".to_owned();
-    }
-    trimmed
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn hex_digest(value: &str) -> String {
-    let digest = Sha256::digest(value.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+fn normalized_object_key_prefix(prefix: &str) -> Option<&str> {
+    let trimmed = prefix.trim().trim_matches('/');
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 fn range_header_value(start: u64, end: u64) -> String {
@@ -1388,6 +1389,22 @@ fn response_content_type(response: &Response, hint: &str) -> String {
         .unwrap_or_else(|| "application/octet-stream".to_owned())
 }
 
+async fn run_before_attempt_deadline<F, T>(attempt: AttemptContext, future: F) -> AppResult<T>
+where
+    F: Future<Output = T>,
+{
+    timeout_at(attempt.deadline, future)
+        .await
+        .map_err(|_| attempt_timeout_error(attempt))
+}
+
+fn attempt_timeout_error(attempt: AttemptContext) -> AppError {
+    AppError::upstream(format!(
+        "transfer attempt timed out after {} seconds",
+        attempt.timeout_seconds
+    ))
+}
+
 #[derive(Debug)]
 struct NumberedCompletedPart {
     part_number: i32,
@@ -1399,10 +1416,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buffer_permit_count_has_floor_of_one() {
-        assert_eq!(buffer_permit_count_for(0, 1024), 1);
-        assert_eq!(buffer_permit_count_for(512, 1024), 1);
-        assert_eq!(buffer_permit_count_for(4096, 1024), 4);
+    fn chunk_size_mb_converts_to_bytes_with_floor() {
+        assert_eq!(chunk_size_bytes_for(0), BYTES_PER_MB);
+        assert_eq!(chunk_size_bytes_for(10), 10 * BYTES_PER_MB);
     }
 
     #[test]
@@ -1412,5 +1428,34 @@ mod tests {
             "image/jpeg",
         );
         assert_eq!(ext, "png");
+    }
+
+    #[test]
+    fn build_object_key_uses_prefix_and_media_id() {
+        let media_id = Uuid::parse_str("018f62db-4f7c-7a1b-9b45-fd5a1f2f8abc").unwrap();
+        let object_key = build_object_key_for(
+            " nested/path/ ",
+            media_id,
+            "https://pbs.twimg.com/media/demo?format=webp",
+            "image/jpeg",
+        );
+
+        assert_eq!(
+            object_key,
+            "nested/path/018f62db-4f7c-7a1b-9b45-fd5a1f2f8abc.webp"
+        );
+    }
+
+    #[test]
+    fn build_object_key_allows_empty_prefix() {
+        let media_id = Uuid::parse_str("018f62db-4f7c-7a1b-9b45-fd5a1f2f8abc").unwrap();
+        let object_key = build_object_key_for(
+            " / ",
+            media_id,
+            "https://example.com/video.mp4",
+            "video/mp4",
+        );
+
+        assert_eq!(object_key, "018f62db-4f7c-7a1b-9b45-fd5a1f2f8abc.mp4");
     }
 }
