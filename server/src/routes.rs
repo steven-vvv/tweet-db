@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{auth, content, db, error::AppResult, state::AppState};
+use crate::{admin, auth, content, db, error::AppResult, state::AppState};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -18,6 +18,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/healthz", get(healthz))
         .merge(public_api_routes())
         .merge(internal_api_routes())
+        .merge(admin_api_routes())
         .merge(browser_routes())
         .merge(integration_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -48,6 +49,51 @@ fn internal_api_routes() -> Router<AppState> {
         .route(
             "/internal/v1/auth/registration",
             post(auth::internal_register_complete),
+        )
+}
+
+fn admin_api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/internal/v1/admin/users", get(admin::list_users))
+        .route("/internal/v1/admin/users/{user_id}", get(admin::get_user))
+        .route(
+            "/internal/v1/admin/users/{user_id}/disable",
+            post(admin::disable_user),
+        )
+        .route(
+            "/internal/v1/admin/users/{user_id}/enable",
+            post(admin::enable_user),
+        )
+        .route("/internal/v1/admin/posts", get(admin::list_posts))
+        .route(
+            "/internal/v1/admin/posts/{source_kind}/{source_post_id}",
+            get(admin::get_post),
+        )
+        .route("/internal/v1/admin/actors", get(admin::list_actors))
+        .route(
+            "/internal/v1/admin/actors/{source_kind}/{source_actor_id}",
+            get(admin::get_actor),
+        )
+        .route("/internal/v1/admin/media/{media_id}", get(admin::get_media))
+        .route(
+            "/internal/v1/admin/storage-objects",
+            get(admin::list_storage_objects),
+        )
+        .route(
+            "/internal/v1/admin/storage-objects/{object_id}",
+            get(admin::get_storage_object),
+        )
+        .route(
+            "/internal/v1/admin/transfers/overview",
+            get(admin::transfer_overview),
+        )
+        .route(
+            "/internal/v1/admin/transfers/jobs",
+            get(admin::list_transfer_jobs),
+        )
+        .route(
+            "/internal/v1/admin/transfers/jobs/{job_id}",
+            get(admin::get_transfer_job),
         )
 }
 
@@ -189,6 +235,12 @@ mod tests {
                     .body(Body::empty())
                     .unwrap(),
                 StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Request::get("/internal/v1/admin/users")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNAUTHORIZED,
             ),
         ];
 
