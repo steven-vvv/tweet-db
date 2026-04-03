@@ -73,7 +73,7 @@ impl AppConfig {
     fn load(path: Option<&Path>) -> AppResult<Self> {
         let path = path
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("config/default.toml"));
+            .unwrap_or_else(discover_default_config_path);
         let raw = fs::read_to_string(&path)?;
         let parsed: RawConfig = toml::from_str(&raw)
             .map_err(|error| AppError::config(format!("invalid config file: {error}")))?;
@@ -180,6 +180,35 @@ struct RawConfig {
 struct RawServerSection {
     listen_addr: String,
     webui_dist_dir: String,
+}
+
+fn discover_default_config_path() -> PathBuf {
+    default_config_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("config/default.toml"))
+}
+
+fn default_config_candidates() -> Vec<PathBuf> {
+    if running_from_server_dir() {
+        vec![
+            PathBuf::from("config.toml"),
+            PathBuf::from("config/default.toml"),
+            PathBuf::from("server/config.toml"),
+            PathBuf::from("server/config/default.toml"),
+        ]
+    } else {
+        vec![
+            PathBuf::from("server/config.toml"),
+            PathBuf::from("config.toml"),
+            PathBuf::from("server/config/default.toml"),
+            PathBuf::from("config/default.toml"),
+        ]
+    }
+}
+
+fn running_from_server_dir() -> bool {
+    Path::new("Cargo.toml").is_file() && Path::new("src/main.rs").is_file()
 }
 
 fn decode_key(name: &str, value: &str) -> AppResult<[u8; 32]> {

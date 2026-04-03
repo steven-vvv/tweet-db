@@ -1,5 +1,6 @@
 server/target/
 server/.env
+server/config.toml
 webui/node_modules/
 webui/dist/
 .codex/
