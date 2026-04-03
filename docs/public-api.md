@@ -191,7 +191,17 @@
         "quoteCount": 0,
         "bookmarkCount": 0,
         "mediaSourceIds": ["m_1"],
-        "sourceLabel": "web"
+        "sourceLabel": "web",
+        "timestamps": {
+          "post": {
+            "lastObservedAt": "2026-04-03T12:34:56Z",
+            "updatedAt": "2026-04-03T12:35:02Z"
+          },
+          "metrics": {
+            "lastObservedAt": "2026-04-03T12:36:00Z",
+            "updatedAt": "2026-04-03T12:36:05Z"
+          }
+        }
       },
       "author": {
         "sourceActorId": "u_1",
@@ -216,6 +226,14 @@
   ]
 }
 ```
+
+响应字段补充说明：
+
+- `post.timestamps.post.lastObservedAt`：平台侧最近一次观测到该帖子本体数据的时间，对应服务端 `posts.last_observed_at`。
+- `post.timestamps.post.updatedAt`：站内帖子记录最近一次更新的时间，对应服务端 `posts.updated_at`。
+- `post.timestamps.metrics.lastObservedAt`：平台侧最近一次观测到该帖子互动数据的时间，对应最新一条 `post_metric_observations.observed_at`。
+- `post.timestamps.metrics.updatedAt`：站内最新互动快照的写入时间，对应该最新指标记录的 `created_at`。
+- 当服务端尚未保存该帖子的互动观测记录时，`post.timestamps.metrics` 返回 `null`。
 
 常见失败：
 
