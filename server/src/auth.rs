@@ -381,6 +381,15 @@ enum CookieAction {
     Clear,
 }
 
+enum AuthorizationRefreshOutcome {
+    Unchanged,
+    Active {
+        last_checked_at: OffsetDateTime,
+        remote_expires_at: Option<OffsetDateTime>,
+    },
+    Revoked,
+}
+
 async fn resolve_request_session(
     state: &AppState,
     jar: &CookieJar,
@@ -418,20 +427,17 @@ async fn resolve_request_session(
         return Ok(CookieAction::Clear);
     }
 
-    refresh_authorization_if_needed(state, &session).await?;
-    session = match db::find_session(&state.db, selector).await? {
-        Some(record) => record,
-        None => return Ok(CookieAction::Clear),
-    };
-
-    if session.user_disabled_at.is_some() {
-        db::delete_session(&state.db, selector).await?;
-        return Ok(CookieAction::Clear);
-    }
-
-    if session.authorization_status != "active" {
-        db::delete_session(&state.db, selector).await?;
-        return Ok(CookieAction::Clear);
+    match refresh_authorization_if_needed(state, &session).await? {
+        AuthorizationRefreshOutcome::Unchanged => {}
+        AuthorizationRefreshOutcome::Active {
+            last_checked_at,
+            remote_expires_at,
+        } => {
+            session.authorization_status = "active".to_owned();
+            session.authorization_last_checked_at = last_checked_at;
+            session.authorization_remote_expires_at = remote_expires_at;
+        }
+        AuthorizationRefreshOutcome::Revoked => return Ok(CookieAction::Clear),
     }
 
     if state.settings.config.session.auto_renew {
@@ -479,10 +485,10 @@ fn apply_cookie_action(state: &AppState, response: &mut Response, action: Cookie
 async fn refresh_authorization_if_needed(
     state: &AppState,
     session: &db::SessionRecord,
-) -> AppResult<()> {
+) -> AppResult<AuthorizationRefreshOutcome> {
     let ttl = Duration::seconds(state.settings.config.sso.authorization_cache_ttl_seconds);
     if session.authorization_last_checked_at + ttl > OffsetDateTime::now_utc() {
-        return Ok(());
+        return Ok(AuthorizationRefreshOutcome::Unchanged);
     }
 
     match check_authorization(state, session.authorization_id).await? {
@@ -509,7 +515,12 @@ async fn refresh_authorization_if_needed(
             .await?;
             if !status.active {
                 db::delete_sessions_by_authorization(&state.db, session.authorization_id).await?;
+                return Ok(AuthorizationRefreshOutcome::Revoked);
             }
+            Ok(AuthorizationRefreshOutcome::Active {
+                last_checked_at: now,
+                remote_expires_at: status.expires_at,
+            })
         }
         None => {
             let now = OffsetDateTime::now_utc();
@@ -523,10 +534,9 @@ async fn refresh_authorization_if_needed(
             )
             .await?;
             db::delete_sessions_by_authorization(&state.db, session.authorization_id).await?;
+            Ok(AuthorizationRefreshOutcome::Revoked)
         }
     }
-
-    Ok(())
 }
 
 async fn exchange_code(
