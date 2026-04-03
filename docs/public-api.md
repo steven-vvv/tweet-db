@@ -93,7 +93,9 @@
 
 - `sourceKind`：来源标识，必填，例如 `x`。
 - `users`：用户资料数组。
+- `users[].createdAt`：来源平台用户创建时间，必填，必须为 RFC3339 字符串。
 - `tweets`：帖子数组。
+- `tweets[].createdAt`：来源平台帖子创建时间，必填，必须为 RFC3339 字符串。
 - `media`：媒体数组。
 
 当前实现要点：
@@ -134,7 +136,7 @@
 
 常见失败：
 
-- `400`：`sourceKind is required`、`batch exceeds max_items_per_batch (...)`。
+- `400`：`sourceKind is required`、`batch exceeds max_items_per_batch (...)`、`users[0].createdAt must be RFC3339`、`tweets[0].createdAt must be RFC3339`。
 - `401`：`session required`、`registration must be completed`。
 
 ## 3. 帖子状态查询
@@ -178,7 +180,7 @@
         "legacyFullText": "hello world",
         "noteText": null,
         "lang": "en",
-        "sourceCreatedAtRaw": "Wed Apr 01 10:00:00 +0000 2026",
+        "sourceCreatedAt": "2026-04-01T10:00:00Z",
         "inReplyToSourcePostId": null,
         "inReplyToSourceActorId": null,
         "quotedSourcePostId": null,
@@ -229,6 +231,7 @@
 
 响应字段补充说明：
 
+- `post.sourceCreatedAt`：来源平台记录的帖子创建时间，统一返回 RFC3339；若历史数据无法安全回填则返回 `null`。
 - `post.timestamps.post.lastObservedAt`：平台侧最近一次观测到该帖子本体数据的时间，对应服务端 `posts.last_observed_at`。
 - `post.timestamps.post.updatedAt`：站内帖子记录最近一次更新的时间，对应服务端 `posts.updated_at`。
 - `post.timestamps.metrics.lastObservedAt`：平台侧最近一次观测到该帖子互动数据的时间，对应最新一条 `post_metric_observations.observed_at`。
