@@ -104,6 +104,7 @@ pub async fn register_managed_media_batch(
         thumb_url: Option<String>,
         content_type_hint: String,
         submission_id: Uuid,
+        #[serde(with = "time::serde::rfc3339")]
         observed_at: OffsetDateTime,
     }
 
@@ -379,5 +380,24 @@ mod tests {
         let value =
             infer_content_type_from_url("https://pbs.twimg.com/media/demo?format=jpg&name=orig");
         assert_eq!(value.as_deref(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn managed_media_batch_timestamp_serializes_as_rfc3339_string() {
+        #[derive(Serialize)]
+        struct TimestampedRow {
+            #[serde(with = "time::serde::rfc3339")]
+            observed_at: OffsetDateTime,
+        }
+
+        let value = serde_json::to_value(TimestampedRow {
+            observed_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value["observed_at"],
+            serde_json::Value::String("1970-01-01T00:00:01Z".to_owned())
+        );
     }
 }

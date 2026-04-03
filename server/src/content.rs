@@ -618,6 +618,7 @@ struct ActorProfileVersionInsertRow {
     source_kind: String,
     source_actor_id: String,
     version_no: i64,
+    #[serde(with = "time::serde::rfc3339")]
     effective_from: OffsetDateTime,
     profile_fingerprint: String,
     name: String,
@@ -643,6 +644,7 @@ struct ActorCurrentProfileUpdateRow {
     source_actor_id: String,
     version_id: Uuid,
     submission_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
     observed_at: OffsetDateTime,
 }
 
@@ -1061,6 +1063,7 @@ async fn insert_actor_metrics_batch(
         submission_id: Uuid,
         source_kind: String,
         source_actor_id: String,
+        #[serde(with = "time::serde::rfc3339")]
         observed_at: OffsetDateTime,
         followers_count: i64,
         friends_count: i64,
@@ -2795,6 +2798,54 @@ mod tests {
         assert_eq!(
             value["post"]["timestamps"]["metrics"],
             serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn batch_ingest_timestamp_rows_serialize_as_rfc3339_strings() {
+        let observed_at = datetime!(2026-04-03 09:37:50.210458604 UTC);
+        let profile_row = ActorProfileVersionInsertRow {
+            id: Uuid::nil(),
+            submission_id: Uuid::nil(),
+            source_kind: "x".to_owned(),
+            source_actor_id: "actor".to_owned(),
+            version_no: 1,
+            effective_from: observed_at,
+            profile_fingerprint: "fingerprint".to_owned(),
+            name: "name".to_owned(),
+            screen_name: "screen".to_owned(),
+            description: String::new(),
+            location: String::new(),
+            avatar_url: "https://example.com/avatar.jpg".to_owned(),
+            profile_url: None,
+            banner_url: None,
+            is_blue_verified: false,
+            verified_type: None,
+            is_protected: false,
+            profile_image_shape: "Circle".to_owned(),
+            professional_type: None,
+            pinned_post_source_ids: Vec::new(),
+            source_created_at_raw: "2026-04-03T09:37:50.210458604Z".to_owned(),
+            avatar_media_id: None,
+            banner_media_id: None,
+        };
+        let current_row = ActorCurrentProfileUpdateRow {
+            source_actor_id: "actor".to_owned(),
+            version_id: Uuid::nil(),
+            submission_id: Uuid::nil(),
+            observed_at,
+        };
+
+        let profile_value = serde_json::to_value(&profile_row).unwrap();
+        let current_value = serde_json::to_value(&current_row).unwrap();
+
+        assert_eq!(
+            profile_value["effective_from"],
+            serde_json::Value::String("2026-04-03T09:37:50.210458604Z".to_owned())
+        );
+        assert_eq!(
+            current_value["observed_at"],
+            serde_json::Value::String("2026-04-03T09:37:50.210458604Z".to_owned())
         );
     }
 }
