@@ -6,5 +6,6 @@ webui/dist/
 .codex/
 .codex
 .db-certs/
+.cloudflare/
 *.log
 .DS_Store
