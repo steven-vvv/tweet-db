@@ -3,8 +3,14 @@ environment = "development"
 base_url = "http://localhost:3001"
 
 [server]
+mode = "http"
 listen_addr = "127.0.0.1:3001"
 webui_dist_dir = "../../webui/dist"
+# Relative certificate paths are resolved from this TOML file.
+# Example:
+# [server.tls]
+# certificate_chain_path = "../../.cloudflare/origin-cert.pem"
+# private_key_path = "../../.cloudflare/origin-key.pem"
 
 [session]
 cookie_name = "tweet_db_sid"

@@ -35,7 +35,12 @@ async fn account_redirect() -> Redirect {
 
 async fn spa_index(State(state): State<AppState>) -> Response {
     if dist_exists(&state) {
-        let index_path = state.settings.config.server.webui_dist_dir.join("index.html");
+        let index_path = state
+            .settings
+            .config
+            .server
+            .webui_dist_dir
+            .join("index.html");
         match tokio::fs::read_to_string(index_path).await {
             Ok(contents) => Html(contents).into_response(),
             Err(_) => placeholder_index().into_response(),
@@ -80,8 +85,8 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AppConfig, AppSecrets, AppSection, IngestSection, ObservabilitySection, ServerSection,
-            SessionSection, Settings, SsoSection, StorageSection, TransferSection,
+            AppConfig, AppSecrets, AppSection, IngestSection, ObservabilitySection, ServerMode,
+            ServerSection, SessionSection, Settings, SsoSection, StorageSection, TransferSection,
         },
         state::AppState,
     };
@@ -94,8 +99,10 @@ mod tests {
                     base_url: "http://127.0.0.1:3001".to_owned(),
                 },
                 server: ServerSection {
+                    mode: ServerMode::Http,
                     listen_addr: "127.0.0.1:3001".parse().unwrap(),
                     webui_dist_dir: "../../webui/dist".into(),
+                    tls: None,
                 },
                 session: SessionSection {
                     cookie_name: "tweet_db_sid".to_owned(),

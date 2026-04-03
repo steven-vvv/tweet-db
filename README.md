@@ -14,3 +14,12 @@ The expected integration model is a Tampermonkey script using `GM_*` privileged 
 
 - `server/`: Rust backend and database migrations
 - `webui/`: Vue frontend for `/account` plus the internal `/admin` management console
+
+## Server TLS
+
+The backend server now supports protocol selection through the `server` section in TOML configuration:
+
+- `server.mode = "http"` keeps the current plaintext listener behavior.
+- `server.mode = "https"` requires `server.tls.certificate_chain_path` and `server.tls.private_key_path`, both resolved relative to the loaded TOML file unless absolute paths are used.
+
+When `server.mode = "https"`, startup fails fast unless `app.base_url` and `sso.login_redirect_uri` use `https://`, and `session.cookie_secure = true`.
