@@ -14,7 +14,7 @@ use crate::{
     error::{AppError, AppResult},
     media::{self, ManagedIdentityKind, ManagedMediaFamily, ManagedMediaSpec},
     state::AppState,
-    transfer::{self, TransferStatusInfo},
+    transfer::TransferStatusInfo,
 };
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -362,52 +362,37 @@ pub async fn query_post_status(
         ));
     }
 
-    let posts = fetch_posts(&state.db, &source_kind, &unique_post_ids).await?;
-    let posts_by_id = posts
-        .iter()
-        .map(|post| (post.source_post_id.clone(), post.clone()))
-        .collect::<HashMap<_, _>>();
+    let core_rows = fetch_post_status_core_rows(&state.db, &source_kind, &unique_post_ids).await?;
+    let mut posts_by_id = HashMap::new();
+    let mut actors_by_id = HashMap::new();
+    let mut metrics_by_post = HashMap::new();
+    for row in core_rows {
+        posts_by_id.insert(row.post.source_post_id.clone(), row.post);
+        if let Some(actor) = row.actor {
+            actors_by_id.insert(actor.source_actor_id.clone(), actor);
+        }
+        if let Some(metrics) = row.metrics {
+            metrics_by_post.insert(metrics.source_post_id.clone(), metrics);
+        }
+    }
 
-    let author_ids = posts
-        .iter()
-        .map(|post| post.author_source_actor_id.clone())
-        .filter(|id| !id.is_empty())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let actors = fetch_actors(&state.db, &source_kind, &author_ids).await?;
-    let actors_by_id = actors
-        .into_iter()
-        .map(|actor| (actor.source_actor_id.clone(), actor))
-        .collect::<HashMap<_, _>>();
-
-    let media_ids_by_post = fetch_post_media_ids(&state.db, &source_kind, &unique_post_ids).await?;
-    let media_ids = media_ids_by_post
-        .values()
-        .flat_map(|ids| ids.iter().cloned())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let media = fetch_media(&state.db, &source_kind, &media_ids).await?;
-    let media_by_id = media
-        .into_iter()
-        .map(|item| (item.source_media_id.clone(), item))
-        .collect::<HashMap<_, _>>();
-
-    let managed_media_ids = media_by_id
-        .values()
-        .map(|item| item.managed_media_id)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let transfer_statuses =
-        transfer::fetch_transfer_statuses(&state.db, &managed_media_ids).await?;
-
-    let metrics = fetch_latest_post_metrics(&state.db, &source_kind, &unique_post_ids).await?;
-    let metrics_by_post = metrics
-        .into_iter()
-        .map(|item| (item.source_post_id.clone(), item))
-        .collect::<HashMap<_, _>>();
+    let media_rows =
+        fetch_post_status_media_rows(&state.db, &source_kind, &unique_post_ids).await?;
+    let mut media_ids_by_post: HashMap<String, Vec<String>> = HashMap::new();
+    let mut media_by_id = HashMap::new();
+    let mut transfer_statuses = HashMap::new();
+    for row in media_rows {
+        media_ids_by_post
+            .entry(row.source_post_id)
+            .or_default()
+            .push(row.source_media_id.clone());
+        if let Some(media) = row.media {
+            if let Some(transfer) = row.transfer {
+                transfer_statuses.insert(media.managed_media_id, transfer);
+            }
+            media_by_id.insert(media.source_media_id.clone(), media);
+        }
+    }
 
     let items = payload
         .post_ids
@@ -2083,11 +2068,26 @@ struct MediaRow {
     duration_ms: Option<i64>,
 }
 
-async fn fetch_posts(
+#[derive(Debug, Clone)]
+struct PostStatusCoreRow {
+    post: PostRow,
+    actor: Option<ActorRow>,
+    metrics: Option<PostMetricRow>,
+}
+
+#[derive(Debug, Clone)]
+struct PostStatusMediaRow {
+    source_post_id: String,
+    source_media_id: String,
+    media: Option<MediaRow>,
+    transfer: Option<TransferStatusInfo>,
+}
+
+async fn fetch_post_status_core_rows(
     pool: &PgPool,
     source_kind: &str,
     post_ids: &[String],
-) -> AppResult<Vec<PostRow>> {
+) -> AppResult<Vec<PostStatusCoreRow>> {
     if post_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2095,25 +2095,76 @@ async fn fetch_posts(
     let rows = sqlx::query(
         r#"
         SELECT
-            source_post_id,
-            author_source_actor_id,
-            conversation_source_post_id,
-            full_text,
-            legacy_full_text,
-            note_text,
-            lang,
-            source_created_at_raw,
-            in_reply_to_source_post_id,
-            in_reply_to_source_actor_id,
-            quoted_source_post_id,
-            retweeted_source_post_id,
-            possibly_sensitive,
-            source_label,
-            last_observed_at,
-            updated_at
-        FROM posts
-        WHERE source_kind = $1
-          AND source_post_id = ANY($2)
+            p.source_post_id AS post_source_post_id,
+            p.author_source_actor_id AS post_author_source_actor_id,
+            p.conversation_source_post_id AS post_conversation_source_post_id,
+            p.full_text AS post_full_text,
+            p.legacy_full_text AS post_legacy_full_text,
+            p.note_text AS post_note_text,
+            p.lang AS post_lang,
+            p.source_created_at_raw AS post_source_created_at_raw,
+            p.in_reply_to_source_post_id AS post_in_reply_to_source_post_id,
+            p.in_reply_to_source_actor_id AS post_in_reply_to_source_actor_id,
+            p.quoted_source_post_id AS post_quoted_source_post_id,
+            p.retweeted_source_post_id AS post_retweeted_source_post_id,
+            p.possibly_sensitive AS post_possibly_sensitive,
+            p.source_label AS post_source_label,
+            p.last_observed_at AS post_last_observed_at,
+            p.updated_at AS post_updated_at,
+            actor.source_actor_id AS actor_source_actor_id,
+            actor.name AS actor_name,
+            actor.screen_name AS actor_screen_name,
+            actor.description AS actor_description,
+            actor.location AS actor_location,
+            actor.avatar_url AS actor_avatar_url,
+            actor.profile_url AS actor_profile_url,
+            actor.banner_url AS actor_banner_url,
+            actor.verified_type AS actor_verified_type,
+            metrics.source_post_id AS metric_source_post_id,
+            metrics.observed_at AS metric_observed_at,
+            metrics.created_at AS metric_created_at,
+            metrics.view_count AS metric_view_count,
+            metrics.favorite_count AS metric_favorite_count,
+            metrics.retweet_count AS metric_retweet_count,
+            metrics.reply_count AS metric_reply_count,
+            metrics.quote_count AS metric_quote_count,
+            metrics.bookmark_count AS metric_bookmark_count
+        FROM posts p
+        LEFT JOIN LATERAL (
+            SELECT
+                a.source_actor_id,
+                v.name,
+                v.screen_name,
+                v.description,
+                v.location,
+                v.avatar_url,
+                v.profile_url,
+                v.banner_url,
+                v.verified_type
+            FROM actors a
+            INNER JOIN actor_profile_versions v ON v.id = a.current_profile_version_id
+            WHERE a.source_kind = p.source_kind
+              AND a.source_actor_id = p.author_source_actor_id
+        ) actor ON true
+        LEFT JOIN LATERAL (
+            SELECT
+                source_post_id,
+                observed_at,
+                created_at,
+                view_count,
+                favorite_count,
+                retweet_count,
+                reply_count,
+                quote_count,
+                bookmark_count
+            FROM post_metric_observations
+            WHERE source_kind = p.source_kind
+              AND source_post_id = p.source_post_id
+            ORDER BY observed_at DESC, created_at DESC
+            LIMIT 1
+        ) metrics ON true
+        WHERE p.source_kind = $1
+          AND p.source_post_id = ANY($2)
         "#,
     )
     .bind(source_kind)
@@ -2123,52 +2174,97 @@ async fn fetch_posts(
 
     Ok(rows
         .into_iter()
-        .map(|row| PostRow {
-            source_post_id: row.get("source_post_id"),
-            author_source_actor_id: row.get("author_source_actor_id"),
-            conversation_source_post_id: row.get("conversation_source_post_id"),
-            full_text: row.get("full_text"),
-            legacy_full_text: row.get("legacy_full_text"),
-            note_text: row.get("note_text"),
-            lang: row.get("lang"),
-            source_created_at_raw: row.get("source_created_at_raw"),
-            in_reply_to_source_post_id: row.get("in_reply_to_source_post_id"),
-            in_reply_to_source_actor_id: row.get("in_reply_to_source_actor_id"),
-            quoted_source_post_id: row.get("quoted_source_post_id"),
-            retweeted_source_post_id: row.get("retweeted_source_post_id"),
-            possibly_sensitive: row.get("possibly_sensitive"),
-            source_label: row.get("source_label"),
-            last_observed_at: row.get("last_observed_at"),
-            updated_at: row.get("updated_at"),
+        .map(|row| {
+            let actor_source_actor_id = row.get::<Option<String>, _>("actor_source_actor_id");
+            let metric_source_post_id = row.get::<Option<String>, _>("metric_source_post_id");
+
+            PostStatusCoreRow {
+                post: PostRow {
+                    source_post_id: row.get("post_source_post_id"),
+                    author_source_actor_id: row.get("post_author_source_actor_id"),
+                    conversation_source_post_id: row.get("post_conversation_source_post_id"),
+                    full_text: row.get("post_full_text"),
+                    legacy_full_text: row.get("post_legacy_full_text"),
+                    note_text: row.get("post_note_text"),
+                    lang: row.get("post_lang"),
+                    source_created_at_raw: row.get("post_source_created_at_raw"),
+                    in_reply_to_source_post_id: row.get("post_in_reply_to_source_post_id"),
+                    in_reply_to_source_actor_id: row.get("post_in_reply_to_source_actor_id"),
+                    quoted_source_post_id: row.get("post_quoted_source_post_id"),
+                    retweeted_source_post_id: row.get("post_retweeted_source_post_id"),
+                    possibly_sensitive: row.get("post_possibly_sensitive"),
+                    source_label: row.get("post_source_label"),
+                    last_observed_at: row.get("post_last_observed_at"),
+                    updated_at: row.get("post_updated_at"),
+                },
+                actor: actor_source_actor_id.map(|source_actor_id| ActorRow {
+                    source_actor_id,
+                    name: row.get("actor_name"),
+                    screen_name: row.get("actor_screen_name"),
+                    description: row.get("actor_description"),
+                    location: row.get("actor_location"),
+                    avatar_url: row.get("actor_avatar_url"),
+                    profile_url: row.get("actor_profile_url"),
+                    banner_url: row.get("actor_banner_url"),
+                    verified_type: row.get("actor_verified_type"),
+                }),
+                metrics: metric_source_post_id.map(|source_post_id| PostMetricRow {
+                    source_post_id,
+                    observed_at: row.get("metric_observed_at"),
+                    created_at: row.get("metric_created_at"),
+                    view_count: row.get("metric_view_count"),
+                    favorite_count: row.get("metric_favorite_count"),
+                    retweet_count: row.get("metric_retweet_count"),
+                    reply_count: row.get("metric_reply_count"),
+                    quote_count: row.get("metric_quote_count"),
+                    bookmark_count: row.get("metric_bookmark_count"),
+                }),
+            }
         })
         .collect())
 }
 
-async fn fetch_latest_post_metrics(
+async fn fetch_post_status_media_rows(
     pool: &PgPool,
     source_kind: &str,
     post_ids: &[String],
-) -> AppResult<Vec<PostMetricRow>> {
+) -> AppResult<Vec<PostStatusMediaRow>> {
     if post_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     let rows = sqlx::query(
         r#"
-        SELECT DISTINCT ON (source_post_id)
-            source_post_id,
-            observed_at,
-            created_at,
-            view_count,
-            favorite_count,
-            retweet_count,
-            reply_count,
-            quote_count,
-            bookmark_count
-        FROM post_metric_observations
-        WHERE source_kind = $1
-          AND source_post_id = ANY($2)
-        ORDER BY source_post_id, observed_at DESC, created_at DESC
+        SELECT
+            pm.source_post_id,
+            pm.source_media_id,
+            pms.source_media_id AS media_source_media_id,
+            pms.managed_media_id AS media_managed_media_id,
+            pms.media_key AS media_media_key,
+            pms.source_post_id AS media_source_post_id,
+            pms.media_type AS media_media_type,
+            pms.source_url AS media_source_url,
+            pms.thumb_url AS media_thumb_url,
+            pms.width AS media_width,
+            pms.height AS media_height,
+            pms.alt_text AS media_alt_text,
+            pms.allow_download AS media_allow_download,
+            pms.duration_ms AS media_duration_ms,
+            j.status AS transfer_status,
+            j.last_error AS transfer_last_error,
+            o.object_key AS transfer_storage_object_key
+        FROM post_media pm
+        LEFT JOIN post_media_sources pms
+            ON pms.source_kind = pm.source_kind
+           AND pms.source_media_id = pm.source_media_id
+        LEFT JOIN media_transfer_jobs j ON j.media_id = pms.managed_media_id
+        LEFT JOIN media_storage_bindings b
+            ON b.media_id = pms.managed_media_id
+           AND b.object_role = 'original'
+        LEFT JOIN storage_objects o ON o.id = b.storage_object_id
+        WHERE pm.source_kind = $1
+          AND pm.source_post_id = ANY($2)
+        ORDER BY pm.source_post_id ASC, pm.position ASC, pm.source_media_id ASC
         "#,
     )
     .bind(source_kind)
@@ -2178,151 +2274,33 @@ async fn fetch_latest_post_metrics(
 
     Ok(rows
         .into_iter()
-        .map(|row| PostMetricRow {
-            source_post_id: row.get("source_post_id"),
-            observed_at: row.get("observed_at"),
-            created_at: row.get("created_at"),
-            view_count: row.get("view_count"),
-            favorite_count: row.get("favorite_count"),
-            retweet_count: row.get("retweet_count"),
-            reply_count: row.get("reply_count"),
-            quote_count: row.get("quote_count"),
-            bookmark_count: row.get("bookmark_count"),
-        })
-        .collect())
-}
+        .map(|row| {
+            let media_source_media_id = row.get::<Option<String>, _>("media_source_media_id");
+            let transfer_status = row.get::<Option<String>, _>("transfer_status");
 
-async fn fetch_post_media_ids(
-    pool: &PgPool,
-    source_kind: &str,
-    post_ids: &[String],
-) -> AppResult<HashMap<String, Vec<String>>> {
-    if post_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = sqlx::query(
-        r#"
-        SELECT source_post_id, source_media_id
-        FROM post_media
-        WHERE source_kind = $1
-          AND source_post_id = ANY($2)
-        ORDER BY source_post_id ASC, position ASC, source_media_id ASC
-        "#,
-    )
-    .bind(source_kind)
-    .bind(post_ids)
-    .fetch_all(pool)
-    .await?;
-
-    let mut media_ids_by_post: HashMap<String, Vec<String>> = HashMap::new();
-    for row in rows {
-        media_ids_by_post
-            .entry(row.get("source_post_id"))
-            .or_default()
-            .push(row.get("source_media_id"));
-    }
-
-    Ok(media_ids_by_post)
-}
-
-async fn fetch_actors(
-    pool: &PgPool,
-    source_kind: &str,
-    actor_ids: &[String],
-) -> AppResult<Vec<ActorRow>> {
-    if actor_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            a.source_actor_id,
-            v.name,
-            v.screen_name,
-            v.description,
-            v.location,
-            v.avatar_url,
-            v.profile_url,
-            v.banner_url,
-            v.verified_type
-        FROM actors a
-        JOIN actor_profile_versions v ON v.id = a.current_profile_version_id
-        WHERE a.source_kind = $1
-          AND a.source_actor_id = ANY($2)
-        "#,
-    )
-    .bind(source_kind)
-    .bind(actor_ids)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| ActorRow {
-            source_actor_id: row.get("source_actor_id"),
-            name: row.get("name"),
-            screen_name: row.get("screen_name"),
-            description: row.get("description"),
-            location: row.get("location"),
-            avatar_url: row.get("avatar_url"),
-            profile_url: row.get("profile_url"),
-            banner_url: row.get("banner_url"),
-            verified_type: row.get("verified_type"),
-        })
-        .collect())
-}
-
-async fn fetch_media(
-    pool: &PgPool,
-    source_kind: &str,
-    media_ids: &[String],
-) -> AppResult<Vec<MediaRow>> {
-    if media_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            source_media_id,
-            managed_media_id,
-            media_key,
-            source_post_id,
-            media_type,
-            source_url,
-            thumb_url,
-            width,
-            height,
-            alt_text,
-            allow_download,
-            duration_ms
-        FROM post_media_sources
-        WHERE source_kind = $1
-          AND source_media_id = ANY($2)
-        "#,
-    )
-    .bind(source_kind)
-    .bind(media_ids)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| MediaRow {
-            source_media_id: row.get("source_media_id"),
-            managed_media_id: row.get("managed_media_id"),
-            media_key: row.get("media_key"),
-            source_post_id: row.get("source_post_id"),
-            media_type: row.get("media_type"),
-            source_url: row.get("source_url"),
-            thumb_url: row.get("thumb_url"),
-            width: row.get("width"),
-            height: row.get("height"),
-            alt_text: row.get("alt_text"),
-            allow_download: row.get("allow_download"),
-            duration_ms: row.get("duration_ms"),
+            PostStatusMediaRow {
+                source_post_id: row.get("source_post_id"),
+                source_media_id: row.get("source_media_id"),
+                media: media_source_media_id.map(|source_media_id| MediaRow {
+                    source_media_id,
+                    managed_media_id: row.get("media_managed_media_id"),
+                    media_key: row.get("media_media_key"),
+                    source_post_id: row.get("media_source_post_id"),
+                    media_type: row.get("media_media_type"),
+                    source_url: row.get("media_source_url"),
+                    thumb_url: row.get("media_thumb_url"),
+                    width: row.get("media_width"),
+                    height: row.get("media_height"),
+                    alt_text: row.get("media_alt_text"),
+                    allow_download: row.get("media_allow_download"),
+                    duration_ms: row.get("media_duration_ms"),
+                }),
+                transfer: transfer_status.map(|status| TransferStatusInfo {
+                    status: Some(status),
+                    storage_object_key: row.get("transfer_storage_object_key"),
+                    last_error: row.get("transfer_last_error"),
+                }),
+            }
         })
         .collect())
 }
