@@ -152,7 +152,7 @@ pub struct PostView {
     pub legacy_full_text: String,
     pub note_text: Option<String>,
     pub lang: String,
-    pub source_created_at_raw: String,
+    pub source_created_at: Option<String>,
     pub in_reply_to_source_post_id: Option<String>,
     pub in_reply_to_source_actor_id: Option<String>,
     pub quoted_source_post_id: Option<String>,
@@ -240,6 +240,7 @@ pub async fn ingest_submission(
     let session = auth::require_registered_session(session)?;
     let source_kind = validate_source_kind(&payload.source_kind)?;
     validate_batch_size(&state, &payload)?;
+    validate_source_created_at_fields(&payload)?;
 
     let submission_id = Uuid::now_v7();
     let now = OffsetDateTime::now_utc();
@@ -434,6 +435,24 @@ fn validate_batch_size(state: &AppState, payload: &SubmissionEnvelope) -> AppRes
     Ok(())
 }
 
+fn validate_source_created_at_fields(payload: &SubmissionEnvelope) -> AppResult<()> {
+    for (index, item) in payload.users.iter().enumerate() {
+        if item.id.trim().is_empty() {
+            continue;
+        }
+        parse_source_created_at(&item.created_at, &format!("users[{index}].createdAt"))?;
+    }
+
+    for (index, item) in payload.tweets.iter().enumerate() {
+        if item.id.trim().is_empty() {
+            continue;
+        }
+        parse_source_created_at(&item.created_at, &format!("tweets[{index}].createdAt"))?;
+    }
+
+    Ok(())
+}
+
 fn normalize_entities<T, F>(items: &[T], key_fn: F) -> NormalizedItems<T>
 where
     T: Clone,
@@ -620,6 +639,8 @@ struct ActorProfileVersionInsertRow {
     version_no: i64,
     #[serde(with = "time::serde::rfc3339")]
     effective_from: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    source_created_at: OffsetDateTime,
     profile_fingerprint: String,
     name: String,
     screen_name: String,
@@ -805,6 +826,9 @@ async fn sync_actor_profiles_batch(
 
         let version_id = Uuid::now_v7();
         let version_no = current.map(|row| row.version_no + 1).unwrap_or(1);
+        let created_at_field = format!("user {actor_id} createdAt");
+        let (source_created_at, source_created_at_raw) =
+            normalize_source_created_at(&item.created_at, &created_at_field)?;
         insert_rows.push(ActorProfileVersionInsertRow {
             id: version_id,
             submission_id,
@@ -812,6 +836,7 @@ async fn sync_actor_profiles_batch(
             source_actor_id: actor_id.to_owned(),
             version_no,
             effective_from: observed_at,
+            source_created_at,
             profile_fingerprint: fingerprint,
             name: item.name.trim().to_owned(),
             screen_name: item.screen_name.trim().to_owned(),
@@ -826,7 +851,7 @@ async fn sync_actor_profiles_batch(
             profile_image_shape: item.profile_image_shape.trim().to_owned(),
             professional_type: trimmed_option(&item.professional_type),
             pinned_post_source_ids: unique_nonempty_strings(&item.pinned_tweet_ids),
-            source_created_at_raw: item.created_at.trim().to_owned(),
+            source_created_at_raw,
             avatar_media_id: actor_avatar_media_id(source_kind, item, managed_media_by_key),
             banner_media_id: actor_banner_media_id(source_kind, item, managed_media_by_key),
         });
@@ -929,6 +954,7 @@ async fn insert_actor_profile_versions_batch(
             source_actor_id,
             version_no,
             effective_from,
+            source_created_at,
             profile_fingerprint,
             name,
             screen_name,
@@ -954,6 +980,7 @@ async fn insert_actor_profile_versions_batch(
             item.source_actor_id,
             item.version_no,
             item.effective_from,
+            item.source_created_at,
             item.profile_fingerprint,
             item.name,
             item.screen_name,
@@ -982,6 +1009,7 @@ async fn insert_actor_profile_versions_batch(
             source_actor_id TEXT,
             version_no BIGINT,
             effective_from TIMESTAMPTZ,
+            source_created_at TIMESTAMPTZ,
             profile_fingerprint TEXT,
             name TEXT,
             screen_name TEXT,
@@ -1228,6 +1256,8 @@ async fn upsert_posts_batch(
         legacy_full_text: String,
         note_text: Option<String>,
         lang: String,
+        #[serde(with = "time::serde::rfc3339")]
+        source_created_at: OffsetDateTime,
         source_created_at_raw: String,
         in_reply_to_source_post_id: Option<String>,
         in_reply_to_source_actor_id: Option<String>,
@@ -1243,23 +1273,29 @@ async fn upsert_posts_batch(
 
     let rows = items
         .iter()
-        .map(|item| PostUpsertRow {
-            source_post_id: item.id.trim().to_owned(),
-            author_source_actor_id: item.author_id.trim().to_owned(),
-            conversation_source_post_id: item.conversation_id.trim().to_owned(),
-            full_text: item.full_text.trim().to_owned(),
-            legacy_full_text: item.legacy_full_text.trim().to_owned(),
-            note_text: trimmed_option(&item.note_text),
-            lang: item.lang.trim().to_owned(),
-            source_created_at_raw: item.created_at.trim().to_owned(),
-            in_reply_to_source_post_id: trimmed_option(&item.in_reply_to_tweet_id),
-            in_reply_to_source_actor_id: trimmed_option(&item.in_reply_to_user_id),
-            quoted_source_post_id: trimmed_option(&item.quoted_tweet_id),
-            retweeted_source_post_id: trimmed_option(&item.retweeted_tweet_id),
-            possibly_sensitive: item.possibly_sensitive,
-            source_label: item.source.trim().to_owned(),
+        .map(|item| {
+            let created_at_field = format!("tweet {} createdAt", item.id.trim());
+            let (source_created_at, source_created_at_raw) =
+                normalize_source_created_at(&item.created_at, &created_at_field)?;
+            Ok(PostUpsertRow {
+                source_post_id: item.id.trim().to_owned(),
+                author_source_actor_id: item.author_id.trim().to_owned(),
+                conversation_source_post_id: item.conversation_id.trim().to_owned(),
+                full_text: item.full_text.trim().to_owned(),
+                legacy_full_text: item.legacy_full_text.trim().to_owned(),
+                note_text: trimmed_option(&item.note_text),
+                lang: item.lang.trim().to_owned(),
+                source_created_at,
+                source_created_at_raw,
+                in_reply_to_source_post_id: trimmed_option(&item.in_reply_to_tweet_id),
+                in_reply_to_source_actor_id: trimmed_option(&item.in_reply_to_user_id),
+                quoted_source_post_id: trimmed_option(&item.quoted_tweet_id),
+                retweeted_source_post_id: trimmed_option(&item.retweeted_tweet_id),
+                possibly_sensitive: item.possibly_sensitive,
+                source_label: item.source.trim().to_owned(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<AppResult<Vec<_>>>()?;
     let payload = serde_json::to_value(&rows)?;
     sqlx::query(
         r#"
@@ -1272,6 +1308,7 @@ async fn upsert_posts_batch(
             legacy_full_text,
             note_text,
             lang,
+            source_created_at,
             source_created_at_raw,
             in_reply_to_source_post_id,
             in_reply_to_source_actor_id,
@@ -1293,6 +1330,7 @@ async fn upsert_posts_batch(
             item.legacy_full_text,
             item.note_text,
             item.lang,
+            item.source_created_at,
             item.source_created_at_raw,
             item.in_reply_to_source_post_id,
             item.in_reply_to_source_actor_id,
@@ -1312,6 +1350,7 @@ async fn upsert_posts_batch(
             legacy_full_text TEXT,
             note_text TEXT,
             lang TEXT,
+            source_created_at TIMESTAMPTZ,
             source_created_at_raw TEXT,
             in_reply_to_source_post_id TEXT,
             in_reply_to_source_actor_id TEXT,
@@ -1327,6 +1366,7 @@ async fn upsert_posts_batch(
             legacy_full_text = EXCLUDED.legacy_full_text,
             note_text = EXCLUDED.note_text,
             lang = EXCLUDED.lang,
+            source_created_at = EXCLUDED.source_created_at,
             source_created_at_raw = EXCLUDED.source_created_at_raw,
             in_reply_to_source_post_id = EXCLUDED.in_reply_to_source_post_id,
             in_reply_to_source_actor_id = EXCLUDED.in_reply_to_source_actor_id,
@@ -1958,8 +1998,12 @@ fn actor_profile_fingerprint(item: &XUserInput) -> AppResult<String> {
         profile_image_shape: &'a str,
         professional_type: Option<String>,
         pinned_post_source_ids: Vec<String>,
-        source_created_at_raw: &'a str,
+        source_created_at: String,
     }
+
+    let created_at_field = format!("user {} createdAt", item.id.trim());
+    let (_, source_created_at) =
+        normalize_source_created_at(&item.created_at, &created_at_field)?;
 
     let payload = FingerprintPayload {
         name: item.name.trim(),
@@ -1975,7 +2019,7 @@ fn actor_profile_fingerprint(item: &XUserInput) -> AppResult<String> {
         profile_image_shape: item.profile_image_shape.trim(),
         professional_type: trimmed_option(&item.professional_type),
         pinned_post_source_ids: unique_nonempty_strings(&item.pinned_tweet_ids),
-        source_created_at_raw: item.created_at.trim(),
+        source_created_at,
     };
 
     let bytes = serde_json::to_vec(&payload)?;
@@ -2018,7 +2062,7 @@ struct PostRow {
     legacy_full_text: String,
     note_text: Option<String>,
     lang: String,
-    source_created_at_raw: String,
+    source_created_at: Option<OffsetDateTime>,
     in_reply_to_source_post_id: Option<String>,
     in_reply_to_source_actor_id: Option<String>,
     quoted_source_post_id: Option<String>,
@@ -2105,7 +2149,7 @@ async fn fetch_post_status_core_rows(
             p.legacy_full_text AS post_legacy_full_text,
             p.note_text AS post_note_text,
             p.lang AS post_lang,
-            p.source_created_at_raw AS post_source_created_at_raw,
+            p.source_created_at AS post_source_created_at,
             p.in_reply_to_source_post_id AS post_in_reply_to_source_post_id,
             p.in_reply_to_source_actor_id AS post_in_reply_to_source_actor_id,
             p.quoted_source_post_id AS post_quoted_source_post_id,
@@ -2190,7 +2234,7 @@ async fn fetch_post_status_core_rows(
                     legacy_full_text: row.get("post_legacy_full_text"),
                     note_text: row.get("post_note_text"),
                     lang: row.get("post_lang"),
-                    source_created_at_raw: row.get("post_source_created_at_raw"),
+                    source_created_at: row.get("post_source_created_at"),
                     in_reply_to_source_post_id: row.get("post_in_reply_to_source_post_id"),
                     in_reply_to_source_actor_id: row.get("post_in_reply_to_source_actor_id"),
                     quoted_source_post_id: row.get("post_quoted_source_post_id"),
@@ -2394,7 +2438,7 @@ fn build_post_status_aggregate(
             legacy_full_text: post.legacy_full_text.clone(),
             note_text: post.note_text.clone(),
             lang: post.lang.clone(),
-            source_created_at_raw: post.source_created_at_raw.clone(),
+            source_created_at: post.source_created_at.map(format_time),
             in_reply_to_source_post_id: post.in_reply_to_source_post_id.clone(),
             in_reply_to_source_actor_id: post.in_reply_to_source_actor_id.clone(),
             quoted_source_post_id: post.quoted_source_post_id.clone(),
@@ -2435,6 +2479,24 @@ fn format_time(value: OffsetDateTime) -> String {
     value
         .format(&Rfc3339)
         .unwrap_or_else(|_| value.unix_timestamp().to_string())
+}
+
+fn normalize_source_created_at(
+    value: &str,
+    field_name: &str,
+) -> AppResult<(OffsetDateTime, String)> {
+    let parsed = parse_source_created_at(value, field_name)?;
+    Ok((parsed, format_time(parsed)))
+}
+
+fn parse_source_created_at(value: &str, field_name: &str) -> AppResult<OffsetDateTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::bad_request(format!("{field_name} is required")));
+    }
+
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| AppError::bad_request(format!("{field_name} must be RFC3339")))
 }
 
 #[cfg(test)]
@@ -2489,6 +2551,7 @@ mod tests {
             screen_name: "demo_user".to_owned(),
             avatar_url: "https://example.com/avatar_normal.jpg".to_owned(),
             banner_url: Some("https://example.com/banner".to_owned()),
+            created_at: "2026-04-03T03:47:59Z".to_owned(),
             followers_count: 10,
             ..Default::default()
         };
@@ -2557,11 +2620,49 @@ mod tests {
     }
 
     #[test]
+    fn validate_source_created_at_fields_accepts_rfc3339_values() {
+        let payload = SubmissionEnvelope {
+            source_kind: "x".to_owned(),
+            users: vec![XUserInput {
+                id: "u1".to_owned(),
+                created_at: "2026-04-03T03:47:59Z".to_owned(),
+                ..Default::default()
+            }],
+            tweets: vec![XTweetInput {
+                id: "t1".to_owned(),
+                created_at: "2026-04-03T03:47:59+00:00".to_owned(),
+                ..Default::default()
+            }],
+            media: Vec::new(),
+        };
+
+        validate_source_created_at_fields(&payload).unwrap();
+    }
+
+    #[test]
+    fn validate_source_created_at_fields_rejects_legacy_source_format() {
+        let payload = SubmissionEnvelope {
+            source_kind: "x".to_owned(),
+            users: vec![XUserInput {
+                id: "u1".to_owned(),
+                created_at: "Fri Aug 23 23:35:25 +0000 2019".to_owned(),
+                ..Default::default()
+            }],
+            tweets: Vec::new(),
+            media: Vec::new(),
+        };
+
+        let error = validate_source_created_at_fields(&payload).unwrap_err();
+        assert!(error.to_string().contains("users[0].createdAt must be RFC3339"));
+    }
+
+    #[test]
     fn build_post_status_aggregate_uses_latest_metrics_and_media_order() {
         let post_last_observed_at = datetime!(2026-04-03 12:34:56 UTC);
         let post_updated_at = datetime!(2026-04-03 12:35:02 UTC);
         let metrics_observed_at = datetime!(2026-04-03 12:36:00 UTC);
         let metrics_updated_at = datetime!(2026-04-03 12:36:05 UTC);
+        let source_created_at = datetime!(2026-04-03 03:47:59 UTC);
         let post = PostRow {
             source_post_id: "p1".to_owned(),
             author_source_actor_id: "a1".to_owned(),
@@ -2570,7 +2671,7 @@ mod tests {
             legacy_full_text: "legacy".to_owned(),
             note_text: None,
             lang: "en".to_owned(),
-            source_created_at_raw: "created".to_owned(),
+            source_created_at: Some(source_created_at),
             in_reply_to_source_post_id: None,
             in_reply_to_source_actor_id: None,
             quoted_source_post_id: None,
@@ -2685,6 +2786,10 @@ mod tests {
         assert_eq!(aggregate.post.as_ref().unwrap().view_count, Some(10));
         assert_eq!(aggregate.post.as_ref().unwrap().media_source_ids, media_ids);
         assert_eq!(
+            aggregate.post.as_ref().unwrap().source_created_at.as_deref(),
+            Some("2026-04-03T03:47:59Z")
+        );
+        assert_eq!(
             aggregate
                 .post
                 .as_ref()
@@ -2733,6 +2838,7 @@ mod tests {
         assert_eq!(aggregate.transfer_summary.succeeded, 1);
 
         let value = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(value["post"]["sourceCreatedAt"], "2026-04-03T03:47:59Z");
         assert_eq!(
             value["post"]["timestamps"]["post"]["lastObservedAt"],
             "2026-04-03T12:34:56Z"
@@ -2761,7 +2867,7 @@ mod tests {
             legacy_full_text: "legacy".to_owned(),
             note_text: None,
             lang: "en".to_owned(),
-            source_created_at_raw: "created".to_owned(),
+            source_created_at: None,
             in_reply_to_source_post_id: None,
             in_reply_to_source_actor_id: None,
             quoted_source_post_id: None,
@@ -2795,6 +2901,7 @@ mod tests {
         );
 
         let value = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(value["post"]["sourceCreatedAt"], serde_json::Value::Null);
         assert_eq!(
             value["post"]["timestamps"]["metrics"],
             serde_json::Value::Null
@@ -2811,6 +2918,7 @@ mod tests {
             source_actor_id: "actor".to_owned(),
             version_no: 1,
             effective_from: observed_at,
+            source_created_at: observed_at,
             profile_fingerprint: "fingerprint".to_owned(),
             name: "name".to_owned(),
             screen_name: "screen".to_owned(),
@@ -2841,6 +2949,10 @@ mod tests {
 
         assert_eq!(
             profile_value["effective_from"],
+            serde_json::Value::String("2026-04-03T09:37:50.210458604Z".to_owned())
+        );
+        assert_eq!(
+            profile_value["source_created_at"],
             serde_json::Value::String("2026-04-03T09:37:50.210458604Z".to_owned())
         );
         assert_eq!(
