@@ -1,6 +1,6 @@
 [app]
 environment = "development"
-base_url = "http://127.0.0.1:3001"
+base_url = "http://localhost:3001"
 
 [server]
 listen_addr = "127.0.0.1:3001"
@@ -16,9 +16,9 @@ auto_renew = true
 pending_login_ttl_seconds = 600
 
 [sso]
-issuer = "http://127.0.0.1:3000"
+issuer = "http://localhost:3000"
 client_id = "tweet-db"
-login_redirect_uri = "http://127.0.0.1:3001/integrations/sso/callback"
+login_redirect_uri = "http://localhost:3001/integrations/sso/callback"
 authorization_cache_ttl_seconds = 300
 
 [ingest]
