@@ -7,7 +7,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use rustls::ServerConfig;
+use rustls::{ServerConfig, crypto::aws_lc_rs};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -28,6 +28,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    install_rustls_crypto_provider();
+
     let cli = Cli::parse();
     let settings = Settings::load(cli.config.as_deref())?;
 
@@ -52,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn install_rustls_crypto_provider() {
+    let _ = aws_lc_rs::default_provider().install_default();
 }
 
 async fn serve_http(app: Router, listen_addr: std::net::SocketAddr) -> std::io::Result<()> {
