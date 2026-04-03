@@ -193,16 +193,47 @@ pub async fn get_user(
     let row = sqlx::query(
         r#"
         SELECT
-            id,
-            username::text AS username,
-            is_admin,
-            disabled_at,
-            disabled_by_user_id,
-            created_at,
-            updated_at,
-            to_jsonb(users) AS record
-        FROM users
-        WHERE id = $1
+            u.id,
+            u.username::text AS username,
+            u.is_admin,
+            u.disabled_at,
+            u.disabled_by_user_id,
+            u.created_at,
+            u.updated_at,
+            to_jsonb(u) AS record,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT selector, user_id, sso_subject_id, authorization_id, registration_state, expires_at, last_seen_at, created_at
+                    FROM sessions
+                    WHERE user_id = u.id
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS sessions,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT authorization_id, sso_subject_id, user_id, status, last_checked_at, remote_expires_at, revoked_at, created_at, updated_at
+                    FROM user_sso_authorizations
+                    WHERE user_id = u.id
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS authorizations,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT id, actor_user_id, event_type, resource_type, resource_id, details, created_at
+                    FROM audit_events
+                    WHERE resource_type = 'user'
+                      AND resource_id = u.id::text
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS audit_events
+        FROM users u
+        WHERE u.id = $1
         "#,
     )
     .bind(user_id)
@@ -211,53 +242,6 @@ pub async fn get_user(
 
     let row = row.ok_or_else(|| AppError::not_found("user not found"))?;
     let disabled_at: Option<OffsetDateTime> = row.get("disabled_at");
-
-    let sessions = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT selector, user_id, sso_subject_id, authorization_id, registration_state, expires_at, last_seen_at, created_at
-            FROM sessions
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        user_id,
-    )
-    .await?;
-    let authorizations = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT authorization_id, sso_subject_id, user_id, status, last_checked_at, remote_expires_at, revoked_at, created_at, updated_at
-            FROM user_sso_authorizations
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        user_id,
-    )
-    .await?;
-    let audit_events = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT id, actor_user_id, event_type, resource_type, resource_id, details, created_at
-            FROM audit_events
-            WHERE resource_type = 'user'
-              AND resource_id = $1
-            ORDER BY created_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        user_id.to_string(),
-    )
-    .await?;
 
     Ok(Json(detail_response(
         json!({
@@ -272,9 +256,9 @@ pub async fn get_user(
         }),
         row.get("record"),
         json!({
-            "sessions": sessions,
-            "authorizations": authorizations,
-            "auditEvents": audit_events,
+            "sessions": row.get::<Value, _>("sessions"),
+            "authorizations": row.get::<Value, _>("authorizations"),
+            "auditEvents": row.get::<Value, _>("audit_events"),
         }),
     )))
 }
@@ -518,7 +502,65 @@ pub async fn get_post(
             p.full_text,
             p.last_observed_at,
             COALESCE(pm.media_count, 0) AS media_count,
-            to_jsonb(p) AS record
+            to_jsonb(p) AS record,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT submission_id, source_kind, source_post_id, observed_at, view_count, favorite_count, retweet_count, reply_count, quote_count, bookmark_count, created_at
+                    FROM post_metric_observations
+                    WHERE source_kind = p.source_kind
+                      AND source_post_id = p.source_post_id
+                    ORDER BY observed_at DESC, created_at DESC
+                    LIMIT 1
+                ) t
+            ) AS latest_metrics,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT
+                        a.source_kind,
+                        a.source_actor_id,
+                        a.last_observed_at,
+                        apv.name,
+                        apv.screen_name,
+                        apv.avatar_media_id,
+                        apv.banner_media_id
+                    FROM actors a
+                    LEFT JOIN actor_profile_versions apv ON apv.id = a.current_profile_version_id
+                    WHERE a.source_kind = p.source_kind
+                      AND a.source_actor_id = p.author_source_actor_id
+                    LIMIT 1
+                ) t
+            ) AS author,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT
+                        pm.position,
+                        pms.source_media_id,
+                        pms.media_type,
+                        pms.media_url,
+                        pms.thumb_url,
+                        pms.source_url,
+                        pms.width,
+                        pms.height,
+                        pms.alt_text,
+                        pms.duration_ms,
+                        pms.managed_media_id,
+                        j.status AS transfer_status,
+                        o.id AS storage_object_id,
+                        o.object_key
+                    FROM post_media pm
+                    INNER JOIN post_media_sources pms
+                        ON pms.source_kind = pm.source_kind
+                       AND pms.source_media_id = pm.source_media_id
+                    LEFT JOIN media_transfer_jobs j ON j.media_id = pms.managed_media_id
+                    LEFT JOIN storage_objects o ON o.id = j.storage_object_id
+                    WHERE pm.source_kind = p.source_kind
+                      AND pm.source_post_id = p.source_post_id
+                    ORDER BY pm.position ASC, pms.source_media_id ASC
+                ) t
+            ), '[]'::jsonb) AS media
         FROM posts p
         LEFT JOIN LATERAL (
             SELECT COUNT(*)::bigint AS media_count
@@ -536,50 +578,6 @@ pub async fn get_post(
     .await?;
     let row = row.ok_or_else(|| AppError::not_found("post not found"))?;
 
-    let metrics = fetch_optional_json2(
-        &state.db,
-        r#"
-        SELECT to_jsonb(t)
-        FROM (
-            SELECT submission_id, source_kind, source_post_id, observed_at, view_count, favorite_count, retweet_count, reply_count, quote_count, bookmark_count, created_at
-            FROM post_metric_observations
-            WHERE source_kind = $1
-              AND source_post_id = $2
-            ORDER BY observed_at DESC, created_at DESC
-            LIMIT 1
-        ) t
-        "#,
-        source_kind.as_str(),
-        source_post_id.trim(),
-    )
-    .await?;
-    let author_source_actor_id = row.get::<String, _>("author_source_actor_id");
-    let author = fetch_optional_json2(
-        &state.db,
-        r#"
-        SELECT to_jsonb(t)
-        FROM (
-            SELECT
-                a.source_kind,
-                a.source_actor_id,
-                a.last_observed_at,
-                apv.name,
-                apv.screen_name,
-                apv.avatar_media_id,
-                apv.banner_media_id
-            FROM actors a
-            LEFT JOIN actor_profile_versions apv ON apv.id = a.current_profile_version_id
-            WHERE a.source_kind = $1
-              AND a.source_actor_id = $2
-            LIMIT 1
-        ) t
-        "#,
-        source_kind.as_str(),
-        author_source_actor_id.as_str(),
-    )
-    .await?;
-    let media = fetch_post_media_json(&state.db, &source_kind, source_post_id.trim()).await?;
-
     Ok(Json(detail_response(
         json!({
             "sourceKind": row.get::<String, _>("source_kind"),
@@ -590,9 +588,9 @@ pub async fn get_post(
         }),
         row.get("record"),
         json!({
-            "latestMetrics": metrics,
-            "author": author,
-            "media": media,
+            "latestMetrics": row.get::<Option<Value>, _>("latest_metrics"),
+            "author": row.get::<Option<Value>, _>("author"),
+            "media": row.get::<Value, _>("media"),
         }),
     )))
 }
@@ -700,7 +698,30 @@ pub async fn get_actor(
             COALESCE(apv.screen_name, '') AS screen_name,
             apv.avatar_media_id,
             apv.banner_media_id,
-            to_jsonb(a) AS record
+            to_jsonb(a) AS record,
+            to_jsonb(apv) AS current_profile,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT submission_id, source_kind, source_actor_id, observed_at, followers_count, friends_count, favourites_count, statuses_count, media_count, listed_count, created_at
+                    FROM actor_metric_observations
+                    WHERE source_kind = a.source_kind
+                      AND source_actor_id = a.source_actor_id
+                    ORDER BY observed_at DESC, created_at DESC
+                    LIMIT 1
+                ) t
+            ) AS latest_metrics,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT source_kind, source_post_id, author_source_actor_id, full_text, last_observed_at
+                    FROM posts
+                    WHERE source_kind = a.source_kind
+                      AND author_source_actor_id = a.source_actor_id
+                    ORDER BY last_observed_at DESC, source_post_id DESC
+                    LIMIT 10
+                ) t
+            ), '[]'::jsonb) AS recent_posts
         FROM actors a
         LEFT JOIN actor_profile_versions apv ON apv.id = a.current_profile_version_id
         WHERE a.source_kind = $1
@@ -712,54 +733,6 @@ pub async fn get_actor(
     .fetch_optional(&state.db)
     .await?;
     let row = row.ok_or_else(|| AppError::not_found("actor not found"))?;
-
-    let current_profile = fetch_optional_json2(
-        &state.db,
-        r#"
-        SELECT to_jsonb(apv)
-        FROM actor_profile_versions apv
-        INNER JOIN actors a ON a.current_profile_version_id = apv.id
-        WHERE a.source_kind = $1
-          AND a.source_actor_id = $2
-        "#,
-        source_kind.as_str(),
-        source_actor_id.trim(),
-    )
-    .await?;
-    let latest_metrics = fetch_optional_json2(
-        &state.db,
-        r#"
-        SELECT to_jsonb(t)
-        FROM (
-            SELECT submission_id, source_kind, source_actor_id, observed_at, followers_count, friends_count, favourites_count, statuses_count, media_count, listed_count, created_at
-            FROM actor_metric_observations
-            WHERE source_kind = $1
-              AND source_actor_id = $2
-            ORDER BY observed_at DESC, created_at DESC
-            LIMIT 1
-        ) t
-        "#,
-        source_kind.as_str(),
-        source_actor_id.trim(),
-    )
-    .await?;
-    let recent_posts = fetch_json_array2(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT source_kind, source_post_id, author_source_actor_id, full_text, last_observed_at
-            FROM posts
-            WHERE source_kind = $1
-              AND author_source_actor_id = $2
-            ORDER BY last_observed_at DESC, source_post_id DESC
-            LIMIT 10
-        ) t
-        "#,
-        &source_kind,
-        source_actor_id.trim(),
-    )
-    .await?;
 
     Ok(Json(detail_response(
         json!({
@@ -773,9 +746,9 @@ pub async fn get_actor(
         }),
         row.get("record"),
         json!({
-            "currentProfile": current_profile,
-            "latestMetrics": latest_metrics,
-            "recentPosts": recent_posts,
+            "currentProfile": row.get::<Option<Value>, _>("current_profile"),
+            "latestMetrics": row.get::<Option<Value>, _>("latest_metrics"),
+            "recentPosts": row.get::<Value, _>("recent_posts"),
         }),
     )))
 }
@@ -804,7 +777,47 @@ pub async fn get_media(
             j.status AS transfer_status,
             j.storage_object_id,
             o.object_key AS storage_object_key,
-            to_jsonb(m) AS record
+            to_jsonb(m) AS record,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT source_kind, source_media_id, managed_media_id, media_key, source_post_id, media_type, media_url, thumb_url, source_url, width, height, alt_text, allow_download, source_status_id, source_actor_id, duration_ms, first_observed_at, last_observed_at, created_at, updated_at
+                    FROM post_media_sources
+                    WHERE managed_media_id = m.id
+                    ORDER BY last_observed_at DESC, source_media_id DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS sources,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT id, media_id, source_kind, fetch_url, content_type_hint, status, attempt_count, next_run_at, leased_at, lease_expires_at, storage_object_id, last_error, created_at, updated_at
+                    FROM media_transfer_jobs
+                    WHERE media_id = m.id
+                ) t
+            ) AS transfer_job,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT a.id, a.job_id, a.status, a.upload_mode, a.error, a.bytes_uploaded, a.parts_uploaded, a.started_at, a.finished_at
+                    FROM media_transfer_attempts a
+                    INNER JOIN media_transfer_jobs j2 ON j2.id = a.job_id
+                    WHERE j2.media_id = m.id
+                    ORDER BY a.started_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS attempts,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT o2.*
+                    FROM media_storage_bindings b
+                    INNER JOIN storage_objects o2 ON o2.id = b.storage_object_id
+                    WHERE b.media_id = m.id
+                      AND b.object_role = 'original'
+                    LIMIT 1
+                ) t
+            ) AS storage_object
         FROM managed_media m
         LEFT JOIN media_transfer_jobs j ON j.media_id = m.id
         LEFT JOIN storage_objects o ON o.id = j.storage_object_id
@@ -815,61 +828,6 @@ pub async fn get_media(
     .fetch_optional(&state.db)
     .await?;
     let row = row.ok_or_else(|| AppError::not_found("media not found"))?;
-
-    let sources = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT source_kind, source_media_id, managed_media_id, media_key, source_post_id, media_type, media_url, thumb_url, source_url, width, height, alt_text, allow_download, source_status_id, source_actor_id, duration_ms, first_observed_at, last_observed_at, created_at, updated_at
-            FROM post_media_sources
-            WHERE managed_media_id = $1
-            ORDER BY last_observed_at DESC, source_media_id DESC
-            LIMIT 20
-        ) t
-        "#,
-        media_id,
-    )
-    .await?;
-    let transfer_job = fetch_optional_json1(
-        &state.db,
-        r#"
-        SELECT to_jsonb(j)
-        FROM media_transfer_jobs j
-        WHERE j.media_id = $1
-        "#,
-        media_id,
-    )
-    .await?;
-    let attempts = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT a.id, a.job_id, a.status, a.upload_mode, a.error, a.bytes_uploaded, a.parts_uploaded, a.started_at, a.finished_at
-            FROM media_transfer_attempts a
-            INNER JOIN media_transfer_jobs j ON j.id = a.job_id
-            WHERE j.media_id = $1
-            ORDER BY a.started_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        media_id,
-    )
-    .await?;
-    let storage_object = fetch_optional_json1(
-        &state.db,
-        r#"
-        SELECT to_jsonb(o)
-        FROM media_storage_bindings b
-        INNER JOIN storage_objects o ON o.id = b.storage_object_id
-        WHERE b.media_id = $1
-          AND b.object_role = 'original'
-        LIMIT 1
-        "#,
-        media_id,
-    )
-    .await?;
 
     Ok(Json(detail_response(
         json!({
@@ -886,10 +844,10 @@ pub async fn get_media(
         }),
         row.get("record"),
         json!({
-            "sources": sources,
-            "transferJob": transfer_job,
-            "transferAttempts": attempts,
-            "storageObject": storage_object,
+            "sources": row.get::<Value, _>("sources"),
+            "transferJob": row.get::<Option<Value>, _>("transfer_job"),
+            "transferAttempts": row.get::<Value, _>("attempts"),
+            "storageObject": row.get::<Option<Value>, _>("storage_object"),
         }),
     )))
 }
@@ -976,48 +934,42 @@ pub async fn get_storage_object(
     let row = sqlx::query(
         r#"
         SELECT
-            id,
-            provider,
-            bucket,
-            object_key,
-            etag,
-            size_bytes,
-            content_type,
-            created_at,
-            to_jsonb(storage_objects) AS record
-        FROM storage_objects
-        WHERE id = $1
+            o.id,
+            o.provider,
+            o.bucket,
+            o.object_key,
+            o.etag,
+            o.size_bytes,
+            o.content_type,
+            o.created_at,
+            to_jsonb(o) AS record,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT
+                        b.id,
+                        b.media_id,
+                        b.object_role,
+                        b.created_at,
+                        m.source_kind,
+                        m.media_family,
+                        m.identity_kind,
+                        m.identity_value
+                    FROM media_storage_bindings b
+                    INNER JOIN managed_media m ON m.id = b.media_id
+                    WHERE b.storage_object_id = o.id
+                    ORDER BY b.created_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS bindings
+        FROM storage_objects o
+        WHERE o.id = $1
         "#,
     )
     .bind(object_id)
     .fetch_optional(&state.db)
     .await?;
     let row = row.ok_or_else(|| AppError::not_found("storage object not found"))?;
-
-    let bindings = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT
-                b.id,
-                b.media_id,
-                b.object_role,
-                b.created_at,
-                m.source_kind,
-                m.media_family,
-                m.identity_kind,
-                m.identity_value
-            FROM media_storage_bindings b
-            INNER JOIN managed_media m ON m.id = b.media_id
-            WHERE b.storage_object_id = $1
-            ORDER BY b.created_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        object_id,
-    )
-    .await?;
 
     Ok(Json(detail_response(
         json!({
@@ -1032,7 +984,7 @@ pub async fn get_storage_object(
         }),
         row.get("record"),
         json!({
-            "bindings": bindings,
+            "bindings": row.get::<Value, _>("bindings"),
         }),
     )))
 }
@@ -1092,54 +1044,49 @@ pub async fn transfer_overview(
     session: Option<Extension<ActiveSession>>,
 ) -> AppResult<Json<Value>> {
     let _session = auth::require_admin_session(session)?;
-    let counts = sqlx::query(
+    let row = sqlx::query(
         r#"
         SELECT
             COUNT(*) FILTER (WHERE status = 'pending') AS pending,
             COUNT(*) FILTER (WHERE status = 'processing') AS processing,
             COUNT(*) FILTER (WHERE status = 'retryable') AS retryable,
             COUNT(*) FILTER (WHERE status = 'succeeded') AS succeeded,
-            COUNT(*) FILTER (WHERE status = 'failed') AS failed
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT
+                        j.id,
+                        j.media_id,
+                        j.source_kind,
+                        j.status,
+                        j.attempt_count,
+                        j.next_run_at,
+                        j.lease_expires_at,
+                        j.updated_at,
+                        j.fetch_url,
+                        o.id AS storage_object_id,
+                        o.object_key
+                    FROM media_transfer_jobs j
+                    LEFT JOIN storage_objects o ON o.id = j.storage_object_id
+                    WHERE j.status IN ('failed', 'retryable')
+                    ORDER BY j.updated_at DESC, j.id DESC
+                    LIMIT 10
+                ) t
+            ), '[]'::jsonb) AS recent_failed_jobs,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT id, job_id, status, upload_mode, error, bytes_uploaded, parts_uploaded, started_at, finished_at
+                    FROM media_transfer_attempts
+                    ORDER BY started_at DESC
+                    LIMIT 10
+                ) t
+            ), '[]'::jsonb) AS recent_attempts
         FROM media_transfer_jobs
         "#,
     )
     .fetch_one(&state.db)
-    .await?;
-    let recent_failed_jobs = fetch_transfer_job_array(
-        &state.db,
-        r#"
-        SELECT
-            j.id,
-            j.media_id,
-            j.source_kind,
-            j.status,
-            j.attempt_count,
-            j.next_run_at,
-            j.lease_expires_at,
-            j.updated_at,
-            j.fetch_url,
-            o.id AS storage_object_id,
-            o.object_key
-        FROM media_transfer_jobs j
-        LEFT JOIN storage_objects o ON o.id = j.storage_object_id
-        WHERE j.status IN ('failed', 'retryable')
-        ORDER BY j.updated_at DESC, j.id DESC
-        LIMIT 10
-        "#,
-    )
-    .await?;
-    let recent_attempts = fetch_json_array_no_args(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT id, job_id, status, upload_mode, error, bytes_uploaded, parts_uploaded, started_at, finished_at
-            FROM media_transfer_attempts
-            ORDER BY started_at DESC
-            LIMIT 10
-        ) t
-        "#,
-    )
     .await?;
 
     Ok(Json(json!({
@@ -1155,14 +1102,14 @@ pub async fn transfer_overview(
             "attemptTimeoutSeconds": state.settings.config.transfer.attempt_timeout_seconds,
         },
         "statusCounts": {
-            "pending": counts.get::<i64, _>("pending"),
-            "processing": counts.get::<i64, _>("processing"),
-            "retryable": counts.get::<i64, _>("retryable"),
-            "succeeded": counts.get::<i64, _>("succeeded"),
-            "failed": counts.get::<i64, _>("failed"),
+            "pending": row.get::<i64, _>("pending"),
+            "processing": row.get::<i64, _>("processing"),
+            "retryable": row.get::<i64, _>("retryable"),
+            "succeeded": row.get::<i64, _>("succeeded"),
+            "failed": row.get::<i64, _>("failed"),
         },
-        "recentFailedJobs": recent_failed_jobs,
-        "recentAttempts": recent_attempts,
+        "recentFailedJobs": row.get::<Value, _>("recent_failed_jobs"),
+        "recentAttempts": row.get::<Value, _>("recent_attempts"),
     })))
 }
 
@@ -1272,7 +1219,26 @@ pub async fn get_transfer_job(
             j.last_error,
             o.id AS storage_object_id,
             o.object_key,
-            to_jsonb(j) AS record
+            to_jsonb(j) AS record,
+            COALESCE((
+                SELECT jsonb_agg(to_jsonb(t))
+                FROM (
+                    SELECT id, job_id, status, upload_mode, error, bytes_uploaded, parts_uploaded, started_at, finished_at
+                    FROM media_transfer_attempts
+                    WHERE job_id = j.id
+                    ORDER BY started_at DESC
+                    LIMIT 20
+                ) t
+            ), '[]'::jsonb) AS attempts,
+            (
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT m.*
+                    FROM managed_media m
+                    WHERE m.id = j.media_id
+                    LIMIT 1
+                ) t
+            ) AS managed_media
         FROM media_transfer_jobs j
         LEFT JOIN storage_objects o ON o.id = j.storage_object_id
         WHERE j.id = $1
@@ -1283,39 +1249,12 @@ pub async fn get_transfer_job(
     .await?;
     let row = row.ok_or_else(|| AppError::not_found("transfer job not found"))?;
 
-    let attempts = fetch_json_array(
-        &state.db,
-        r#"
-        SELECT COALESCE(jsonb_agg(to_jsonb(t)), '[]'::jsonb)
-        FROM (
-            SELECT id, job_id, status, upload_mode, error, bytes_uploaded, parts_uploaded, started_at, finished_at
-            FROM media_transfer_attempts
-            WHERE job_id = $1
-            ORDER BY started_at DESC
-            LIMIT 20
-        ) t
-        "#,
-        job_id,
-    )
-    .await?;
-    let managed_media = fetch_optional_json1(
-        &state.db,
-        r#"
-        SELECT to_jsonb(m)
-        FROM managed_media m
-        INNER JOIN media_transfer_jobs j ON j.media_id = m.id
-        WHERE j.id = $1
-        "#,
-        job_id,
-    )
-    .await?;
-
     Ok(Json(detail_response(
         transfer_job_json_from_row(&row),
         row.get("record"),
         json!({
-            "managedMedia": managed_media,
-            "attempts": attempts,
+            "managedMedia": row.get::<Option<Value>, _>("managed_media"),
+            "attempts": row.get::<Value, _>("attempts"),
         }),
     )))
 }
@@ -1403,79 +1342,6 @@ fn transfer_job_json_from_row(row: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
-fn fetch_post_media_json<'a>(
-    pool: &'a PgPool,
-    source_kind: &'a str,
-    source_post_id: &'a str,
-) -> impl std::future::Future<Output = AppResult<Value>> + 'a {
-    async move {
-        let rows = sqlx::query(
-            r#"
-            SELECT
-                pm.position,
-                pms.source_media_id,
-                pms.media_type,
-                pms.media_url,
-                pms.thumb_url,
-                pms.source_url,
-                pms.width,
-                pms.height,
-                pms.alt_text,
-                pms.duration_ms,
-                pms.managed_media_id,
-                j.status AS transfer_status,
-                o.id AS storage_object_id,
-                o.object_key
-            FROM post_media pm
-            INNER JOIN post_media_sources pms
-                ON pms.source_kind = pm.source_kind
-               AND pms.source_media_id = pm.source_media_id
-            LEFT JOIN media_transfer_jobs j ON j.media_id = pms.managed_media_id
-            LEFT JOIN storage_objects o ON o.id = j.storage_object_id
-            WHERE pm.source_kind = $1
-              AND pm.source_post_id = $2
-            ORDER BY pm.position ASC, pms.source_media_id ASC
-            "#,
-        )
-        .bind(source_kind)
-        .bind(source_post_id)
-        .fetch_all(pool)
-        .await?;
-
-        Ok(Value::Array(
-            rows.into_iter()
-                .map(|row| {
-                    json!({
-                        "position": row.get::<i32, _>("position"),
-                        "sourceMediaId": row.get::<String, _>("source_media_id"),
-                        "mediaType": row.get::<String, _>("media_type"),
-                        "mediaUrl": row.get::<String, _>("media_url"),
-                        "thumbUrl": row.get::<String, _>("thumb_url"),
-                        "sourceUrl": row.get::<String, _>("source_url"),
-                        "width": row.get::<i32, _>("width"),
-                        "height": row.get::<i32, _>("height"),
-                        "altText": row.get::<Option<String>, _>("alt_text"),
-                        "durationMs": row.get::<Option<i64>, _>("duration_ms"),
-                        "managedMediaId": row.get::<Uuid, _>("managed_media_id"),
-                        "transferStatus": row.get::<Option<String>, _>("transfer_status"),
-                        "storageObjectId": row.get::<Option<Uuid>, _>("storage_object_id"),
-                        "storageObjectKey": row.get::<Option<String>, _>("object_key"),
-                    })
-                })
-                .collect(),
-        ))
-    }
-}
-
-async fn fetch_transfer_job_array(pool: &PgPool, sql: &str) -> AppResult<Value> {
-    let rows = sqlx::query(sql).fetch_all(pool).await?;
-    Ok(Value::Array(
-        rows.into_iter()
-            .map(|row| transfer_job_json_from_row(&row))
-            .collect(),
-    ))
-}
-
 async fn fetch_transfer_job_summary(pool: &PgPool, job_id: Uuid) -> AppResult<Value> {
     let row = sqlx::query(
         r#"
@@ -1529,73 +1395,6 @@ async fn fetch_user_summary_json_tx(
         "createdAt": format_time(row.get("created_at")),
         "updatedAt": format_time(row.get("updated_at")),
     }))
-}
-
-async fn fetch_json_array<'a, T>(pool: &PgPool, sql: &'a str, arg: T) -> AppResult<Value>
-where
-    T: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-{
-    let value = sqlx::query_scalar::<_, Value>(sql)
-        .bind(arg)
-        .fetch_one(pool)
-        .await?;
-    Ok(value)
-}
-
-async fn fetch_json_array2<'a, T1, T2>(
-    pool: &PgPool,
-    sql: &'a str,
-    arg1: T1,
-    arg2: T2,
-) -> AppResult<Value>
-where
-    T1: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-    T2: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-{
-    let value = sqlx::query_scalar::<_, Value>(sql)
-        .bind(arg1)
-        .bind(arg2)
-        .fetch_one(pool)
-        .await?;
-    Ok(value)
-}
-
-async fn fetch_json_array_no_args(pool: &PgPool, sql: &str) -> AppResult<Value> {
-    let value = sqlx::query_scalar::<_, Value>(sql).fetch_one(pool).await?;
-    Ok(value)
-}
-
-async fn fetch_optional_json1<'a, T>(
-    pool: &PgPool,
-    sql: &'a str,
-    arg: T,
-) -> AppResult<Option<Value>>
-where
-    T: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-{
-    sqlx::query_scalar::<_, Value>(sql)
-        .bind(arg)
-        .fetch_optional(pool)
-        .await
-        .map_err(Into::into)
-}
-
-async fn fetch_optional_json2<'a, T1, T2>(
-    pool: &PgPool,
-    sql: &'a str,
-    arg1: T1,
-    arg2: T2,
-) -> AppResult<Option<Value>>
-where
-    T1: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-    T2: Send + 'a + sqlx::Encode<'a, Postgres> + sqlx::Type<Postgres>,
-{
-    sqlx::query_scalar::<_, Value>(sql)
-        .bind(arg1)
-        .bind(arg2)
-        .fetch_optional(pool)
-        .await
-        .map_err(Into::into)
 }
 
 fn list_response(items: Vec<Value>, next_cursor: Option<String>) -> Value {
