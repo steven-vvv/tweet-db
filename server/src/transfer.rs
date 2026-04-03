@@ -10,6 +10,7 @@ use reqwest::{
     Client as HttpClient, Response, StatusCode,
     header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
 };
+use serde::Serialize;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use time::OffsetDateTime;
 use tokio::{
@@ -51,6 +52,14 @@ pub struct TransferStatusInfo {
     pub status: Option<String>,
     pub storage_object_key: Option<String>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferEnqueueInput {
+    pub media_id: Uuid,
+    pub source_kind: String,
+    pub fetch_url: String,
+    pub content_type_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,34 +116,93 @@ pub async fn enqueue_media_transfer(
     fetch_url: &str,
     content_type_hint: Option<&str>,
 ) -> AppResult<bool> {
-    let fetch_url = fetch_url.trim();
-    if fetch_url.is_empty() {
-        return Ok(false);
+    let mut result = enqueue_media_transfers_batch(
+        tx,
+        &[TransferEnqueueInput {
+            media_id,
+            source_kind: source_kind.to_owned(),
+            fetch_url: fetch_url.to_owned(),
+            content_type_hint: content_type_hint.map(ToOwned::to_owned),
+        }],
+    )
+    .await?;
+    Ok(result.remove(&media_id).unwrap_or(false))
+}
+
+pub async fn enqueue_media_transfers_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    inputs: &[TransferEnqueueInput],
+) -> AppResult<HashMap<Uuid, bool>> {
+    #[derive(Serialize)]
+    struct TransferJobRow {
+        id: Uuid,
+        media_id: Uuid,
+        source_kind: String,
+        fetch_url: String,
+        content_type_hint: String,
     }
 
-    let existing = sqlx::query(
-        r#"
-        SELECT status, fetch_url
-        FROM media_transfer_jobs
-        WHERE media_id = $1
-        "#,
-    )
-    .bind(media_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    if inputs.is_empty() {
+        return Ok(HashMap::new());
+    }
 
-    let should_enqueue = match existing.as_ref() {
-        None => true,
-        Some(row) => {
-            let status: String = row.get("status");
-            let existing_fetch_url: String = row.get("fetch_url");
-            status != "succeeded" || existing_fetch_url != fetch_url
+    let mut inputs_by_media_id = HashMap::new();
+    for input in inputs {
+        let fetch_url = input.fetch_url.trim();
+        if fetch_url.is_empty() {
+            continue;
         }
-    };
 
-    if existing.is_none() {
-        sqlx::query(
-            r#"
+        inputs_by_media_id.insert(
+            input.media_id,
+            TransferJobRow {
+                id: Uuid::now_v7(),
+                media_id: input.media_id,
+                source_kind: input.source_kind.trim().to_owned(),
+                fetch_url: fetch_url.to_owned(),
+                content_type_hint: input
+                    .content_type_hint
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+        );
+    }
+
+    if inputs_by_media_id.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = inputs_by_media_id.into_values().collect::<Vec<_>>();
+    let payload = serde_json::to_value(&rows)?;
+    let result_rows = sqlx::query(
+        r#"
+        WITH input AS (
+            SELECT
+                id,
+                media_id,
+                source_kind,
+                fetch_url,
+                content_type_hint
+            FROM jsonb_to_recordset($1::jsonb) AS item(
+                id UUID,
+                media_id UUID,
+                source_kind TEXT,
+                fetch_url TEXT,
+                content_type_hint TEXT
+            )
+        ),
+        existing AS (
+            SELECT
+                i.media_id,
+                i.fetch_url,
+                j.status AS existing_status,
+                j.fetch_url AS existing_fetch_url
+            FROM input i
+            LEFT JOIN media_transfer_jobs j ON j.media_id = i.media_id
+        ),
+        upserted AS (
             INSERT INTO media_transfer_jobs (
                 id,
                 media_id,
@@ -146,54 +214,63 @@ pub async fn enqueue_media_transfer(
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, 'pending', NOW(), NOW(), NOW())
-            "#,
+            SELECT
+                id,
+                media_id,
+                source_kind,
+                fetch_url,
+                content_type_hint,
+                'pending',
+                NOW(),
+                NOW(),
+                NOW()
+            FROM input
+            ON CONFLICT (media_id) DO UPDATE
+            SET source_kind = EXCLUDED.source_kind,
+                fetch_url = EXCLUDED.fetch_url,
+                content_type_hint = CASE
+                    WHEN EXCLUDED.content_type_hint = '' THEN media_transfer_jobs.content_type_hint
+                    ELSE EXCLUDED.content_type_hint
+                END,
+                status = CASE
+                    WHEN media_transfer_jobs.status <> 'succeeded'
+                        OR media_transfer_jobs.fetch_url <> EXCLUDED.fetch_url
+                    THEN 'pending'
+                    ELSE 'succeeded'
+                END,
+                next_run_at = CASE
+                    WHEN media_transfer_jobs.status <> 'succeeded'
+                        OR media_transfer_jobs.fetch_url <> EXCLUDED.fetch_url
+                    THEN NOW()
+                    ELSE media_transfer_jobs.next_run_at
+                END,
+                leased_at = NULL,
+                lease_expires_at = NULL,
+                last_error = NULL,
+                updated_at = NOW()
+            RETURNING media_id
         )
-        .bind(Uuid::now_v7())
-        .bind(media_id)
-        .bind(source_kind)
-        .bind(fetch_url)
-        .bind(content_type_hint.unwrap_or_default().trim())
-        .execute(&mut **tx)
-        .await?;
-        return Ok(true);
-    }
-
-    let status = if should_enqueue {
-        "pending"
-    } else {
-        "succeeded"
-    };
-    sqlx::query(
-        r#"
-        UPDATE media_transfer_jobs
-        SET source_kind = $2,
-            fetch_url = $3,
-            content_type_hint = CASE
-                WHEN $4 = '' THEN content_type_hint
-                ELSE $4
-            END,
-            status = $5,
-            next_run_at = CASE
-                WHEN $5 = 'pending' THEN NOW()
-                ELSE next_run_at
-            END,
-            leased_at = NULL,
-            lease_expires_at = NULL,
-            last_error = NULL,
-            updated_at = NOW()
-        WHERE media_id = $1
+        SELECT
+            e.media_id,
+            (e.existing_status IS NULL
+                OR e.existing_status <> 'succeeded'
+                OR e.existing_fetch_url <> e.fetch_url) AS transfer_enqueued
+        FROM existing e
+        INNER JOIN upserted u ON u.media_id = e.media_id
         "#,
     )
-    .bind(media_id)
-    .bind(source_kind)
-    .bind(fetch_url)
-    .bind(content_type_hint.unwrap_or_default().trim())
-    .bind(status)
-    .execute(&mut **tx)
+    .bind(payload)
+    .fetch_all(&mut **tx)
     .await?;
 
-    Ok(should_enqueue)
+    let mut result = HashMap::new();
+    for row in result_rows {
+        result.insert(
+            row.get::<Uuid, _>("media_id"),
+            row.get::<bool, _>("transfer_enqueued"),
+        );
+    }
+    Ok(result)
 }
 
 pub async fn fetch_transfer_statuses(

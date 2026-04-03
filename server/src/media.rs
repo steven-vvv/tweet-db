@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use serde::Serialize;
 use sqlx::{Postgres, Row, Transaction};
 use time::OffsetDateTime;
 use url::Url;
@@ -62,23 +65,101 @@ pub struct ManagedMediaRecord {
     pub transfer_enqueued: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ManagedMediaBatchRecord {
+    pub source_kind: String,
+    pub identity_kind: String,
+    pub identity_value: String,
+    pub id: Uuid,
+    pub transfer_enqueued: bool,
+}
+
 pub async fn register_managed_media(
     tx: &mut Transaction<'_, Postgres>,
     spec: &ManagedMediaSpec,
 ) -> AppResult<ManagedMediaRecord> {
-    let identity_value = spec.identity_value.trim();
-    if identity_value.is_empty() {
-        return Err(AppError::bad_request(
-            "managed media identity_value is required",
-        ));
+    let mut rows = register_managed_media_batch(tx, std::slice::from_ref(spec)).await?;
+    let record = rows.pop().ok_or_else(|| {
+        AppError::upstream("managed media batch upsert returned no rows for single item")
+    })?;
+    Ok(ManagedMediaRecord {
+        id: record.id,
+        transfer_enqueued: record.transfer_enqueued,
+    })
+}
+
+pub async fn register_managed_media_batch(
+    tx: &mut Transaction<'_, Postgres>,
+    specs: &[ManagedMediaSpec],
+) -> AppResult<Vec<ManagedMediaBatchRecord>> {
+    #[derive(Debug, Clone, Serialize)]
+    struct ManagedMediaUpsertRow {
+        id: Uuid,
+        source_kind: String,
+        media_family: String,
+        identity_kind: String,
+        identity_value: String,
+        fetch_url: String,
+        display_url: String,
+        thumb_url: Option<String>,
+        content_type_hint: String,
+        submission_id: Uuid,
+        observed_at: OffsetDateTime,
     }
 
-    let fetch_url = spec.fetch_url.trim();
-    if fetch_url.is_empty() {
-        return Err(AppError::bad_request("managed media fetch_url is required"));
+    if specs.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let row = sqlx::query(
+    let mut unique_specs = HashMap::new();
+    for spec in specs {
+        let identity_value = spec.identity_value.trim();
+        if identity_value.is_empty() {
+            return Err(AppError::bad_request(
+                "managed media identity_value is required",
+            ));
+        }
+
+        let fetch_url = spec.fetch_url.trim();
+        if fetch_url.is_empty() {
+            return Err(AppError::bad_request("managed media fetch_url is required"));
+        }
+
+        unique_specs.insert(
+            managed_media_key(
+                spec.source_kind.trim(),
+                spec.identity_kind.as_str(),
+                identity_value,
+            ),
+            ManagedMediaUpsertRow {
+                id: Uuid::now_v7(),
+                source_kind: spec.source_kind.trim().to_owned(),
+                media_family: spec.media_family.as_str().to_owned(),
+                identity_kind: spec.identity_kind.as_str().to_owned(),
+                identity_value: identity_value.to_owned(),
+                fetch_url: fetch_url.to_owned(),
+                display_url: spec.display_url.trim().to_owned(),
+                thumb_url: trimmed_option(&spec.thumb_url),
+                content_type_hint: trimmed_or_empty(&spec.content_type_hint),
+                submission_id: spec.submission_id,
+                observed_at: spec.observed_at,
+            },
+        );
+    }
+
+    let rows = unique_specs.into_values().collect::<Vec<_>>();
+    let rows_by_key = rows
+        .iter()
+        .cloned()
+        .map(|row| {
+            (
+                managed_media_key(&row.source_kind, &row.identity_kind, &row.identity_value),
+                row,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let payload = serde_json::to_value(&rows)?;
+    let upserted_rows = sqlx::query(
         r#"
         INSERT INTO managed_media (
             id,
@@ -95,8 +176,32 @@ pub async fn register_managed_media(
             first_observed_at,
             last_observed_at
         )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $11
+        SELECT
+            item.id,
+            item.source_kind,
+            item.media_family,
+            item.identity_kind,
+            item.identity_value,
+            item.fetch_url,
+            item.display_url,
+            item.thumb_url,
+            item.content_type_hint,
+            item.submission_id,
+            item.submission_id,
+            item.observed_at,
+            item.observed_at
+        FROM jsonb_to_recordset($1::jsonb) AS item(
+            id UUID,
+            source_kind TEXT,
+            media_family TEXT,
+            identity_kind TEXT,
+            identity_value TEXT,
+            fetch_url TEXT,
+            display_url TEXT,
+            thumb_url TEXT,
+            content_type_hint TEXT,
+            submission_id UUID,
+            observed_at TIMESTAMPTZ
         )
         ON CONFLICT (source_kind, identity_kind, identity_value) DO UPDATE
         SET media_family = EXCLUDED.media_family,
@@ -110,37 +215,45 @@ pub async fn register_managed_media(
             last_submission_id = EXCLUDED.last_submission_id,
             last_observed_at = EXCLUDED.last_observed_at,
             updated_at = NOW()
-        RETURNING id
+        RETURNING source_kind, identity_kind, identity_value, id
         "#,
     )
-    .bind(Uuid::now_v7())
-    .bind(spec.source_kind.trim())
-    .bind(spec.media_family.as_str())
-    .bind(spec.identity_kind.as_str())
-    .bind(identity_value)
-    .bind(fetch_url)
-    .bind(spec.display_url.trim())
-    .bind(trimmed_option(&spec.thumb_url))
-    .bind(trimmed_or_empty(&spec.content_type_hint))
-    .bind(spec.submission_id)
-    .bind(spec.observed_at)
-    .fetch_one(&mut **tx)
+    .bind(payload)
+    .fetch_all(&mut **tx)
     .await?;
 
-    let media_id: Uuid = row.get("id");
-    let transfer_enqueued = transfer::enqueue_media_transfer(
-        tx,
-        media_id,
-        spec.source_kind.trim(),
-        fetch_url,
-        spec.content_type_hint.as_deref(),
-    )
-    .await?;
+    let mut transfer_inputs = Vec::new();
+    let mut results = Vec::new();
+    for row in upserted_rows {
+        let source_kind: String = row.get("source_kind");
+        let identity_kind: String = row.get("identity_kind");
+        let identity_value: String = row.get("identity_value");
+        let key = managed_media_key(&source_kind, &identity_kind, &identity_value);
+        let input = rows_by_key.get(&key).ok_or_else(|| {
+            AppError::upstream("managed media upsert returned an identity not present in input")
+        })?;
+        let media_id: Uuid = row.get("id");
+        transfer_inputs.push(transfer::TransferEnqueueInput {
+            media_id,
+            source_kind: input.source_kind.clone(),
+            fetch_url: input.fetch_url.clone(),
+            content_type_hint: (!input.content_type_hint.is_empty())
+                .then(|| input.content_type_hint.clone()),
+        });
+        results.push(ManagedMediaBatchRecord {
+            source_kind,
+            identity_kind,
+            identity_value,
+            id: media_id,
+            transfer_enqueued: false,
+        });
+    }
 
-    Ok(ManagedMediaRecord {
-        id: media_id,
-        transfer_enqueued,
-    })
+    let transfer_results = transfer::enqueue_media_transfers_batch(tx, &transfer_inputs).await?;
+    for record in &mut results {
+        record.transfer_enqueued = transfer_results.get(&record.id).copied().unwrap_or(false);
+    }
+    Ok(results)
 }
 
 pub fn normalize_post_source_url(value: &str) -> Option<String> {
@@ -208,6 +321,10 @@ fn trimmed_or_empty(value: &Option<String>) -> String {
         .map(str::trim)
         .unwrap_or_default()
         .to_owned()
+}
+
+fn managed_media_key(source_kind: &str, identity_kind: &str, identity_value: &str) -> String {
+    format!("{source_kind}\u{1f}{identity_kind}\u{1f}{identity_value}")
 }
 
 fn is_dimension_segment(value: &str) -> bool {

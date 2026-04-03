@@ -230,12 +230,6 @@ struct NormalizedItems<T> {
     skipped_empty: usize,
 }
 
-#[derive(Debug, Default)]
-struct ProcessOutcome {
-    accepted: bool,
-    transfer_jobs_enqueued: i32,
-}
-
 type DbTx<'a> = Transaction<'a, Postgres>;
 
 pub async fn ingest_submission(
@@ -262,8 +256,6 @@ pub async fn ingest_submission(
     let tweets = normalize_entities(&payload.tweets, |item| &item.id);
     let media = normalize_entities(&payload.media, |item| &item.id);
 
-    let mut accepted_count = 0_i32;
-    let mut transfer_jobs_enqueued = 0_i32;
     let mut warnings = Vec::new();
 
     extend_skip_warnings(
@@ -282,50 +274,43 @@ pub async fn ingest_submission(
         "skipped media with empty id",
     );
 
-    for user in &users.items {
-        match process_actor(
-            &state.db,
-            submission_id,
-            &source_kind,
-            user,
-            now,
-            time::Duration::seconds(
-                state
-                    .settings
-                    .config
-                    .ingest
-                    .actor_metrics_min_interval_seconds,
-            ),
-        )
-        .await
-        {
-            Ok(outcome) if outcome.accepted => {
-                accepted_count += 1;
-                transfer_jobs_enqueued += outcome.transfer_jobs_enqueued;
-            }
-            Ok(_) => warnings.push("skipped user with empty id".to_owned()),
-            Err(error) => warnings.push(format!("failed to upsert user {}: {error}", user.id)),
+    let batch_outcome = match process_submission_batch(
+        &state.db,
+        submission_id,
+        &source_kind,
+        &users.items,
+        &tweets.items,
+        &media.items,
+        now,
+        time::Duration::seconds(
+            state
+                .settings
+                .config
+                .ingest
+                .actor_metrics_min_interval_seconds,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let failure_warnings = vec![format!("ingest failed: {error}")];
+            let _ = finalize_submission(
+                &state.db,
+                submission_id,
+                "failed",
+                0,
+                0,
+                &failure_warnings,
+                now,
+            )
+            .await;
+            return Err(error);
         }
-    }
-
-    for tweet in &tweets.items {
-        match process_post(&state.db, submission_id, &source_kind, tweet, now).await {
-            Ok(outcome) if outcome.accepted => accepted_count += 1,
-            Ok(_) => warnings.push("skipped tweet with empty id".to_owned()),
-            Err(error) => warnings.push(format!("failed to upsert tweet {}: {error}", tweet.id)),
-        }
-    }
-
-    for item in &media.items {
-        match process_media(&state.db, submission_id, &source_kind, item, now).await {
-            Ok(outcome) if outcome.accepted => {
-                accepted_count += 1;
-                transfer_jobs_enqueued += outcome.transfer_jobs_enqueued;
-            }
-            Ok(_) => warnings.push("skipped media with empty id".to_owned()),
-            Err(error) => warnings.push(format!("failed to upsert media {}: {error}", item.id)),
-        }
-    }
+    };
+    warnings.extend(batch_outcome.warnings);
+    let accepted_count = batch_outcome.accepted_count;
+    let transfer_jobs_enqueued = batch_outcome.transfer_jobs_enqueued;
 
     let status = if warnings.is_empty() {
         "success"
@@ -605,127 +590,168 @@ async fn finalize_submission(
     Ok(())
 }
 
-async fn process_actor(
+fn should_insert_actor_metric_observation(
+    latest: Option<&LatestActorMetricObservationRow>,
+    item: &XUserInput,
+    observed_at: OffsetDateTime,
+    min_interval: time::Duration,
+) -> bool {
+    let Some(latest) = latest else {
+        return true;
+    };
+
+    actor_metrics_changed(latest, item) || observed_at - latest.observed_at >= min_interval
+}
+
+fn actor_metrics_changed(latest: &LatestActorMetricObservationRow, item: &XUserInput) -> bool {
+    latest.followers_count != item.followers_count
+        || latest.friends_count != item.friends_count
+        || latest.favourites_count != item.favourites_count
+        || latest.statuses_count != item.statuses_count
+        || latest.media_count != item.media_count
+        || latest.listed_count != item.listed_count
+}
+
+#[derive(Debug, Default)]
+struct BatchProcessOutcome {
+    accepted_count: i32,
+    transfer_jobs_enqueued: i32,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedMediaItem {
+    item: XMediaInput,
+    managed_spec: ManagedMediaSpec,
+    variants: Vec<VideoVariantInput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActorProfileVersionInsertRow {
+    id: Uuid,
+    submission_id: Uuid,
+    source_kind: String,
+    source_actor_id: String,
+    version_no: i64,
+    effective_from: OffsetDateTime,
+    profile_fingerprint: String,
+    name: String,
+    screen_name: String,
+    description: String,
+    location: String,
+    avatar_url: String,
+    profile_url: Option<String>,
+    banner_url: Option<String>,
+    is_blue_verified: bool,
+    verified_type: Option<String>,
+    is_protected: bool,
+    profile_image_shape: String,
+    professional_type: Option<String>,
+    pinned_post_source_ids: Vec<String>,
+    source_created_at_raw: String,
+    avatar_media_id: Option<Uuid>,
+    banner_media_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ActorCurrentProfileUpdateRow {
+    source_actor_id: String,
+    version_id: Uuid,
+    submission_id: Uuid,
+    observed_at: OffsetDateTime,
+}
+
+async fn process_submission_batch(
     pool: &PgPool,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XUserInput,
+    users: &[XUserInput],
+    tweets: &[XTweetInput],
+    media_items: &[XMediaInput],
     observed_at: OffsetDateTime,
     metrics_min_interval: time::Duration,
-) -> AppResult<ProcessOutcome> {
-    let actor_id = item.id.trim();
-    if actor_id.is_empty() {
-        return Ok(ProcessOutcome::default());
-    }
+) -> AppResult<BatchProcessOutcome> {
+    let mut outcome = BatchProcessOutcome {
+        accepted_count: (users.len() + tweets.len()) as i32,
+        transfer_jobs_enqueued: 0,
+        warnings: Vec::new(),
+    };
+    let prepared_media = prepare_media_items(
+        source_kind,
+        submission_id,
+        media_items,
+        observed_at,
+        &mut outcome.warnings,
+    )?;
+    outcome.accepted_count += prepared_media.len() as i32;
 
     let mut tx = pool.begin().await?;
+    upsert_actor_heads_batch(&mut tx, submission_id, source_kind, users, observed_at).await?;
 
-    upsert_actor_head(&mut tx, submission_id, source_kind, actor_id, observed_at).await?;
-    let avatar_media =
-        register_actor_avatar_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
-    let banner_media =
-        register_actor_banner_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
+    let mut managed_media_specs =
+        build_actor_media_specs(source_kind, submission_id, users, observed_at);
+    managed_media_specs.extend(prepared_media.iter().map(|item| item.managed_spec.clone()));
+    let managed_media_by_key = if managed_media_specs.is_empty() {
+        HashMap::new()
+    } else {
+        let records = media::register_managed_media_batch(&mut tx, &managed_media_specs).await?;
+        outcome.transfer_jobs_enqueued =
+            records.iter().filter(|item| item.transfer_enqueued).count() as i32;
+        managed_media_records_by_key(records)
+    };
 
-    sync_actor_profile_version(
+    sync_actor_profiles_batch(
         &mut tx,
         submission_id,
         source_kind,
-        item,
-        avatar_media.as_ref().map(|item| item.id),
-        banner_media.as_ref().map(|item| item.id),
+        users,
         observed_at,
+        &managed_media_by_key,
     )
     .await?;
-
-    insert_actor_metric_observation(
+    insert_actor_metrics_batch(
         &mut tx,
         submission_id,
         source_kind,
-        item,
+        users,
         observed_at,
         metrics_min_interval,
     )
     .await?;
-    tx.commit().await?;
-
-    Ok(ProcessOutcome {
-        accepted: true,
-        transfer_jobs_enqueued: i32::from(
-            avatar_media
-                .as_ref()
-                .map(|item| item.transfer_enqueued)
-                .unwrap_or(false),
-        ) + i32::from(
-            banner_media
-                .as_ref()
-                .map(|item| item.transfer_enqueued)
-                .unwrap_or(false),
-        ),
-    })
-}
-
-async fn process_post(
-    pool: &PgPool,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XTweetInput,
-    observed_at: OffsetDateTime,
-) -> AppResult<ProcessOutcome> {
-    if item.id.trim().is_empty() {
-        return Ok(ProcessOutcome::default());
-    }
-
-    let mut tx = pool.begin().await?;
-    upsert_post(&mut tx, submission_id, source_kind, item, observed_at).await?;
-    replace_post_media(&mut tx, source_kind, item).await?;
-    insert_post_metric_observation(&mut tx, submission_id, source_kind, item, observed_at).await?;
-    tx.commit().await?;
-
-    Ok(ProcessOutcome {
-        accepted: true,
-        transfer_jobs_enqueued: 0,
-    })
-}
-
-async fn process_media(
-    pool: &PgPool,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XMediaInput,
-    observed_at: OffsetDateTime,
-) -> AppResult<ProcessOutcome> {
-    if item.id.trim().is_empty() {
-        return Ok(ProcessOutcome::default());
-    }
-
-    let mut tx = pool.begin().await?;
-    let managed_media =
-        register_post_media(&mut tx, submission_id, source_kind, item, observed_at).await?;
-    upsert_post_media_source(
+    upsert_posts_batch(&mut tx, submission_id, source_kind, tweets, observed_at).await?;
+    replace_post_media_batch(&mut tx, source_kind, tweets).await?;
+    insert_post_metric_observations_batch(&mut tx, submission_id, source_kind, tweets, observed_at)
+        .await?;
+    upsert_post_media_sources_batch(
         &mut tx,
         submission_id,
         source_kind,
-        item,
-        managed_media.id,
+        &prepared_media,
         observed_at,
+        &managed_media_by_key,
     )
     .await?;
-    replace_media_variants(&mut tx, source_kind, item).await?;
+    replace_media_variants_batch(&mut tx, source_kind, &prepared_media).await?;
     tx.commit().await?;
 
-    Ok(ProcessOutcome {
-        accepted: true,
-        transfer_jobs_enqueued: i32::from(managed_media.transfer_enqueued),
-    })
+    Ok(outcome)
 }
 
-async fn upsert_actor_head(
+async fn upsert_actor_heads_batch(
     tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
-    actor_id: &str,
+    items: &[XUserInput],
     observed_at: OffsetDateTime,
 ) -> AppResult<()> {
+    let actor_ids = items
+        .iter()
+        .map(|item| item.id.trim().to_owned())
+        .collect::<Vec<_>>();
+    if actor_ids.is_empty() {
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
         INSERT INTO actors (
@@ -736,7 +762,8 @@ async fn upsert_actor_head(
             first_observed_at,
             last_observed_at
         )
-        VALUES ($1, $2, $3, $3, $4, $4)
+        SELECT $1, actor_id, $2, $2, $3, $3
+        FROM UNNEST($4::text[]) AS input(actor_id)
         ON CONFLICT (source_kind, source_actor_id) DO UPDATE
         SET last_submission_id = EXCLUDED.last_submission_id,
             last_observed_at = EXCLUDED.last_observed_at,
@@ -744,131 +771,168 @@ async fn upsert_actor_head(
         "#,
     )
     .bind(source_kind)
-    .bind(actor_id)
     .bind(submission_id)
     .bind(observed_at)
+    .bind(actor_ids)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-async fn sync_actor_profile_version(
+async fn sync_actor_profiles_batch(
     tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XUserInput,
-    avatar_media_id: Option<Uuid>,
-    banner_media_id: Option<Uuid>,
+    items: &[XUserInput],
     observed_at: OffsetDateTime,
+    managed_media_by_key: &HashMap<String, media::ManagedMediaBatchRecord>,
 ) -> AppResult<()> {
-    let actor_id = item.id.trim();
-    let fingerprint = actor_profile_fingerprint(item)?;
-    let current = fetch_current_actor_profile_version(tx, source_kind, actor_id).await?;
-
-    if let Some(current) = current.as_ref() {
-        if current.profile_fingerprint == fingerprint {
-            return Ok(());
-        }
-
-        close_actor_profile_version(tx, current.id, observed_at).await?;
+    if items.is_empty() {
+        return Ok(());
     }
 
-    let version_id = Uuid::now_v7();
-    let version_no = current.map(|item| item.version_no + 1).unwrap_or(1);
-    insert_actor_profile_version(
-        tx,
-        version_id,
-        submission_id,
-        source_kind,
-        item,
-        version_no,
-        &fingerprint,
-        avatar_media_id,
-        banner_media_id,
-        observed_at,
-    )
-    .await?;
-    set_actor_current_profile_version(
-        tx,
-        source_kind,
-        actor_id,
-        version_id,
-        submission_id,
-        observed_at,
-    )
-    .await?;
+    let actor_ids = items
+        .iter()
+        .map(|item| item.id.trim().to_owned())
+        .collect::<Vec<_>>();
+    let current_versions =
+        fetch_current_actor_profile_versions_batch(tx, source_kind, &actor_ids).await?;
+    let mut close_ids = Vec::new();
+    let mut insert_rows = Vec::new();
+    let mut current_rows = Vec::new();
 
+    for item in items {
+        let actor_id = item.id.trim();
+        let fingerprint = actor_profile_fingerprint(item)?;
+        let current = current_versions.get(actor_id);
+        if current
+            .as_ref()
+            .is_some_and(|row| row.profile_fingerprint == fingerprint)
+        {
+            continue;
+        }
+
+        if let Some(row) = current {
+            close_ids.push(row.id);
+        }
+
+        let version_id = Uuid::now_v7();
+        let version_no = current.map(|row| row.version_no + 1).unwrap_or(1);
+        insert_rows.push(ActorProfileVersionInsertRow {
+            id: version_id,
+            submission_id,
+            source_kind: source_kind.to_owned(),
+            source_actor_id: actor_id.to_owned(),
+            version_no,
+            effective_from: observed_at,
+            profile_fingerprint: fingerprint,
+            name: item.name.trim().to_owned(),
+            screen_name: item.screen_name.trim().to_owned(),
+            description: item.description.trim().to_owned(),
+            location: item.location.trim().to_owned(),
+            avatar_url: item.avatar_url.trim().to_owned(),
+            profile_url: trimmed_option(&item.profile_url),
+            banner_url: trimmed_option(&item.banner_url),
+            is_blue_verified: item.is_blue_verified,
+            verified_type: trimmed_option(&item.verified_type),
+            is_protected: item.is_protected,
+            profile_image_shape: item.profile_image_shape.trim().to_owned(),
+            professional_type: trimmed_option(&item.professional_type),
+            pinned_post_source_ids: unique_nonempty_strings(&item.pinned_tweet_ids),
+            source_created_at_raw: item.created_at.trim().to_owned(),
+            avatar_media_id: actor_avatar_media_id(source_kind, item, managed_media_by_key),
+            banner_media_id: actor_banner_media_id(source_kind, item, managed_media_by_key),
+        });
+        current_rows.push(ActorCurrentProfileUpdateRow {
+            source_actor_id: actor_id.to_owned(),
+            version_id,
+            submission_id,
+            observed_at,
+        });
+    }
+
+    if !close_ids.is_empty() {
+        close_actor_profile_versions_batch(tx, &close_ids, observed_at).await?;
+    }
+    if !insert_rows.is_empty() {
+        insert_actor_profile_versions_batch(tx, &insert_rows).await?;
+        set_actor_current_profile_versions_batch(tx, source_kind, &current_rows).await?;
+    }
     Ok(())
 }
 
-async fn fetch_current_actor_profile_version(
+async fn fetch_current_actor_profile_versions_batch(
     tx: &mut DbTx<'_>,
     source_kind: &str,
-    actor_id: &str,
-) -> AppResult<Option<CurrentActorProfileVersionRow>> {
-    let row = sqlx::query(
+    actor_ids: &[String],
+) -> AppResult<HashMap<String, CurrentActorProfileVersionRow>> {
+    if actor_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
         r#"
         SELECT
+            a.source_actor_id,
             v.id,
             v.version_no,
             v.profile_fingerprint
         FROM actors a
         LEFT JOIN actor_profile_versions v ON v.id = a.current_profile_version_id
         WHERE a.source_kind = $1
-          AND a.source_actor_id = $2
+          AND a.source_actor_id = ANY($2)
         "#,
     )
     .bind(source_kind)
-    .bind(actor_id)
-    .fetch_optional(&mut **tx)
+    .bind(actor_ids)
+    .fetch_all(&mut **tx)
     .await?;
 
-    Ok(row.and_then(|row| {
-        row.try_get("id")
-            .ok()
-            .map(|id| CurrentActorProfileVersionRow {
-                id,
-                version_no: row.get("version_no"),
-                profile_fingerprint: row.get("profile_fingerprint"),
-            })
-    }))
+    let mut result = HashMap::new();
+    for row in rows {
+        if let Ok(id) = row.try_get("id") {
+            result.insert(
+                row.get::<String, _>("source_actor_id"),
+                CurrentActorProfileVersionRow {
+                    id,
+                    version_no: row.get("version_no"),
+                    profile_fingerprint: row.get("profile_fingerprint"),
+                },
+            );
+        }
+    }
+    Ok(result)
 }
 
-async fn close_actor_profile_version(
+async fn close_actor_profile_versions_batch(
     tx: &mut DbTx<'_>,
-    version_id: Uuid,
+    version_ids: &[Uuid],
     effective_to: OffsetDateTime,
 ) -> AppResult<()> {
     sqlx::query(
         r#"
         UPDATE actor_profile_versions
         SET effective_to = $2
-        WHERE id = $1
+        WHERE id = ANY($1)
           AND effective_to IS NULL
         "#,
     )
-    .bind(version_id)
+    .bind(version_ids)
     .bind(effective_to)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn insert_actor_profile_version(
+async fn insert_actor_profile_versions_batch(
     tx: &mut DbTx<'_>,
-    version_id: Uuid,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XUserInput,
-    version_no: i64,
-    fingerprint: &str,
-    avatar_media_id: Option<Uuid>,
-    banner_media_id: Option<Uuid>,
-    observed_at: OffsetDateTime,
+    rows: &[ActorProfileVersionInsertRow],
 ) -> AppResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let payload = serde_json::to_value(rows)?;
     sqlx::query(
         r#"
         INSERT INTO actor_profile_versions (
@@ -896,85 +960,168 @@ async fn insert_actor_profile_version(
             avatar_media_id,
             banner_media_id
         )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-            $21, $22, $23
+        SELECT
+            item.id,
+            item.submission_id,
+            item.source_kind,
+            item.source_actor_id,
+            item.version_no,
+            item.effective_from,
+            item.profile_fingerprint,
+            item.name,
+            item.screen_name,
+            item.description,
+            item.location,
+            item.avatar_url,
+            item.profile_url,
+            item.banner_url,
+            item.is_blue_verified,
+            item.verified_type,
+            item.is_protected,
+            item.profile_image_shape,
+            item.professional_type,
+            ARRAY(
+                SELECT jsonb_array_elements_text(
+                    COALESCE(item.pinned_post_source_ids, '[]'::jsonb)
+                )
+            ),
+            item.source_created_at_raw,
+            item.avatar_media_id,
+            item.banner_media_id
+        FROM jsonb_to_recordset($1::jsonb) AS item(
+            id UUID,
+            submission_id UUID,
+            source_kind TEXT,
+            source_actor_id TEXT,
+            version_no BIGINT,
+            effective_from TIMESTAMPTZ,
+            profile_fingerprint TEXT,
+            name TEXT,
+            screen_name TEXT,
+            description TEXT,
+            location TEXT,
+            avatar_url TEXT,
+            profile_url TEXT,
+            banner_url TEXT,
+            is_blue_verified BOOLEAN,
+            verified_type TEXT,
+            is_protected BOOLEAN,
+            profile_image_shape TEXT,
+            professional_type TEXT,
+            pinned_post_source_ids JSONB,
+            source_created_at_raw TEXT,
+            avatar_media_id UUID,
+            banner_media_id UUID
         )
         "#,
     )
-    .bind(version_id)
-    .bind(submission_id)
-    .bind(source_kind)
-    .bind(item.id.trim())
-    .bind(version_no)
-    .bind(observed_at)
-    .bind(fingerprint)
-    .bind(item.name.trim())
-    .bind(item.screen_name.trim())
-    .bind(item.description.trim())
-    .bind(item.location.trim())
-    .bind(item.avatar_url.trim())
-    .bind(trimmed_option(&item.profile_url))
-    .bind(trimmed_option(&item.banner_url))
-    .bind(item.is_blue_verified)
-    .bind(trimmed_option(&item.verified_type))
-    .bind(item.is_protected)
-    .bind(item.profile_image_shape.trim())
-    .bind(trimmed_option(&item.professional_type))
-    .bind(unique_nonempty_strings(&item.pinned_tweet_ids))
-    .bind(item.created_at.trim())
-    .bind(avatar_media_id)
-    .bind(banner_media_id)
+    .bind(payload)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-async fn set_actor_current_profile_version(
+async fn set_actor_current_profile_versions_batch(
     tx: &mut DbTx<'_>,
     source_kind: &str,
-    actor_id: &str,
-    version_id: Uuid,
-    submission_id: Uuid,
-    observed_at: OffsetDateTime,
+    rows: &[ActorCurrentProfileUpdateRow],
 ) -> AppResult<()> {
-    sqlx::query(
-        r#"
-        UPDATE actors
-        SET current_profile_version_id = $3,
-            last_submission_id = $4,
-            last_observed_at = $5,
-            updated_at = NOW()
-        WHERE source_kind = $1
-          AND source_actor_id = $2
-        "#,
-    )
-    .bind(source_kind)
-    .bind(actor_id)
-    .bind(version_id)
-    .bind(submission_id)
-    .bind(observed_at)
-    .execute(&mut **tx)
-    .await?;
-
-    Ok(())
-}
-
-async fn insert_actor_metric_observation(
-    tx: &mut DbTx<'_>,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XUserInput,
-    observed_at: OffsetDateTime,
-    min_interval: time::Duration,
-) -> AppResult<()> {
-    let latest = fetch_latest_actor_metric_observation(tx, source_kind, item.id.trim()).await?;
-    if !should_insert_actor_metric_observation(latest.as_ref(), item, observed_at, min_interval) {
+    if rows.is_empty() {
         return Ok(());
     }
 
+    let payload = serde_json::to_value(rows)?;
+    sqlx::query(
+        r#"
+        WITH input AS (
+            SELECT
+                source_actor_id,
+                version_id,
+                submission_id,
+                observed_at
+            FROM jsonb_to_recordset($2::jsonb) AS item(
+                source_actor_id TEXT,
+                version_id UUID,
+                submission_id UUID,
+                observed_at TIMESTAMPTZ
+            )
+        )
+        UPDATE actors
+        SET current_profile_version_id = input.version_id,
+            last_submission_id = input.submission_id,
+            last_observed_at = input.observed_at,
+            updated_at = NOW()
+        FROM input
+        WHERE actors.source_kind = $1
+          AND actors.source_actor_id = input.source_actor_id
+        "#,
+    )
+    .bind(source_kind)
+    .bind(payload)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_actor_metrics_batch(
+    tx: &mut DbTx<'_>,
+    submission_id: Uuid,
+    source_kind: &str,
+    items: &[XUserInput],
+    observed_at: OffsetDateTime,
+    min_interval: time::Duration,
+) -> AppResult<()> {
+    #[derive(Debug, Clone, Serialize)]
+    struct ActorMetricInsertRow {
+        submission_id: Uuid,
+        source_kind: String,
+        source_actor_id: String,
+        observed_at: OffsetDateTime,
+        followers_count: i64,
+        friends_count: i64,
+        favourites_count: i64,
+        statuses_count: i64,
+        media_count: i64,
+        listed_count: i64,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let actor_ids = items
+        .iter()
+        .map(|item| item.id.trim().to_owned())
+        .collect::<Vec<_>>();
+    let latest = fetch_latest_actor_metric_observations_batch(tx, source_kind, &actor_ids).await?;
+    let rows = items
+        .iter()
+        .filter(|item| {
+            should_insert_actor_metric_observation(
+                latest.get(item.id.trim()),
+                item,
+                observed_at,
+                min_interval,
+            )
+        })
+        .map(|item| ActorMetricInsertRow {
+            submission_id,
+            source_kind: source_kind.to_owned(),
+            source_actor_id: item.id.trim().to_owned(),
+            observed_at,
+            followers_count: item.followers_count,
+            friends_count: item.friends_count,
+            favourites_count: item.favourites_count,
+            statuses_count: item.statuses_count,
+            media_count: item.media_count,
+            listed_count: item.listed_count,
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let payload = serde_json::to_value(&rows)?;
     sqlx::query(
         r#"
         INSERT INTO actor_metric_observations (
@@ -989,7 +1136,29 @@ async fn insert_actor_metric_observation(
             media_count,
             listed_count
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        SELECT
+            item.submission_id,
+            item.source_kind,
+            item.source_actor_id,
+            item.observed_at,
+            item.followers_count,
+            item.friends_count,
+            item.favourites_count,
+            item.statuses_count,
+            item.media_count,
+            item.listed_count
+        FROM jsonb_to_recordset($1::jsonb) AS item(
+            submission_id UUID,
+            source_kind TEXT,
+            source_actor_id TEXT,
+            observed_at TIMESTAMPTZ,
+            followers_count BIGINT,
+            friends_count BIGINT,
+            favourites_count BIGINT,
+            statuses_count BIGINT,
+            media_count BIGINT,
+            listed_count BIGINT
+        )
         ON CONFLICT (submission_id, source_kind, source_actor_id) DO UPDATE
         SET observed_at = EXCLUDED.observed_at,
             followers_count = EXCLUDED.followers_count,
@@ -1000,30 +1169,25 @@ async fn insert_actor_metric_observation(
             listed_count = EXCLUDED.listed_count
         "#,
     )
-    .bind(submission_id)
-    .bind(source_kind)
-    .bind(item.id.trim())
-    .bind(observed_at)
-    .bind(item.followers_count)
-    .bind(item.friends_count)
-    .bind(item.favourites_count)
-    .bind(item.statuses_count)
-    .bind(item.media_count)
-    .bind(item.listed_count)
+    .bind(payload)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-async fn fetch_latest_actor_metric_observation(
+async fn fetch_latest_actor_metric_observations_batch(
     tx: &mut DbTx<'_>,
     source_kind: &str,
-    actor_id: &str,
-) -> AppResult<Option<LatestActorMetricObservationRow>> {
-    let row = sqlx::query(
+    actor_ids: &[String],
+) -> AppResult<HashMap<String, LatestActorMetricObservationRow>> {
+    if actor_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
         r#"
-        SELECT
+        SELECT DISTINCT ON (source_actor_id)
+            source_actor_id,
             observed_at,
             followers_count,
             friends_count,
@@ -1033,56 +1197,82 @@ async fn fetch_latest_actor_metric_observation(
             listed_count
         FROM actor_metric_observations
         WHERE source_kind = $1
-          AND source_actor_id = $2
-        ORDER BY observed_at DESC, created_at DESC
-        LIMIT 1
+          AND source_actor_id = ANY($2)
+        ORDER BY source_actor_id, observed_at DESC, created_at DESC
         "#,
     )
     .bind(source_kind)
-    .bind(actor_id)
-    .fetch_optional(&mut **tx)
+    .bind(actor_ids)
+    .fetch_all(&mut **tx)
     .await?;
 
-    Ok(row.map(|row| LatestActorMetricObservationRow {
-        observed_at: row.get("observed_at"),
-        followers_count: row.get("followers_count"),
-        friends_count: row.get("friends_count"),
-        favourites_count: row.get("favourites_count"),
-        statuses_count: row.get("statuses_count"),
-        media_count: row.get("media_count"),
-        listed_count: row.get("listed_count"),
-    }))
+    let mut result = HashMap::new();
+    for row in rows {
+        result.insert(
+            row.get::<String, _>("source_actor_id"),
+            LatestActorMetricObservationRow {
+                observed_at: row.get("observed_at"),
+                followers_count: row.get("followers_count"),
+                friends_count: row.get("friends_count"),
+                favourites_count: row.get("favourites_count"),
+                statuses_count: row.get("statuses_count"),
+                media_count: row.get("media_count"),
+                listed_count: row.get("listed_count"),
+            },
+        );
+    }
+    Ok(result)
 }
 
-fn should_insert_actor_metric_observation(
-    latest: Option<&LatestActorMetricObservationRow>,
-    item: &XUserInput,
-    observed_at: OffsetDateTime,
-    min_interval: time::Duration,
-) -> bool {
-    let Some(latest) = latest else {
-        return true;
-    };
-
-    actor_metrics_changed(latest, item) || observed_at - latest.observed_at >= min_interval
-}
-
-fn actor_metrics_changed(latest: &LatestActorMetricObservationRow, item: &XUserInput) -> bool {
-    latest.followers_count != item.followers_count
-        || latest.friends_count != item.friends_count
-        || latest.favourites_count != item.favourites_count
-        || latest.statuses_count != item.statuses_count
-        || latest.media_count != item.media_count
-        || latest.listed_count != item.listed_count
-}
-
-async fn upsert_post(
+async fn upsert_posts_batch(
     tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XTweetInput,
+    items: &[XTweetInput],
     observed_at: OffsetDateTime,
 ) -> AppResult<()> {
+    #[derive(Debug, Clone, Serialize)]
+    struct PostUpsertRow {
+        source_post_id: String,
+        author_source_actor_id: String,
+        conversation_source_post_id: String,
+        full_text: String,
+        legacy_full_text: String,
+        note_text: Option<String>,
+        lang: String,
+        source_created_at_raw: String,
+        in_reply_to_source_post_id: Option<String>,
+        in_reply_to_source_actor_id: Option<String>,
+        quoted_source_post_id: Option<String>,
+        retweeted_source_post_id: Option<String>,
+        possibly_sensitive: Option<bool>,
+        source_label: String,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let rows = items
+        .iter()
+        .map(|item| PostUpsertRow {
+            source_post_id: item.id.trim().to_owned(),
+            author_source_actor_id: item.author_id.trim().to_owned(),
+            conversation_source_post_id: item.conversation_id.trim().to_owned(),
+            full_text: item.full_text.trim().to_owned(),
+            legacy_full_text: item.legacy_full_text.trim().to_owned(),
+            note_text: trimmed_option(&item.note_text),
+            lang: item.lang.trim().to_owned(),
+            source_created_at_raw: item.created_at.trim().to_owned(),
+            in_reply_to_source_post_id: trimmed_option(&item.in_reply_to_tweet_id),
+            in_reply_to_source_actor_id: trimmed_option(&item.in_reply_to_user_id),
+            quoted_source_post_id: trimmed_option(&item.quoted_tweet_id),
+            retweeted_source_post_id: trimmed_option(&item.retweeted_tweet_id),
+            possibly_sensitive: item.possibly_sensitive,
+            source_label: item.source.trim().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_value(&rows)?;
     sqlx::query(
         r#"
         INSERT INTO posts (
@@ -1106,9 +1296,41 @@ async fn upsert_post(
             first_observed_at,
             last_observed_at
         )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $16, $17, $17
+        SELECT
+            $1,
+            item.source_post_id,
+            item.author_source_actor_id,
+            item.conversation_source_post_id,
+            item.full_text,
+            item.legacy_full_text,
+            item.note_text,
+            item.lang,
+            item.source_created_at_raw,
+            item.in_reply_to_source_post_id,
+            item.in_reply_to_source_actor_id,
+            item.quoted_source_post_id,
+            item.retweeted_source_post_id,
+            item.possibly_sensitive,
+            item.source_label,
+            $2,
+            $2,
+            $3,
+            $3
+        FROM jsonb_to_recordset($4::jsonb) AS item(
+            source_post_id TEXT,
+            author_source_actor_id TEXT,
+            conversation_source_post_id TEXT,
+            full_text TEXT,
+            legacy_full_text TEXT,
+            note_text TEXT,
+            lang TEXT,
+            source_created_at_raw TEXT,
+            in_reply_to_source_post_id TEXT,
+            in_reply_to_source_actor_id TEXT,
+            quoted_source_post_id TEXT,
+            retweeted_source_post_id TEXT,
+            possibly_sensitive BOOLEAN,
+            source_label TEXT
         )
         ON CONFLICT (source_kind, source_post_id) DO UPDATE
         SET author_source_actor_id = EXCLUDED.author_source_actor_id,
@@ -1130,77 +1352,126 @@ async fn upsert_post(
         "#,
     )
     .bind(source_kind)
-    .bind(item.id.trim())
-    .bind(item.author_id.trim())
-    .bind(item.conversation_id.trim())
-    .bind(item.full_text.trim())
-    .bind(item.legacy_full_text.trim())
-    .bind(trimmed_option(&item.note_text))
-    .bind(item.lang.trim())
-    .bind(item.created_at.trim())
-    .bind(trimmed_option(&item.in_reply_to_tweet_id))
-    .bind(trimmed_option(&item.in_reply_to_user_id))
-    .bind(trimmed_option(&item.quoted_tweet_id))
-    .bind(trimmed_option(&item.retweeted_tweet_id))
-    .bind(item.possibly_sensitive)
-    .bind(item.source.trim())
     .bind(submission_id)
     .bind(observed_at)
+    .bind(payload)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-async fn replace_post_media(
+async fn replace_post_media_batch(
     tx: &mut DbTx<'_>,
     source_kind: &str,
-    item: &XTweetInput,
+    items: &[XTweetInput],
 ) -> AppResult<()> {
-    let post_id = item.id.trim();
+    #[derive(Debug, Clone, Serialize)]
+    struct PostMediaRow {
+        source_post_id: String,
+        source_media_id: String,
+        position: i32,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let post_ids = items
+        .iter()
+        .map(|item| item.id.trim().to_owned())
+        .collect::<Vec<_>>();
     sqlx::query(
         r#"
         DELETE FROM post_media
         WHERE source_kind = $1
-          AND source_post_id = $2
+          AND source_post_id = ANY($2)
         "#,
     )
     .bind(source_kind)
-    .bind(post_id)
+    .bind(post_ids)
     .execute(&mut **tx)
     .await?;
 
-    let media_ids = unique_nonempty_strings(&item.media_ids);
-    for (position, media_id) in media_ids.into_iter().enumerate() {
-        sqlx::query(
-            r#"
-            INSERT INTO post_media (
-                source_kind,
-                source_post_id,
-                source_media_id,
-                position
-            )
-            VALUES ($1, $2, $3, $4)
-            "#,
-        )
-        .bind(source_kind)
-        .bind(post_id)
-        .bind(media_id)
-        .bind(position as i32)
-        .execute(&mut **tx)
-        .await?;
+    let mut rows = Vec::new();
+    for item in items {
+        for (position, media_id) in unique_nonempty_strings(&item.media_ids)
+            .into_iter()
+            .enumerate()
+        {
+            rows.push(PostMediaRow {
+                source_post_id: item.id.trim().to_owned(),
+                source_media_id: media_id,
+                position: position as i32,
+            });
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
     }
 
+    let payload = serde_json::to_value(&rows)?;
+    sqlx::query(
+        r#"
+        INSERT INTO post_media (
+            source_kind,
+            source_post_id,
+            source_media_id,
+            position
+        )
+        SELECT
+            $1,
+            item.source_post_id,
+            item.source_media_id,
+            item.position
+        FROM jsonb_to_recordset($2::jsonb) AS item(
+            source_post_id TEXT,
+            source_media_id TEXT,
+            position INTEGER
+        )
+        "#,
+    )
+    .bind(source_kind)
+    .bind(payload)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
-async fn insert_post_metric_observation(
+async fn insert_post_metric_observations_batch(
     tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XTweetInput,
+    items: &[XTweetInput],
     observed_at: OffsetDateTime,
 ) -> AppResult<()> {
+    #[derive(Debug, Clone, Serialize)]
+    struct PostMetricInsertRow {
+        source_post_id: String,
+        view_count: Option<i64>,
+        favorite_count: i64,
+        retweet_count: i64,
+        reply_count: i64,
+        quote_count: i64,
+        bookmark_count: i64,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let rows = items
+        .iter()
+        .map(|item| PostMetricInsertRow {
+            source_post_id: item.id.trim().to_owned(),
+            view_count: item.view_count,
+            favorite_count: item.favorite_count,
+            retweet_count: item.retweet_count,
+            reply_count: item.reply_count,
+            quote_count: item.quote_count,
+            bookmark_count: item.bookmark_count,
+        })
+        .collect::<Vec<_>>();
+    let payload = serde_json::to_value(&rows)?;
     sqlx::query(
         r#"
         INSERT INTO post_metric_observations (
@@ -1215,7 +1486,26 @@ async fn insert_post_metric_observation(
             quote_count,
             bookmark_count
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        SELECT
+            $1,
+            $2,
+            item.source_post_id,
+            $3,
+            item.view_count,
+            item.favorite_count,
+            item.retweet_count,
+            item.reply_count,
+            item.quote_count,
+            item.bookmark_count
+        FROM jsonb_to_recordset($4::jsonb) AS item(
+            source_post_id TEXT,
+            view_count BIGINT,
+            favorite_count BIGINT,
+            retweet_count BIGINT,
+            reply_count BIGINT,
+            quote_count BIGINT,
+            bookmark_count BIGINT
+        )
         ON CONFLICT (submission_id, source_kind, source_post_id) DO UPDATE
         SET observed_at = EXCLUDED.observed_at,
             view_count = EXCLUDED.view_count,
@@ -1228,116 +1518,75 @@ async fn insert_post_metric_observation(
     )
     .bind(submission_id)
     .bind(source_kind)
-    .bind(item.id.trim())
     .bind(observed_at)
-    .bind(item.view_count)
-    .bind(item.favorite_count)
-    .bind(item.retweet_count)
-    .bind(item.reply_count)
-    .bind(item.quote_count)
-    .bind(item.bookmark_count)
+    .bind(payload)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
-async fn register_post_media(
+async fn upsert_post_media_sources_batch(
     tx: &mut DbTx<'_>,
     submission_id: Uuid,
     source_kind: &str,
-    item: &XMediaInput,
+    items: &[PreparedMediaItem],
     observed_at: OffsetDateTime,
-) -> AppResult<media::ManagedMediaRecord> {
-    let fetch_url = media::normalize_post_source_url(&item.source_url).ok_or_else(|| {
-        AppError::bad_request(format!("media {} sourceUrl is required", item.id.trim()))
-    })?;
-    let display_url = if item.media_url.trim().is_empty() {
-        fetch_url.clone()
-    } else {
-        item.media_url.trim().to_owned()
-    };
-
-    let spec = ManagedMediaSpec {
-        source_kind: source_kind.to_owned(),
-        media_family: media_family_for_type(&item.r#type)?,
-        identity_kind: ManagedIdentityKind::PostSourceUrl,
-        identity_value: fetch_url.clone(),
-        fetch_url,
-        display_url,
-        thumb_url: trimmed_option(&Some(item.thumb_url.clone())),
-        content_type_hint: media_content_type_hint(item),
-        submission_id,
-        observed_at,
-    };
-
-    media::register_managed_media(tx, &spec).await
-}
-
-async fn register_actor_avatar_media(
-    tx: &mut DbTx<'_>,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XUserInput,
-    observed_at: OffsetDateTime,
-) -> AppResult<Option<media::ManagedMediaRecord>> {
-    let Some(fetch_url) = media::normalize_actor_avatar_fetch_url(&item.avatar_url) else {
-        return Ok(None);
-    };
-
-    let spec = ManagedMediaSpec {
-        source_kind: source_kind.to_owned(),
-        media_family: ManagedMediaFamily::Image,
-        identity_kind: ManagedIdentityKind::ActorAvatarUrl,
-        identity_value: fetch_url.clone(),
-        fetch_url,
-        display_url: item.avatar_url.trim().to_owned(),
-        thumb_url: None,
-        content_type_hint: media::infer_content_type_from_url(&item.avatar_url),
-        submission_id,
-        observed_at,
-    };
-
-    media::register_managed_media(tx, &spec).await.map(Some)
-}
-
-async fn register_actor_banner_media(
-    tx: &mut DbTx<'_>,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XUserInput,
-    observed_at: OffsetDateTime,
-) -> AppResult<Option<media::ManagedMediaRecord>> {
-    let Some(raw_banner_url) = trimmed_option(&item.banner_url) else {
-        return Ok(None);
-    };
-    let Some(fetch_url) = media::normalize_actor_banner_fetch_url(&raw_banner_url) else {
-        return Ok(None);
-    };
-
-    let spec = ManagedMediaSpec {
-        source_kind: source_kind.to_owned(),
-        media_family: ManagedMediaFamily::Image,
-        identity_kind: ManagedIdentityKind::ActorBannerUrl,
-        identity_value: fetch_url.clone(),
-        fetch_url,
-        display_url: raw_banner_url.clone(),
-        thumb_url: None,
-        content_type_hint: media::infer_content_type_from_url(&raw_banner_url),
-        submission_id,
-        observed_at,
-    };
-
-    media::register_managed_media(tx, &spec).await.map(Some)
-}
-
-async fn upsert_post_media_source(
-    tx: &mut DbTx<'_>,
-    submission_id: Uuid,
-    source_kind: &str,
-    item: &XMediaInput,
-    managed_media_id: Uuid,
-    observed_at: OffsetDateTime,
+    managed_media_by_key: &HashMap<String, media::ManagedMediaBatchRecord>,
 ) -> AppResult<()> {
+    #[derive(Debug, Clone, Serialize)]
+    struct PostMediaSourceUpsertRow {
+        source_media_id: String,
+        managed_media_id: Uuid,
+        media_key: String,
+        source_post_id: String,
+        media_type: String,
+        media_url: String,
+        thumb_url: String,
+        source_url: String,
+        width: i32,
+        height: i32,
+        alt_text: Option<String>,
+        allow_download: bool,
+        source_status_id: Option<String>,
+        source_actor_id: Option<String>,
+        duration_ms: Option<i64>,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let mut rows = Vec::new();
+    for item in items {
+        let managed_media = managed_media_by_key
+            .get(&managed_media_identity_key(
+                &item.managed_spec.source_kind,
+                item.managed_spec.identity_kind.as_str(),
+                &item.managed_spec.identity_value,
+            ))
+            .ok_or_else(|| {
+                AppError::upstream("missing managed media result for post media source")
+            })?;
+        rows.push(PostMediaSourceUpsertRow {
+            source_media_id: item.item.id.trim().to_owned(),
+            managed_media_id: managed_media.id,
+            media_key: item.item.media_key.trim().to_owned(),
+            source_post_id: item.item.tweet_id.trim().to_owned(),
+            media_type: item.item.r#type.trim().to_owned(),
+            media_url: item.item.media_url.trim().to_owned(),
+            thumb_url: item.item.thumb_url.trim().to_owned(),
+            source_url: item.item.source_url.trim().to_owned(),
+            width: item.item.width,
+            height: item.item.height,
+            alt_text: trimmed_option(&item.item.alt_text),
+            allow_download: item.item.allow_download,
+            source_status_id: trimmed_option(&item.item.source_status_id),
+            source_actor_id: trimmed_option(&item.item.source_user_id),
+            duration_ms: item.item.duration_ms,
+        });
+    }
+
+    let payload = serde_json::to_value(&rows)?;
     sqlx::query(
         r#"
         INSERT INTO post_media_sources (
@@ -1362,9 +1611,43 @@ async fn upsert_post_media_source(
             first_observed_at,
             last_observed_at
         )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $17, $18, $18
+        SELECT
+            $1,
+            item.source_media_id,
+            item.managed_media_id,
+            item.media_key,
+            item.source_post_id,
+            item.media_type,
+            item.media_url,
+            item.thumb_url,
+            item.source_url,
+            item.width,
+            item.height,
+            item.alt_text,
+            item.allow_download,
+            item.source_status_id,
+            item.source_actor_id,
+            item.duration_ms,
+            $2,
+            $2,
+            $3,
+            $3
+        FROM jsonb_to_recordset($4::jsonb) AS item(
+            source_media_id TEXT,
+            managed_media_id UUID,
+            media_key TEXT,
+            source_post_id TEXT,
+            media_type TEXT,
+            media_url TEXT,
+            thumb_url TEXT,
+            source_url TEXT,
+            width INTEGER,
+            height INTEGER,
+            alt_text TEXT,
+            allow_download BOOLEAN,
+            source_status_id TEXT,
+            source_actor_id TEXT,
+            duration_ms BIGINT
         )
         ON CONFLICT (source_kind, source_media_id) DO UPDATE
         SET managed_media_id = EXCLUDED.managed_media_id,
@@ -1387,73 +1670,251 @@ async fn upsert_post_media_source(
         "#,
     )
     .bind(source_kind)
-    .bind(item.id.trim())
-    .bind(managed_media_id)
-    .bind(item.media_key.trim())
-    .bind(item.tweet_id.trim())
-    .bind(item.r#type.trim())
-    .bind(item.media_url.trim())
-    .bind(item.thumb_url.trim())
-    .bind(item.source_url.trim())
-    .bind(item.width)
-    .bind(item.height)
-    .bind(trimmed_option(&item.alt_text))
-    .bind(item.allow_download)
-    .bind(trimmed_option(&item.source_status_id))
-    .bind(trimmed_option(&item.source_user_id))
-    .bind(item.duration_ms)
     .bind(submission_id)
     .bind(observed_at)
+    .bind(payload)
     .execute(&mut **tx)
     .await?;
-
     Ok(())
 }
 
-async fn replace_media_variants(
+async fn replace_media_variants_batch(
     tx: &mut DbTx<'_>,
     source_kind: &str,
-    item: &XMediaInput,
+    items: &[PreparedMediaItem],
 ) -> AppResult<()> {
-    let media_id = item.id.trim();
+    #[derive(Debug, Clone, Serialize)]
+    struct MediaVariantInsertRow {
+        source_media_id: String,
+        url: String,
+        position: i32,
+        bitrate: Option<i64>,
+        content_type: String,
+    }
+
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let media_ids = items
+        .iter()
+        .map(|item| item.item.id.trim().to_owned())
+        .collect::<Vec<_>>();
     sqlx::query(
         r#"
         DELETE FROM media_variants
         WHERE source_kind = $1
-          AND source_media_id = $2
+          AND source_media_id = ANY($2)
         "#,
     )
     .bind(source_kind)
-    .bind(media_id)
+    .bind(media_ids)
     .execute(&mut **tx)
     .await?;
 
-    let variants = unique_video_variants(&item.video_variants);
-    for (position, variant) in variants.into_iter().enumerate() {
-        sqlx::query(
-            r#"
-            INSERT INTO media_variants (
-                source_kind,
-                source_media_id,
-                url,
-                position,
-                bitrate,
-                content_type
-            )
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
-        )
-        .bind(source_kind)
-        .bind(media_id)
-        .bind(variant.url)
-        .bind(position as i32)
-        .bind(variant.bitrate)
-        .bind(variant.content_type.trim())
-        .execute(&mut **tx)
-        .await?;
+    let mut rows = Vec::new();
+    for item in items {
+        for (position, variant) in item.variants.iter().enumerate() {
+            rows.push(MediaVariantInsertRow {
+                source_media_id: item.item.id.trim().to_owned(),
+                url: variant.url.clone(),
+                position: position as i32,
+                bitrate: variant.bitrate,
+                content_type: variant.content_type.trim().to_owned(),
+            });
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
     }
 
+    let payload = serde_json::to_value(&rows)?;
+    sqlx::query(
+        r#"
+        INSERT INTO media_variants (
+            source_kind,
+            source_media_id,
+            url,
+            position,
+            bitrate,
+            content_type
+        )
+        SELECT
+            $1,
+            item.source_media_id,
+            item.url,
+            item.position,
+            item.bitrate,
+            item.content_type
+        FROM jsonb_to_recordset($2::jsonb) AS item(
+            source_media_id TEXT,
+            url TEXT,
+            position INTEGER,
+            bitrate BIGINT,
+            content_type TEXT
+        )
+        "#,
+    )
+    .bind(source_kind)
+    .bind(payload)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
+}
+
+fn build_actor_media_specs(
+    source_kind: &str,
+    submission_id: Uuid,
+    items: &[XUserInput],
+    observed_at: OffsetDateTime,
+) -> Vec<ManagedMediaSpec> {
+    let mut specs = Vec::new();
+    for item in items {
+        if let Some(fetch_url) = media::normalize_actor_avatar_fetch_url(&item.avatar_url) {
+            specs.push(ManagedMediaSpec {
+                source_kind: source_kind.to_owned(),
+                media_family: ManagedMediaFamily::Image,
+                identity_kind: ManagedIdentityKind::ActorAvatarUrl,
+                identity_value: fetch_url.clone(),
+                fetch_url,
+                display_url: item.avatar_url.trim().to_owned(),
+                thumb_url: None,
+                content_type_hint: media::infer_content_type_from_url(&item.avatar_url),
+                submission_id,
+                observed_at,
+            });
+        }
+
+        if let Some(raw_banner_url) = trimmed_option(&item.banner_url) {
+            if let Some(fetch_url) = media::normalize_actor_banner_fetch_url(&raw_banner_url) {
+                specs.push(ManagedMediaSpec {
+                    source_kind: source_kind.to_owned(),
+                    media_family: ManagedMediaFamily::Image,
+                    identity_kind: ManagedIdentityKind::ActorBannerUrl,
+                    identity_value: fetch_url.clone(),
+                    fetch_url,
+                    display_url: raw_banner_url,
+                    thumb_url: None,
+                    content_type_hint: media::infer_content_type_from_url(
+                        item.banner_url.as_deref().unwrap_or_default(),
+                    ),
+                    submission_id,
+                    observed_at,
+                });
+            }
+        }
+    }
+    specs
+}
+
+fn prepare_media_items(
+    source_kind: &str,
+    submission_id: Uuid,
+    items: &[XMediaInput],
+    observed_at: OffsetDateTime,
+    warnings: &mut Vec<String>,
+) -> AppResult<Vec<PreparedMediaItem>> {
+    let mut prepared = Vec::new();
+    for item in items {
+        match build_post_media_spec(source_kind, submission_id, item, observed_at) {
+            Ok((managed_spec, variants)) => prepared.push(PreparedMediaItem {
+                item: item.clone(),
+                managed_spec,
+                variants,
+            }),
+            Err(error) => warnings.push(format!("failed to upsert media {}: {error}", item.id)),
+        }
+    }
+    Ok(prepared)
+}
+
+fn build_post_media_spec(
+    source_kind: &str,
+    submission_id: Uuid,
+    item: &XMediaInput,
+    observed_at: OffsetDateTime,
+) -> AppResult<(ManagedMediaSpec, Vec<VideoVariantInput>)> {
+    let fetch_url = media::normalize_post_source_url(&item.source_url).ok_or_else(|| {
+        AppError::bad_request(format!("media {} sourceUrl is required", item.id.trim()))
+    })?;
+    let display_url = if item.media_url.trim().is_empty() {
+        fetch_url.clone()
+    } else {
+        item.media_url.trim().to_owned()
+    };
+
+    Ok((
+        ManagedMediaSpec {
+            source_kind: source_kind.to_owned(),
+            media_family: media_family_for_type(&item.r#type)?,
+            identity_kind: ManagedIdentityKind::PostSourceUrl,
+            identity_value: fetch_url.clone(),
+            fetch_url,
+            display_url,
+            thumb_url: trimmed_option(&Some(item.thumb_url.clone())),
+            content_type_hint: media_content_type_hint(item),
+            submission_id,
+            observed_at,
+        },
+        unique_video_variants(&item.video_variants),
+    ))
+}
+
+fn actor_avatar_media_id(
+    source_kind: &str,
+    item: &XUserInput,
+    managed_media_by_key: &HashMap<String, media::ManagedMediaBatchRecord>,
+) -> Option<Uuid> {
+    let fetch_url = media::normalize_actor_avatar_fetch_url(&item.avatar_url)?;
+    managed_media_by_key
+        .get(&managed_media_identity_key(
+            source_kind,
+            ManagedIdentityKind::ActorAvatarUrl.as_str(),
+            &fetch_url,
+        ))
+        .map(|item| item.id)
+}
+
+fn actor_banner_media_id(
+    source_kind: &str,
+    item: &XUserInput,
+    managed_media_by_key: &HashMap<String, media::ManagedMediaBatchRecord>,
+) -> Option<Uuid> {
+    let raw_banner_url = trimmed_option(&item.banner_url)?;
+    let fetch_url = media::normalize_actor_banner_fetch_url(&raw_banner_url)?;
+    managed_media_by_key
+        .get(&managed_media_identity_key(
+            source_kind,
+            ManagedIdentityKind::ActorBannerUrl.as_str(),
+            &fetch_url,
+        ))
+        .map(|item| item.id)
+}
+
+fn managed_media_records_by_key(
+    records: Vec<media::ManagedMediaBatchRecord>,
+) -> HashMap<String, media::ManagedMediaBatchRecord> {
+    records
+        .into_iter()
+        .map(|item| {
+            (
+                managed_media_identity_key(
+                    &item.source_kind,
+                    &item.identity_kind,
+                    &item.identity_value,
+                ),
+                item,
+            )
+        })
+        .collect()
+}
+
+fn managed_media_identity_key(
+    source_kind: &str,
+    identity_kind: &str,
+    identity_value: &str,
+) -> String {
+    format!("{source_kind}\n{identity_kind}\n{identity_value}")
 }
 
 fn media_family_for_type(value: &str) -> AppResult<ManagedMediaFamily> {
