@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{HashMap, HashSet};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
@@ -166,6 +166,21 @@ pub struct PostView {
     pub bookmark_count: i64,
     pub media_source_ids: Vec<String>,
     pub source_label: String,
+    pub timestamps: PostTimestampsView,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostTimestampsView {
+    pub post: EntityTimestampsView,
+    pub metrics: Option<EntityTimestampsView>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntityTimestampsView {
+    pub last_observed_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1561,11 +1576,15 @@ struct PostRow {
     retweeted_source_post_id: Option<String>,
     possibly_sensitive: Option<bool>,
     source_label: String,
+    last_observed_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone)]
 struct PostMetricRow {
     source_post_id: String,
+    observed_at: OffsetDateTime,
+    created_at: OffsetDateTime,
     view_count: Option<i64>,
     favorite_count: i64,
     retweet_count: i64,
@@ -1628,7 +1647,9 @@ async fn fetch_posts(
             quoted_source_post_id,
             retweeted_source_post_id,
             possibly_sensitive,
-            source_label
+            source_label,
+            last_observed_at,
+            updated_at
         FROM posts
         WHERE source_kind = $1
           AND source_post_id = ANY($2)
@@ -1656,6 +1677,8 @@ async fn fetch_posts(
             retweeted_source_post_id: row.get("retweeted_source_post_id"),
             possibly_sensitive: row.get("possibly_sensitive"),
             source_label: row.get("source_label"),
+            last_observed_at: row.get("last_observed_at"),
+            updated_at: row.get("updated_at"),
         })
         .collect())
 }
@@ -1673,6 +1696,8 @@ async fn fetch_latest_post_metrics(
         r#"
         SELECT DISTINCT ON (source_post_id)
             source_post_id,
+            observed_at,
+            created_at,
             view_count,
             favorite_count,
             retweet_count,
@@ -1694,6 +1719,8 @@ async fn fetch_latest_post_metrics(
         .into_iter()
         .map(|row| PostMetricRow {
             source_post_id: row.get("source_post_id"),
+            observed_at: row.get("observed_at"),
+            created_at: row.get("created_at"),
             view_count: row.get("view_count"),
             favorite_count: row.get("favorite_count"),
             retweet_count: row.get("retweet_count"),
@@ -1939,6 +1966,11 @@ fn build_post_status_aggregate(
             bookmark_count: metrics.map(|item| item.bookmark_count).unwrap_or_default(),
             media_source_ids,
             source_label: post.source_label.clone(),
+            timestamps: PostTimestampsView {
+                post: build_entity_timestamps(post.last_observed_at, post.updated_at),
+                metrics: metrics
+                    .map(|item| build_entity_timestamps(item.observed_at, item.created_at)),
+            },
         }),
         author,
         media,
@@ -1947,11 +1979,28 @@ fn build_post_status_aggregate(
     }
 }
 
+fn build_entity_timestamps(
+    last_observed_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+) -> EntityTimestampsView {
+    EntityTimestampsView {
+        last_observed_at: format_time(last_observed_at),
+        updated_at: format_time(updated_at),
+    }
+}
+
+fn format_time(value: OffsetDateTime) -> String {
+    value
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| value.unix_timestamp().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use serde_json::json;
+    use time::macros::datetime;
 
     use super::*;
 
@@ -2067,6 +2116,10 @@ mod tests {
 
     #[test]
     fn build_post_status_aggregate_uses_latest_metrics_and_media_order() {
+        let post_last_observed_at = datetime!(2026-04-03 12:34:56 UTC);
+        let post_updated_at = datetime!(2026-04-03 12:35:02 UTC);
+        let metrics_observed_at = datetime!(2026-04-03 12:36:00 UTC);
+        let metrics_updated_at = datetime!(2026-04-03 12:36:05 UTC);
         let post = PostRow {
             source_post_id: "p1".to_owned(),
             author_source_actor_id: "a1".to_owned(),
@@ -2082,6 +2135,8 @@ mod tests {
             retweeted_source_post_id: None,
             possibly_sensitive: Some(false),
             source_label: "web".to_owned(),
+            last_observed_at: post_last_observed_at,
+            updated_at: post_updated_at,
         };
 
         let mut actors = HashMap::new();
@@ -2144,6 +2199,8 @@ mod tests {
             "p1".to_owned(),
             PostMetricRow {
                 source_post_id: "p1".to_owned(),
+                observed_at: metrics_observed_at,
+                created_at: metrics_updated_at,
                 view_count: Some(10),
                 favorite_count: 1,
                 retweet_count: 2,
@@ -2185,6 +2242,44 @@ mod tests {
         assert!(aggregate.found);
         assert_eq!(aggregate.post.as_ref().unwrap().view_count, Some(10));
         assert_eq!(aggregate.post.as_ref().unwrap().media_source_ids, media_ids);
+        assert_eq!(
+            aggregate
+                .post
+                .as_ref()
+                .unwrap()
+                .timestamps
+                .post
+                .last_observed_at,
+            "2026-04-03T12:34:56Z"
+        );
+        assert_eq!(
+            aggregate.post.as_ref().unwrap().timestamps.post.updated_at,
+            "2026-04-03T12:35:02Z"
+        );
+        assert_eq!(
+            aggregate
+                .post
+                .as_ref()
+                .unwrap()
+                .timestamps
+                .metrics
+                .as_ref()
+                .unwrap()
+                .last_observed_at,
+            "2026-04-03T12:36:00Z"
+        );
+        assert_eq!(
+            aggregate
+                .post
+                .as_ref()
+                .unwrap()
+                .timestamps
+                .metrics
+                .as_ref()
+                .unwrap()
+                .updated_at,
+            "2026-04-03T12:36:05Z"
+        );
         assert_eq!(aggregate.media.len(), 2);
         assert_eq!(aggregate.media[0].source_media_id, "m2");
         assert_eq!(aggregate.media[1].source_media_id, "m1");
@@ -2194,5 +2289,73 @@ mod tests {
         );
         assert_eq!(aggregate.transfer_summary.processing, 1);
         assert_eq!(aggregate.transfer_summary.succeeded, 1);
+
+        let value = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(
+            value["post"]["timestamps"]["post"]["lastObservedAt"],
+            "2026-04-03T12:34:56Z"
+        );
+        assert_eq!(
+            value["post"]["timestamps"]["post"]["updatedAt"],
+            "2026-04-03T12:35:02Z"
+        );
+        assert_eq!(
+            value["post"]["timestamps"]["metrics"]["lastObservedAt"],
+            "2026-04-03T12:36:00Z"
+        );
+        assert_eq!(
+            value["post"]["timestamps"]["metrics"]["updatedAt"],
+            "2026-04-03T12:36:05Z"
+        );
+    }
+
+    #[test]
+    fn build_post_status_aggregate_returns_null_metric_timestamps_without_metrics() {
+        let post = PostRow {
+            source_post_id: "p1".to_owned(),
+            author_source_actor_id: "a1".to_owned(),
+            conversation_source_post_id: "c1".to_owned(),
+            full_text: "full".to_owned(),
+            legacy_full_text: "legacy".to_owned(),
+            note_text: None,
+            lang: "en".to_owned(),
+            source_created_at_raw: "created".to_owned(),
+            in_reply_to_source_post_id: None,
+            in_reply_to_source_actor_id: None,
+            quoted_source_post_id: None,
+            retweeted_source_post_id: None,
+            possibly_sensitive: Some(false),
+            source_label: "web".to_owned(),
+            last_observed_at: datetime!(2026-04-03 13:00:00 UTC),
+            updated_at: datetime!(2026-04-03 13:00:05 UTC),
+        };
+
+        let aggregate = build_post_status_aggregate(
+            "x",
+            "p1".to_owned(),
+            Some(&post),
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(aggregate.found);
+        assert!(
+            aggregate
+                .post
+                .as_ref()
+                .unwrap()
+                .timestamps
+                .metrics
+                .is_none()
+        );
+
+        let value = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(
+            value["post"]["timestamps"]["metrics"],
+            serde_json::Value::Null
+        );
     }
 }
