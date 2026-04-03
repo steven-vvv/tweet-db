@@ -3,7 +3,7 @@ use axum::{
     extract::{Extension, Path, Query, State},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -58,6 +58,7 @@ struct UserCursor {
     v: u8,
     q: Option<String>,
     status: String,
+    #[serde(with = "cursor_datetime")]
     created_at: OffsetDateTime,
     id: Uuid,
 }
@@ -67,6 +68,7 @@ struct PostCursor {
     v: u8,
     q: Option<String>,
     source_kind: Option<String>,
+    #[serde(with = "cursor_datetime")]
     last_observed_at: OffsetDateTime,
     row_source_kind: String,
     source_post_id: String,
@@ -77,6 +79,7 @@ struct ActorCursor {
     v: u8,
     q: Option<String>,
     source_kind: Option<String>,
+    #[serde(with = "cursor_datetime")]
     last_observed_at: OffsetDateTime,
     row_source_kind: String,
     source_actor_id: String,
@@ -86,6 +89,7 @@ struct ActorCursor {
 struct StorageObjectCursor {
     v: u8,
     q: Option<String>,
+    #[serde(with = "cursor_datetime")]
     created_at: OffsetDateTime,
     id: Uuid,
 }
@@ -95,8 +99,89 @@ struct TransferJobCursor {
     v: u8,
     q: Option<String>,
     status: Option<String>,
+    #[serde(with = "cursor_datetime")]
     updated_at: OffsetDateTime,
     id: Uuid,
+}
+
+mod cursor_datetime {
+    use super::*;
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+    use time::{Date, PrimitiveDateTime, Time, UtcOffset};
+
+    pub fn serialize<S>(value: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let formatted = value.format(&Rfc3339).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&formatted)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<OffsetDateTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OffsetDateTimeVisitor;
+
+        impl<'de> Visitor<'de> for OffsetDateTimeVisitor {
+            type Value = OffsetDateTime;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an RFC3339 datetime string or legacy datetime tuple")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                OffsetDateTime::parse(value, &Rfc3339).map_err(E::custom)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let year = seq
+                    .next_element::<i32>()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let ordinal = seq
+                    .next_element::<u16>()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let hour = seq
+                    .next_element::<u8>()?
+                    .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+                let minute = seq
+                    .next_element::<u8>()?
+                    .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+                let second = seq
+                    .next_element::<u8>()?
+                    .ok_or_else(|| de::Error::invalid_length(4, &self))?;
+                let nanosecond = seq
+                    .next_element::<u32>()?
+                    .ok_or_else(|| de::Error::invalid_length(5, &self))?;
+                let offset_hours = seq
+                    .next_element::<i8>()?
+                    .ok_or_else(|| de::Error::invalid_length(6, &self))?;
+                let offset_minutes = seq
+                    .next_element::<i8>()?
+                    .ok_or_else(|| de::Error::invalid_length(7, &self))?;
+                let offset_seconds = seq
+                    .next_element::<i8>()?
+                    .ok_or_else(|| de::Error::invalid_length(8, &self))?;
+
+                let date = Date::from_ordinal_date(year, ordinal).map_err(de::Error::custom)?;
+                let time =
+                    Time::from_hms_nano(hour, minute, second, nanosecond).map_err(de::Error::custom)?;
+                let offset = UtcOffset::from_hms(offset_hours, offset_minutes, offset_seconds)
+                    .map_err(de::Error::custom)?;
+
+                Ok(PrimitiveDateTime::new(date, time).assume_offset(offset))
+            }
+        }
+
+        deserializer.deserialize_any(OffsetDateTimeVisitor)
+    }
 }
 
 pub async fn list_users(
@@ -1557,6 +1642,26 @@ mod tests {
         let encoded = encode_cursor(&cursor).unwrap();
         let decoded = decode_cursor::<UserCursor>(Some(&encoded)).unwrap();
         assert_eq!(decoded.unwrap().status, "active");
+
+        let raw = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        let payload: Value = serde_json::from_slice(&raw).unwrap();
+        assert!(payload.get("created_at").unwrap().is_string());
+    }
+
+    #[test]
+    fn accepts_legacy_cursor_datetime_payload() {
+        let legacy = serde_json::json!({
+            "v": CURSOR_VERSION,
+            "q": "demo",
+            "status": "active",
+            "created_at": [2026, 93, 9, 29, 21, 628560142, 0, 0, 0],
+            "id": Uuid::nil(),
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy).unwrap());
+
+        let decoded = decode_cursor::<UserCursor>(Some(&encoded)).unwrap().unwrap();
+        assert_eq!(decoded.status, "active");
+        assert_eq!(decoded.created_at, time::macros::datetime!(2026-04-03 09:29:21.628560142 UTC));
     }
 
     #[test]
