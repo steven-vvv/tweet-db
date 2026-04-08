@@ -89,6 +89,7 @@ mod tests {
             ServerSection, SessionSection, Settings, SsoSection, StorageSection, TransferSection,
         },
         state::AppState,
+        string_dict::StringDictCache,
     };
 
     fn test_state() -> AppState {
@@ -164,7 +165,7 @@ mod tests {
                 .connect_lazy("postgres://postgres:postgres@127.0.0.1/tweet_db")
                 .unwrap(),
             Client::new(),
-            Client::new(),
+            StringDictCache::default(),
         )
     }
 

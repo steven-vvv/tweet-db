@@ -6,6 +6,7 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use crate::{
     config::Settings,
     error::{AppError, AppResult},
+    string_dict::StringDictCache,
 };
 
 #[derive(Clone)]
@@ -13,7 +14,7 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     pub db: PgPool,
     pub auth_http_client: Client,
-    pub transfer_http_client: Client,
+    pub string_dict: StringDictCache,
 }
 
 impl AppState {
@@ -21,13 +22,13 @@ impl AppState {
         settings: Settings,
         db: PgPool,
         auth_http_client: Client,
-        transfer_http_client: Client,
+        string_dict: StringDictCache,
     ) -> Self {
         Self {
             settings: Arc::new(settings),
             db,
             auth_http_client,
-            transfer_http_client,
+            string_dict,
         }
     }
 }
@@ -46,17 +47,4 @@ pub fn build_auth_http_client() -> AppResult<Client> {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| AppError::config(format!("failed to build http client: {error}")))
-}
-
-pub fn build_transfer_http_client(settings: &Settings) -> AppResult<Client> {
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(
-            settings.config.transfer.connect_timeout_seconds,
-        ))
-        .read_timeout(std::time::Duration::from_secs(
-            settings.config.transfer.read_timeout_seconds,
-        ))
-        .build()
-        .map_err(|error| AppError::config(format!("failed to build transfer http client: {error}")))
 }

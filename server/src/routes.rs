@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{admin, auth, content, db, error::AppResult, state::AppState};
+use crate::{admin, auth, db, error::AppResult, state::AppState};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -28,16 +28,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
 }
 
 fn public_api_routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/v1/session", get(auth::session_me))
-        .route(
-            "/api/v1/ingest/submissions",
-            post(content::ingest_submission),
-        )
-        .route(
-            "/api/v1/posts/status/query",
-            post(content::query_post_status),
-        )
+    Router::new().route("/api/v1/session", get(auth::session_me))
 }
 
 fn internal_api_routes() -> Router<AppState> {
@@ -63,45 +54,6 @@ fn admin_api_routes() -> Router<AppState> {
         .route(
             "/internal/v1/admin/users/{user_id}/enable",
             post(admin::enable_user),
-        )
-        .route("/internal/v1/admin/posts", get(admin::list_posts))
-        .route(
-            "/internal/v1/admin/posts/{source_kind}/{source_post_id}",
-            get(admin::get_post),
-        )
-        .route("/internal/v1/admin/actors", get(admin::list_actors))
-        .route(
-            "/internal/v1/admin/actors/{source_kind}/{source_actor_id}",
-            get(admin::get_actor),
-        )
-        .route("/internal/v1/admin/media/{media_id}", get(admin::get_media))
-        .route(
-            "/internal/v1/admin/storage-objects",
-            get(admin::list_storage_objects),
-        )
-        .route(
-            "/internal/v1/admin/storage-objects/{object_id}",
-            get(admin::get_storage_object),
-        )
-        .route(
-            "/internal/v1/admin/storage-objects/{object_id}/sign",
-            post(admin::sign_storage_object),
-        )
-        .route(
-            "/internal/v1/admin/transfers/overview",
-            get(admin::transfer_overview),
-        )
-        .route(
-            "/internal/v1/admin/transfers/jobs",
-            get(admin::list_transfer_jobs),
-        )
-        .route(
-            "/internal/v1/admin/transfers/jobs/{job_id}",
-            get(admin::get_transfer_job),
-        )
-        .route(
-            "/internal/v1/admin/transfers/jobs/{job_id}/requeue",
-            post(admin::requeue_transfer_job),
         )
 }
 
@@ -141,6 +93,7 @@ mod tests {
             ServerSection, SessionSection, Settings, SsoSection, StorageSection, TransferSection,
         },
         state::AppState,
+        string_dict::StringDictCache,
     };
 
     fn test_state() -> AppState {
@@ -216,7 +169,7 @@ mod tests {
                 .connect_lazy("postgres://postgres:postgres@127.0.0.1/tweet_db")
                 .unwrap(),
             Client::new(),
-            Client::new(),
+            StringDictCache::default(),
         )
     }
 
@@ -247,18 +200,28 @@ mod tests {
                 StatusCode::METHOD_NOT_ALLOWED,
             ),
             (
+                Request::post("/api/v1/ingest/submissions")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Request::post("/api/v1/posts/status/query")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
                 Request::get("/internal/v1/admin/users")
                     .body(Body::empty())
                     .unwrap(),
                 StatusCode::UNAUTHORIZED,
             ),
             (
-                Request::post(
-                    "/internal/v1/admin/storage-objects/0195f1df-0730-7f69-9a92-cd8e4eb4d001/sign",
-                )
-                .body(Body::empty())
-                .unwrap(),
-                StatusCode::UNAUTHORIZED,
+                Request::get("/internal/v1/admin/posts")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::NOT_FOUND,
             ),
         ];
 
