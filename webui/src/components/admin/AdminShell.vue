@@ -34,18 +34,6 @@ const session = ref<InternalSessionResponse | null>(null)
 
 const navItems = [
   { to: '/admin/users', label: 'Users', description: 'Accounts and enable or disable actions' },
-  { to: '/admin/posts', label: 'Posts', description: 'Post browse, search, and raw records' },
-  { to: '/admin/actors', label: 'Actors', description: 'Actor browse, detail, and linked media' },
-  {
-    to: '/admin/storage-objects',
-    label: 'Resources',
-    description: 'Stored objects and signed download links',
-  },
-  {
-    to: '/admin/transfers',
-    label: 'Transfers',
-    description: 'Transfer overview, jobs, attempts, and retries',
-  },
 ]
 
 onMounted(async () => {

@@ -3,7 +3,7 @@
     <section class="card" :class="{ wide: isWide }">
       <header class="hero">
         <p class="eyebrow">tweet-db</p>
-        <h1>{{ isWide ? 'Internal operations console' : 'Capture storage and status control plane' }}</h1>
+        <h1>{{ isWide ? 'Internal account console' : 'Account access and session status' }}</h1>
       </header>
       <RouterView />
     </section>
