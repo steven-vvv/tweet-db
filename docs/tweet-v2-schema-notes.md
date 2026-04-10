@@ -2,35 +2,43 @@
 
 ## 状态
 
-- 当前 [tweet-v2-schema-draft.sql](/home/steven/code/tweet-db/docs/tweet-v2-schema-draft.sql) 可视为现阶段冻结候选版本。
-- 后续默认不再继续扩展 DDL，除非出现明确的结构性矛盾、实现阻塞或上游模型再次发生实质变化。
+- 当前 [tweet-v2-schema-draft.sql](/home/steven/code/tweet-db/docs/tweet-v2-schema-draft.sql) 已升级为数据库 bootstrap 草案，而不再只是单一 `public` schema 下的 tweet 表草稿。
+- 本轮 schema 分层已定稿，后续默认不再回到“全部对象落在 public”的组织方式。
 
-## 当前已锁定的方向
+## 已锁定的 schema 划分
 
-- 字符串搜索外置：
-  数据库不承担全文检索、模糊匹配或 URL 搜索职责。后续若接入外部搜索引擎，当前参考方向为 Tantivy，但本阶段不回写任何 DDL 变更。
-- 富文本内联保留：
-  `annotated_text` 继续保留在正文、长文、bio、社区附注等核心场景，正向读取不依赖维表 JOIN 组装文本。
-- 关系表只做反查优化：
-  `tweet_media_ref`、`tweet_mention_ref`、`tweet_hashtag_ref`、`tweet_symbol_ref` 主要服务反向查询或顺序恢复，不承担正文主读取路径。
-- 命名字典只做归一化：
-  `string_dict` 仅负责受控短字符串归一化，不承担搜索系统角色。
+- `tweet`：
+  tweet v2 核心数据域，承载字典、复合类型、维表、主表、关系表与便利视图。
+- `iam`：
+  本站用户、SSO subject、authorization、session。
+- `audit`：
+  审计与日志域；当前已迁入 `audit_events`。
+- `media`：
+  预留给未来媒体资产、OSS 文件、转储工作者；当前仅保留 schema 占位。
+- `vector`：
+  预留给未来 embedding、向量索引、召回；当前仅保留 schema 占位。
 
 ## 实现侧约定
 
-- 建议服务端维护 `string_dict` 的本地缓存：
-  `(semantic, value) -> id` 与 `id -> value` 两个方向均建议缓存，以减少高频查表、重复插入争用和读取侧反解开销。
-- `tweet_mention_ref`、`tweet_hashtag_ref`、`tweet_symbol_ref` 的数据来源应限定为 tweet 正文相关实体，写入时由应用层负责去重。
-- `user_professional.category_ids`、`annotated_text.hashtags`、`annotated_text.symbols` 的装配与反解由应用层承担，数据库不为复合类型内部元素建立物理外键。
+- 应用层 SQL 一律显式使用 schema-qualified 名称，例如 `tweet.tweet`、`iam.users`、`audit.audit_events`。
+- 不依赖 `search_path`，也不在配置系统、连接封装或 `DATABASE_URL` 上引入“默认 schema”概念。
+- `public` 不承载应用自有表、视图、类型或函数；仅允许保留扩展对象，例如 `public.citext`。
+- `tweet.string_dict` 继续采用进程内双向缓存：
+  `(semantic, value) -> id` 与 `id -> value`。
+
+## 当前已锁定的 tweet 侧方向
+
+- 字符串搜索外置：
+  数据库不承担全文检索、模糊匹配或 URL 搜索职责。
+- 富文本内联保留：
+  `tweet.annotated_text` 继续保留在正文、长文、bio 与社区附注等核心场景。
+- 关系表只做反查优化：
+  `tweet.tweet_media_ref`、`tweet.tweet_mention_ref`、`tweet.tweet_hashtag_ref`、`tweet.tweet_symbol_ref` 主要服务反向查询或顺序恢复。
+- 选择性外键策略保持不变：
+  直接卫星表与关系表保留物理外键；乱序、缺失、跨批次引用继续仅存 ID。
 
 ## 非目标
 
 - 不在数据库中引入 `tsvector`、`GIN`、`trgm` 或其他全文检索结构。
-- 不新增 URL 专用反查表或 URL 裁剪字段。
-- 不为了搜索系统预留额外同步列、镜像文本列或派生搜索索引字段。
-
-## 后续若需重新打开 DDL 的触发条件
-
-- 上游 `tweet-schema.ts` 再次删除、重命名或重构核心结构。
-- 当前维表或关系表在写入链路中证明存在不可接受的复杂度或一致性问题。
-- 外部搜索引擎接入后，确实需要数据库补充稳定的同步元数据，而该元数据无法在应用层自然生成。
+- 不为 `media`、`vector` schema 提前补充半成品业务表。
+- 不使用 schema 配置开关去隐藏数据库子系统边界。
