@@ -4,6 +4,7 @@
 
 - 当前 [tweet-v2-schema-draft.sql](/home/steven/code/tweet-db/docs/tweet-v2-schema-draft.sql) 已升级为数据库 bootstrap 草案，而不再只是单一 `public` schema 下的 tweet 表草稿。
 - 本轮 schema 分层已定稿，后续默认不再回到“全部对象落在 public”的组织方式。
+- 可执行 migration 已按子系统拆成多文件顺序执行；设计草案文件继续保留为单文件总览。
 
 ## 已锁定的 schema 划分
 
