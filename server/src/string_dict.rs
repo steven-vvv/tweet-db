@@ -18,6 +18,7 @@ pub enum StringSemantic {
     TweetCountryCode,
     TweetLanguageCode,
     TweetMediaAvailabilityStatus,
+    TweetMediaSensitivityCode,
     TweetMediaTagKind,
     TweetMediaResizeMode,
     TweetVideoContentType,
@@ -40,6 +41,7 @@ impl StringSemantic {
             Self::TweetCountryCode => "tweet_country_code",
             Self::TweetLanguageCode => "tweet_language_code",
             Self::TweetMediaAvailabilityStatus => "tweet_media_availability_status",
+            Self::TweetMediaSensitivityCode => "tweet_media_sensitivity_code",
             Self::TweetMediaTagKind => "tweet_media_tag_kind",
             Self::TweetMediaResizeMode => "tweet_media_resize_mode",
             Self::TweetVideoContentType => "tweet_video_content_type",
@@ -184,6 +186,7 @@ fn semantic_from_db(value: &str) -> StringSemantic {
         "tweet_country_code" => StringSemantic::TweetCountryCode,
         "tweet_language_code" => StringSemantic::TweetLanguageCode,
         "tweet_media_availability_status" => StringSemantic::TweetMediaAvailabilityStatus,
+        "tweet_media_sensitivity_code" => StringSemantic::TweetMediaSensitivityCode,
         "tweet_media_tag_kind" => StringSemantic::TweetMediaTagKind,
         "tweet_media_resize_mode" => StringSemantic::TweetMediaResizeMode,
         "tweet_video_content_type" => StringSemantic::TweetVideoContentType,
@@ -222,6 +225,10 @@ mod tests {
         assert_eq!(
             StringSemantic::TweetMediaResizeMode.as_db_str(),
             "tweet_media_resize_mode"
+        );
+        assert_eq!(
+            StringSemantic::TweetMediaSensitivityCode.as_db_str(),
+            "tweet_media_sensitivity_code"
         );
         assert_eq!(
             StringSemantic::TweetActionCode.as_db_str(),

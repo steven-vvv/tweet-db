@@ -337,6 +337,8 @@ pub struct Media {
     pub geometry: Option<MediaGeometry>,
     pub size_variants: Option<MediaSizeVariants>,
     pub tagged_users: Vec<MediaTag>,
+    #[serde(default)]
+    pub sensitivity_warnings: Vec<String>,
     pub origin_tweet_id: Option<i64>,
     pub origin_user_id: Option<i64>,
     pub details: Option<MediaDetails>,

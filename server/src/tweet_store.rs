@@ -41,7 +41,10 @@ impl<'a> TweetStore<'a> {
                 registered_at TIMESTAMPTZ
             )
             ON CONFLICT (id) DO UPDATE
-            SET registered_at = COALESCE(tweet.twitter_user.registered_at, EXCLUDED.registered_at)
+            SET registered_at = EXCLUDED.registered_at,
+                updated_at = NOW()
+            WHERE tweet.twitter_user.registered_at IS NULL
+              AND EXCLUDED.registered_at IS NOT NULL
             "#,
         )
         .bind(serde_json::to_value(users)?)
@@ -601,6 +604,7 @@ impl<'a> TweetStore<'a> {
                 geometry,
                 size_variants,
                 tagged_users,
+                sensitivity_warning_ids,
                 origin_tweet_id,
                 origin_user_id,
                 details
@@ -613,6 +617,7 @@ impl<'a> TweetStore<'a> {
                 item.geometry,
                 item.size_variants,
                 COALESCE(item.tagged_users, ARRAY[]::tweet.media_tag[]),
+                COALESCE(item.sensitivity_warning_ids, ARRAY[]::SMALLINT[]),
                 item.origin_tweet_id,
                 item.origin_user_id,
                 item.details
@@ -624,6 +629,7 @@ impl<'a> TweetStore<'a> {
                 geometry tweet.media_geometry,
                 size_variants tweet.media_size_variants,
                 tagged_users tweet.media_tag[],
+                sensitivity_warning_ids SMALLINT[],
                 origin_tweet_id BIGINT,
                 origin_user_id BIGINT,
                 details tweet.media_details
@@ -1115,6 +1121,14 @@ impl<'a> TweetStore<'a> {
                 None => None,
             },
             tagged_users: self.media_tag_payloads(&value.tagged_users).await?,
+            sensitivity_warning_ids: self
+                .string_dict
+                .ensure_ids(
+                    self.pool,
+                    StringSemantic::TweetMediaSensitivityCode,
+                    &value.sensitivity_warnings,
+                )
+                .await?,
             origin_tweet_id: value.origin_tweet_id,
             origin_user_id: value.origin_user_id,
             details: value.details.clone(),
@@ -1385,6 +1399,7 @@ struct MediaPayload {
     geometry: Option<MediaGeometry>,
     size_variants: Option<MediaSizeVariantsPayload>,
     tagged_users: Vec<MediaTagPayload>,
+    sensitivity_warning_ids: Vec<i16>,
     origin_tweet_id: Option<i64>,
     origin_user_id: Option<i64>,
     details: Option<MediaDetails>,

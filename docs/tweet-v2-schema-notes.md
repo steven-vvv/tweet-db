@@ -26,6 +26,10 @@
 - `public` 不承载应用自有表、视图、类型或函数；仅允许保留扩展对象，例如 `public.citext`。
 - `tweet.string_dict` 继续采用进程内双向缓存：
   `(semantic, value) -> id` 与 `id -> value`。
+- `tweet` 域新增媒体敏感性提示语义时，继续复用 `tweet.string_dict`，
+  不引入独立“自动枚举表”。
+- 插入时间统一使用 `created_at` / `updated_at` 命名；
+  `recorded_at` 仅保留给快照/时序表表示业务采样时间。
 
 ## 当前已锁定的 tweet 侧方向
 

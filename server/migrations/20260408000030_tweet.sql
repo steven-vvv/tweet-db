@@ -11,6 +11,7 @@ CREATE TYPE tweet.string_semantic_enum AS ENUM (
     'tweet_country_code',
     'tweet_language_code',
     'tweet_media_availability_status',
+    'tweet_media_sensitivity_code',
     'tweet_media_tag_kind',
     'tweet_media_resize_mode',
     'tweet_video_content_type',
@@ -221,7 +222,8 @@ $$;
 CREATE TABLE tweet.twitter_user (
     id BIGINT PRIMARY KEY,
     registered_at TIMESTAMPTZ,
-    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE tweet.user_snapshot (
@@ -315,7 +317,8 @@ CREATE TABLE tweet.tweet (
     quote_tweet_id BIGINT,
     quote_permalink tweet.resolved_url,
     repost_id BIGINT,
-    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE tweet.tweet_edit (
@@ -378,10 +381,12 @@ CREATE TABLE tweet.media (
     geometry tweet.media_geometry,
     size_variants tweet.media_size_variants,
     tagged_users tweet.media_tag[] NOT NULL DEFAULT ARRAY[]::tweet.media_tag[],
+    sensitivity_warning_ids SMALLINT[] NOT NULL DEFAULT ARRAY[]::SMALLINT[],
     origin_tweet_id BIGINT,
     origin_user_id BIGINT,
     details tweet.media_details,
-    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE tweet.media_resource (
