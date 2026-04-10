@@ -34,14 +34,14 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO twitter_user (id, registered_at)
+            INSERT INTO tweet.twitter_user (id, registered_at)
             SELECT item.id, item.registered_at
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 id BIGINT,
                 registered_at TIMESTAMPTZ
             )
             ON CONFLICT (id) DO UPDATE
-            SET registered_at = COALESCE(twitter_user.registered_at, EXCLUDED.registered_at)
+            SET registered_at = COALESCE(tweet.twitter_user.registered_at, EXCLUDED.registered_at)
             "#,
         )
         .bind(serde_json::to_value(users)?)
@@ -63,7 +63,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO user_snapshot (
+            INSERT INTO tweet.user_snapshot (
                 user_id,
                 recorded_at,
                 display_name,
@@ -91,7 +91,7 @@ impl<'a> TweetStore<'a> {
                 item.banner_url,
                 item.location,
                 item.bio,
-                COALESCE(item.profile_links, ARRAY[]::resolved_url[]),
+                COALESCE(item.profile_links, ARRAY[]::tweet.resolved_url[]),
                 item.identity,
                 item.features,
                 item.professional,
@@ -106,11 +106,11 @@ impl<'a> TweetStore<'a> {
                 avatar_shape_id SMALLINT,
                 banner_url TEXT,
                 location TEXT,
-                bio annotated_text,
-                profile_links resolved_url[],
-                identity user_identity,
-                features user_features,
-                professional user_professional,
+                bio tweet.annotated_text,
+                profile_links tweet.resolved_url[],
+                identity tweet.user_identity,
+                features tweet.user_features,
+                professional tweet.user_professional,
                 pinned_tweet_ids BIGINT[]
             )
             ON CONFLICT (user_id, recorded_at) DO NOTHING
@@ -130,7 +130,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO user_stats (
+            INSERT INTO tweet.user_stats (
                 user_id,
                 recorded_at,
                 followers,
@@ -179,7 +179,7 @@ impl<'a> TweetStore<'a> {
 
         let rows = sqlx::query(
             r#"
-            INSERT INTO user_category (source_category_code, name)
+            INSERT INTO tweet.user_category (source_category_code, name)
             SELECT item.source_category_code, item.name
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 source_category_code INTEGER,
@@ -213,7 +213,7 @@ impl<'a> TweetStore<'a> {
 
         let rows = sqlx::query(
             r#"
-            INSERT INTO hashtag (tag)
+            INSERT INTO tweet.hashtag (tag)
             SELECT item.tag
             FROM jsonb_to_recordset($1::jsonb) AS item(tag TEXT)
             ON CONFLICT (tag) DO UPDATE
@@ -238,7 +238,7 @@ impl<'a> TweetStore<'a> {
 
         let rows = sqlx::query(
             r#"
-            INSERT INTO symbol (symbol, ticker, name)
+            INSERT INTO tweet.symbol (symbol, ticker, name)
             SELECT item.symbol, item.ticker, item.name
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 symbol TEXT,
@@ -274,7 +274,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet_place (
+            INSERT INTO tweet.tweet_place (
                 id,
                 name,
                 full_name,
@@ -298,7 +298,7 @@ impl<'a> TweetStore<'a> {
                 country_id SMALLINT,
                 country_code_id SMALLINT,
                 kind_id SMALLINT,
-                boundary geo_point[]
+                boundary tweet.geo_point[]
             )
             ON CONFLICT (id) DO UPDATE
             SET name = EXCLUDED.name,
@@ -329,7 +329,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet (
+            INSERT INTO tweet.tweet (
                 id,
                 published_at,
                 source_id,
@@ -368,15 +368,15 @@ impl<'a> TweetStore<'a> {
                 source_id SMALLINT,
                 author_id BIGINT,
                 place_id TEXT,
-                legacy_text annotated_text,
+                legacy_text tweet.annotated_text,
                 note_id TEXT,
-                note_text annotated_text,
+                note_text tweet.annotated_text,
                 language_id SMALLINT,
                 conversation_id BIGINT,
                 reply_to_tweet_id BIGINT,
                 reply_to_user_id BIGINT,
                 quote_tweet_id BIGINT,
-                quote_permalink resolved_url,
+                quote_permalink tweet.resolved_url,
                 repost_id BIGINT
             )
             ON CONFLICT (id) DO NOTHING
@@ -396,7 +396,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet_edit (tweet_id, version_ids, editable_until, remaining_edits)
+            INSERT INTO tweet.tweet_edit (tweet_id, version_ids, editable_until, remaining_edits)
             SELECT
                 item.tweet_id,
                 COALESCE(item.version_ids, ARRAY[]::BIGINT[]),
@@ -434,7 +434,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet_policy (
+            INSERT INTO tweet.tweet_policy (
                 tweet_id,
                 reply_policy_id,
                 followers_only,
@@ -484,7 +484,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet_stats (
+            INSERT INTO tweet.tweet_stats (
                 tweet_id,
                 recorded_at,
                 views,
@@ -538,7 +538,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO tweet_community_note (
+            INSERT INTO tweet.tweet_community_note (
                 tweet_id,
                 note_id,
                 title,
@@ -560,8 +560,8 @@ impl<'a> TweetStore<'a> {
                 note_id BIGINT,
                 title TEXT,
                 short_title TEXT,
-                subtitle annotated_text,
-                footer annotated_text,
+                subtitle tweet.annotated_text,
+                footer tweet.annotated_text,
                 destination_url TEXT
             )
             ON CONFLICT (tweet_id) DO UPDATE
@@ -593,7 +593,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO media (
+            INSERT INTO tweet.media (
                 id,
                 type,
                 alt_text,
@@ -612,21 +612,21 @@ impl<'a> TweetStore<'a> {
                 item.grok_post_id,
                 item.geometry,
                 item.size_variants,
-                COALESCE(item.tagged_users, ARRAY[]::media_tag[]),
+                COALESCE(item.tagged_users, ARRAY[]::tweet.media_tag[]),
                 item.origin_tweet_id,
                 item.origin_user_id,
                 item.details
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 id BIGINT,
-                media_type media_type_enum,
+                media_type tweet.media_type_enum,
                 alt_text TEXT,
                 grok_post_id UUID,
-                geometry media_geometry,
-                size_variants media_size_variants,
-                tagged_users media_tag[],
+                geometry tweet.media_geometry,
+                size_variants tweet.media_size_variants,
+                tagged_users tweet.media_tag[],
                 origin_tweet_id BIGINT,
                 origin_user_id BIGINT,
-                details media_details
+                details tweet.media_details
             )
             ON CONFLICT (id) DO NOTHING
             "#,
@@ -650,7 +650,7 @@ impl<'a> TweetStore<'a> {
 
         let result = sqlx::query(
             r#"
-            INSERT INTO media_resource (
+            INSERT INTO tweet.media_resource (
                 media_id,
                 recorded_at,
                 media_url,
@@ -668,7 +668,7 @@ impl<'a> TweetStore<'a> {
                 recorded_at TIMESTAMPTZ,
                 media_url TEXT,
                 availability_id SMALLINT,
-                video media_video
+                video tweet.media_video
             )
             ON CONFLICT (media_id, recorded_at) DO NOTHING
             "#,
@@ -688,9 +688,9 @@ impl<'a> TweetStore<'a> {
         self.replace_tweet_relations(
             tweet_ids,
             refs,
-            "DELETE FROM tweet_media_ref WHERE tweet_id = ANY($1)",
+            "DELETE FROM tweet.tweet_media_ref WHERE tweet_id = ANY($1)",
             r#"
-            INSERT INTO tweet_media_ref (tweet_id, media_id, display_order)
+            INSERT INTO tweet.tweet_media_ref (tweet_id, media_id, display_order)
             SELECT item.tweet_id, item.media_id, item.display_order
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 tweet_id BIGINT,
@@ -710,9 +710,9 @@ impl<'a> TweetStore<'a> {
         self.replace_tweet_relations(
             tweet_ids,
             refs,
-            "DELETE FROM tweet_mention_ref WHERE tweet_id = ANY($1)",
+            "DELETE FROM tweet.tweet_mention_ref WHERE tweet_id = ANY($1)",
             r#"
-            INSERT INTO tweet_mention_ref (tweet_id, user_id)
+            INSERT INTO tweet.tweet_mention_ref (tweet_id, user_id)
             SELECT item.tweet_id, item.user_id
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 tweet_id BIGINT,
@@ -731,9 +731,9 @@ impl<'a> TweetStore<'a> {
         self.replace_tweet_relations(
             tweet_ids,
             refs,
-            "DELETE FROM tweet_hashtag_ref WHERE tweet_id = ANY($1)",
+            "DELETE FROM tweet.tweet_hashtag_ref WHERE tweet_id = ANY($1)",
             r#"
-            INSERT INTO tweet_hashtag_ref (tweet_id, hashtag_id)
+            INSERT INTO tweet.tweet_hashtag_ref (tweet_id, hashtag_id)
             SELECT item.tweet_id, item.hashtag_id
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 tweet_id BIGINT,
@@ -752,9 +752,9 @@ impl<'a> TweetStore<'a> {
         self.replace_tweet_relations(
             tweet_ids,
             refs,
-            "DELETE FROM tweet_symbol_ref WHERE tweet_id = ANY($1)",
+            "DELETE FROM tweet.tweet_symbol_ref WHERE tweet_id = ANY($1)",
             r#"
-            INSERT INTO tweet_symbol_ref (tweet_id, symbol_id)
+            INSERT INTO tweet.tweet_symbol_ref (tweet_id, symbol_id)
             SELECT item.tweet_id, item.symbol_id
             FROM jsonb_to_recordset($1::jsonb) AS item(
                 tweet_id BIGINT,
@@ -767,7 +767,7 @@ impl<'a> TweetStore<'a> {
 
     pub async fn fetch_latest_user_snapshot_json(&self, user_id: i64) -> AppResult<Option<Value>> {
         sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(view_row) FROM v_latest_user_snapshot AS view_row WHERE user_id = $1",
+            "SELECT to_jsonb(view_row) FROM tweet.v_latest_user_snapshot AS view_row WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(self.pool)
@@ -777,7 +777,7 @@ impl<'a> TweetStore<'a> {
 
     pub async fn fetch_latest_user_stats_json(&self, user_id: i64) -> AppResult<Option<Value>> {
         sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(view_row) FROM v_latest_user_stats AS view_row WHERE user_id = $1",
+            "SELECT to_jsonb(view_row) FROM tweet.v_latest_user_stats AS view_row WHERE user_id = $1",
         )
         .bind(user_id)
         .fetch_optional(self.pool)
@@ -787,7 +787,7 @@ impl<'a> TweetStore<'a> {
 
     pub async fn fetch_latest_tweet_stats_json(&self, tweet_id: i64) -> AppResult<Option<Value>> {
         sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(view_row) FROM v_latest_tweet_stats AS view_row WHERE tweet_id = $1",
+            "SELECT to_jsonb(view_row) FROM tweet.v_latest_tweet_stats AS view_row WHERE tweet_id = $1",
         )
         .bind(tweet_id)
         .fetch_optional(self.pool)
@@ -800,7 +800,7 @@ impl<'a> TweetStore<'a> {
         media_id: i64,
     ) -> AppResult<Option<Value>> {
         sqlx::query_scalar::<_, Value>(
-            "SELECT to_jsonb(view_row) FROM v_latest_media_resource AS view_row WHERE media_id = $1",
+            "SELECT to_jsonb(view_row) FROM tweet.v_latest_media_resource AS view_row WHERE media_id = $1",
         )
         .bind(media_id)
         .fetch_optional(self.pool)

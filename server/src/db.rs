@@ -64,7 +64,7 @@ pub async fn delete_expired_pending_sso_logins(
     pool: &PgPool,
     now: OffsetDateTime,
 ) -> AppResult<u64> {
-    let result = sqlx::query("DELETE FROM pending_sso_logins WHERE expires_at <= $1")
+    let result = sqlx::query("DELETE FROM iam.pending_sso_logins WHERE expires_at <= $1")
         .bind(now)
         .execute(pool)
         .await?;
@@ -79,7 +79,7 @@ pub async fn insert_pending_sso_login(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO pending_sso_logins (state, code_verifier, expires_at)
+        INSERT INTO iam.pending_sso_logins (state, code_verifier, expires_at)
         VALUES ($1, $2, $3)
         ON CONFLICT (state) DO UPDATE
         SET code_verifier = EXCLUDED.code_verifier,
@@ -104,7 +104,7 @@ pub async fn consume_pending_sso_login(
     let row = sqlx::query(
         r#"
         SELECT state, code_verifier, expires_at
-        FROM pending_sso_logins
+        FROM iam.pending_sso_logins
         WHERE state = $1
         "#,
     )
@@ -112,7 +112,7 @@ pub async fn consume_pending_sso_login(
     .fetch_optional(&mut *tx)
     .await?;
 
-    sqlx::query("DELETE FROM pending_sso_logins WHERE state = $1")
+    sqlx::query("DELETE FROM iam.pending_sso_logins WHERE state = $1")
         .bind(state)
         .execute(&mut *tx)
         .await?;
@@ -141,7 +141,7 @@ pub async fn upsert_authorization(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO user_sso_authorizations (
+        INSERT INTO iam.user_sso_authorizations (
             authorization_id,
             sso_subject_id,
             user_id,
@@ -155,7 +155,7 @@ pub async fn upsert_authorization(
         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
         ON CONFLICT (authorization_id) DO UPDATE
         SET sso_subject_id = EXCLUDED.sso_subject_id,
-            user_id = COALESCE(EXCLUDED.user_id, user_sso_authorizations.user_id),
+            user_id = COALESCE(EXCLUDED.user_id, iam.user_sso_authorizations.user_id),
             status = EXCLUDED.status,
             last_checked_at = EXCLUDED.last_checked_at,
             remote_expires_at = EXCLUDED.remote_expires_at,
@@ -183,8 +183,8 @@ pub async fn find_subject_binding(
     let row = sqlx::query(
         r#"
         SELECT u.id AS user_id, u.username::text AS username, us.sso_subject_id
-        FROM user_sso_subjects us
-        INNER JOIN users u ON u.id = us.user_id
+        FROM iam.user_sso_subjects us
+        INNER JOIN iam.users u ON u.id = us.user_id
         WHERE us.sso_subject_id = $1
         "#,
     )
@@ -213,7 +213,7 @@ pub async fn create_session(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO sessions (
+        INSERT INTO iam.sessions (
             selector,
             verifier_hash,
             user_id,
@@ -259,9 +259,9 @@ pub async fn find_session(pool: &PgPool, selector: Uuid) -> AppResult<Option<Ses
             a.status AS authorization_status,
             a.last_checked_at AS authorization_last_checked_at,
             a.remote_expires_at AS authorization_remote_expires_at
-        FROM sessions s
-        LEFT JOIN users u ON u.id = s.user_id
-        INNER JOIN user_sso_authorizations a ON a.authorization_id = s.authorization_id
+        FROM iam.sessions s
+        LEFT JOIN iam.users u ON u.id = s.user_id
+        INNER JOIN iam.user_sso_authorizations a ON a.authorization_id = s.authorization_id
         WHERE s.selector = $1
         "#,
     )
@@ -296,7 +296,7 @@ pub async fn touch_session(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        UPDATE sessions
+        UPDATE iam.sessions
         SET last_seen_at = $2,
             expires_at = $3
         WHERE selector = $1
@@ -312,7 +312,7 @@ pub async fn touch_session(
 }
 
 pub async fn delete_session(pool: &PgPool, selector: Uuid) -> AppResult<()> {
-    sqlx::query("DELETE FROM sessions WHERE selector = $1")
+    sqlx::query("DELETE FROM iam.sessions WHERE selector = $1")
         .bind(selector)
         .execute(pool)
         .await?;
@@ -323,7 +323,7 @@ pub async fn delete_sessions_by_authorization(
     pool: &PgPool,
     authorization_id: Uuid,
 ) -> AppResult<u64> {
-    let result = sqlx::query("DELETE FROM sessions WHERE authorization_id = $1")
+    let result = sqlx::query("DELETE FROM iam.sessions WHERE authorization_id = $1")
         .bind(authorization_id)
         .execute(pool)
         .await?;
@@ -344,7 +344,7 @@ pub async fn find_authorization(
             last_checked_at,
             remote_expires_at,
             revoked_at
-        FROM user_sso_authorizations
+        FROM iam.user_sso_authorizations
         WHERE authorization_id = $1
         "#,
     )
@@ -373,7 +373,7 @@ pub async fn update_authorization_status(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        UPDATE user_sso_authorizations
+        UPDATE iam.user_sso_authorizations
         SET status = $2,
             last_checked_at = $3,
             remote_expires_at = $4,
@@ -403,7 +403,7 @@ pub async fn insert_audit_event(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO audit_events (id, actor_user_id, event_type, resource_type, resource_id, details)
+        INSERT INTO audit.audit_events (id, actor_user_id, event_type, resource_type, resource_id, details)
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
@@ -429,7 +429,7 @@ pub async fn insert_audit_event_tx(
 ) -> AppResult<()> {
     sqlx::query(
         r#"
-        INSERT INTO audit_events (id, actor_user_id, event_type, resource_type, resource_id, details)
+        INSERT INTO audit.audit_events (id, actor_user_id, event_type, resource_type, resource_id, details)
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
     )
@@ -458,7 +458,7 @@ pub async fn bind_username_to_subject(
 
     let user_insert = sqlx::query(
         r#"
-        INSERT INTO users (id, username, created_at, updated_at)
+        INSERT INTO iam.users (id, username, created_at, updated_at)
         VALUES ($1, $2, $3, $3)
         "#,
     )
@@ -480,7 +480,7 @@ pub async fn bind_username_to_subject(
 
     sqlx::query(
         r#"
-        INSERT INTO user_sso_subjects (id, user_id, sso_subject_id, created_at)
+        INSERT INTO iam.user_sso_subjects (id, user_id, sso_subject_id, created_at)
         VALUES ($1, $2, $3, $4)
         "#,
     )
@@ -493,7 +493,7 @@ pub async fn bind_username_to_subject(
 
     sqlx::query(
         r#"
-        UPDATE user_sso_authorizations
+        UPDATE iam.user_sso_authorizations
         SET user_id = $2,
             updated_at = NOW()
         WHERE authorization_id = $1
@@ -506,7 +506,7 @@ pub async fn bind_username_to_subject(
 
     sqlx::query(
         r#"
-        UPDATE sessions
+        UPDATE iam.sessions
         SET user_id = $2,
             registration_state = 'active'
         WHERE selector = $1

@@ -79,7 +79,7 @@ impl StringDictCache {
         let rows = sqlx::query(
             r#"
             SELECT id, semantic::text AS semantic, value
-            FROM string_dict
+            FROM tweet.string_dict
             ORDER BY id ASC
             "#,
         )
@@ -130,12 +130,13 @@ impl StringDictCache {
             return Ok(Some(id));
         }
 
-        let id =
-            sqlx::query_scalar::<_, Option<i16>>("SELECT dict_id($1::string_semantic_enum, $2)")
-                .bind(semantic.as_db_str())
-                .bind(&value)
-                .fetch_one(pool)
-                .await?;
+        let id = sqlx::query_scalar::<_, Option<i16>>(
+            "SELECT tweet.dict_id($1::tweet.string_semantic_enum, $2)",
+        )
+        .bind(semantic.as_db_str())
+        .bind(&value)
+        .fetch_one(pool)
+        .await?;
 
         if let Some(id) = id {
             self.insert_cached(id, semantic, value).await;

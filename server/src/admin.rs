@@ -156,7 +156,7 @@ pub async fn list_users(
     let rows = sqlx::query(
         r#"
         SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
-        FROM users
+        FROM iam.users
         WHERE (
                 $1::text = 'all'
             OR ($1 = 'active' AND disabled_at IS NULL)
@@ -232,7 +232,7 @@ pub async fn get_user(
                 SELECT jsonb_agg(to_jsonb(t))
                 FROM (
                     SELECT selector, user_id, sso_subject_id, authorization_id, registration_state, expires_at, last_seen_at, created_at
-                    FROM sessions
+                    FROM iam.sessions
                     WHERE user_id = u.id
                     ORDER BY created_at DESC
                     LIMIT 20
@@ -242,7 +242,7 @@ pub async fn get_user(
                 SELECT jsonb_agg(to_jsonb(t))
                 FROM (
                     SELECT authorization_id, sso_subject_id, user_id, status, last_checked_at, remote_expires_at, revoked_at, created_at, updated_at
-                    FROM user_sso_authorizations
+                    FROM iam.user_sso_authorizations
                     WHERE user_id = u.id
                     ORDER BY created_at DESC
                     LIMIT 20
@@ -252,14 +252,14 @@ pub async fn get_user(
                 SELECT jsonb_agg(to_jsonb(t))
                 FROM (
                     SELECT id, actor_user_id, event_type, resource_type, resource_id, details, created_at
-                    FROM audit_events
+                    FROM audit.audit_events
                     WHERE resource_type = 'user'
                       AND resource_id = u.id::text
                     ORDER BY created_at DESC
                     LIMIT 20
                 ) t
             ), '[]'::jsonb) AS audit_events
-        FROM users u
+        FROM iam.users u
         WHERE u.id = $1
         "#,
     )
@@ -306,7 +306,7 @@ pub async fn disable_user(
     let existing = sqlx::query(
         r#"
         SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
-        FROM users
+        FROM iam.users
         WHERE id = $1
         FOR UPDATE
         "#,
@@ -321,7 +321,7 @@ pub async fn disable_user(
     if already_disabled.is_none() {
         sqlx::query(
             r#"
-            UPDATE users
+            UPDATE iam.users
             SET disabled_at = $2,
                 disabled_by_user_id = $3,
                 updated_at = NOW()
@@ -334,7 +334,7 @@ pub async fn disable_user(
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        sqlx::query("DELETE FROM iam.sessions WHERE user_id = $1")
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
@@ -371,7 +371,7 @@ pub async fn enable_user(
     let existing = sqlx::query(
         r#"
         SELECT id, disabled_at
-        FROM users
+        FROM iam.users
         WHERE id = $1
         FOR UPDATE
         "#,
@@ -385,7 +385,7 @@ pub async fn enable_user(
     if disabled_at.is_some() {
         sqlx::query(
             r#"
-            UPDATE users
+            UPDATE iam.users
             SET disabled_at = NULL,
                 disabled_by_user_id = NULL,
                 updated_at = NOW()
@@ -423,7 +423,7 @@ async fn fetch_user_summary_json_tx(
     let row = sqlx::query(
         r#"
         SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
-        FROM users
+        FROM iam.users
         WHERE id = $1
         "#,
     )
