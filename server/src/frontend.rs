@@ -124,6 +124,7 @@ mod tests {
                 ingest: IngestSection {
                     max_items_per_batch: 5000,
                     actor_metrics_min_interval_seconds: 86_400,
+                    stats_sample_interval_seconds: 3_600,
                 },
                 storage: StorageSection {
                     provider: "s3_compatible".to_owned(),

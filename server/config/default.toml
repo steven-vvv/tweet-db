@@ -30,6 +30,7 @@ authorization_cache_ttl_seconds = 300
 [ingest]
 max_items_per_batch = 5000
 actor_metrics_min_interval_seconds = 86400
+stats_sample_interval_seconds = 3600
 
 [storage]
 provider = "s3_compatible"

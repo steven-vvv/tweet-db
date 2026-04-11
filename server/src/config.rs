@@ -105,6 +105,18 @@ impl AppConfig {
     }
 
     fn validate(&self) -> AppResult<()> {
+        if self.ingest.max_items_per_batch == 0 {
+            return Err(AppError::config(
+                "ingest.max_items_per_batch must be greater than 0",
+            ));
+        }
+
+        if self.ingest.stats_sample_interval_seconds <= 0 {
+            return Err(AppError::config(
+                "ingest.stats_sample_interval_seconds must be greater than 0",
+            ));
+        }
+
         if self.server.mode != ServerMode::Https {
             return Ok(());
         }
@@ -201,6 +213,7 @@ pub struct SsoSection {
 pub struct IngestSection {
     pub max_items_per_batch: usize,
     pub actor_metrics_min_interval_seconds: i64,
+    pub stats_sample_interval_seconds: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -529,6 +542,31 @@ private_key_path = "missing.key"
         );
     }
 
+    #[test]
+    fn rejects_nonpositive_stats_sample_interval() {
+        let temp_dir = TempDir::new();
+        let config = test_config(
+            r#"
+listen_addr = "127.0.0.1:3001"
+webui_dist_dir = "../../webui/dist"
+"#,
+            "http://127.0.0.1:3001",
+            false,
+            "http://127.0.0.1:3001/integrations/sso/callback",
+        )
+        .replace(
+            "stats_sample_interval_seconds = 3600",
+            "stats_sample_interval_seconds = 0",
+        );
+        let config_path = temp_dir.write("config.toml", &config);
+
+        let error = AppConfig::load(Some(&config_path)).unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Config(message) if message.contains("ingest.stats_sample_interval_seconds"))
+        );
+    }
+
     fn test_config(
         server_body: &str,
         app_base_url: &str,
@@ -561,6 +599,7 @@ authorization_cache_ttl_seconds = 300
 [ingest]
 max_items_per_batch = 5000
 actor_metrics_min_interval_seconds = 86400
+stats_sample_interval_seconds = 3600
 
 [storage]
 provider = "s3_compatible"

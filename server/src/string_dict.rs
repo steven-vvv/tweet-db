@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
@@ -160,6 +163,73 @@ impl StringDictCache {
             }
         }
         Ok(ids)
+    }
+
+    pub async fn ensure_many<I>(&self, pool: &PgPool, values: I) -> AppResult<()>
+    where
+        I: IntoIterator<Item = (StringSemantic, String)>,
+    {
+        #[derive(serde::Serialize)]
+        struct EnsureManyInput {
+            semantic: &'static str,
+            value: String,
+        }
+
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for (semantic, value) in values {
+            let Some(value) = normalize_value(&value) else {
+                continue;
+            };
+            if !seen.insert((semantic, value.clone())) {
+                continue;
+            }
+            if self.get_id(semantic, &value).await.is_some() {
+                continue;
+            }
+            missing.push(EnsureManyInput {
+                semantic: semantic.as_db_str(),
+                value,
+            });
+        }
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH input AS (
+                SELECT DISTINCT
+                    item.semantic::tweet.string_semantic_enum AS semantic,
+                    btrim(item.value) AS value
+                FROM jsonb_to_recordset($1::jsonb) AS item(
+                    semantic TEXT,
+                    value TEXT
+                )
+                WHERE item.value IS NOT NULL
+                  AND btrim(item.value) <> ''
+            )
+            SELECT
+                input.semantic::text AS semantic,
+                input.value,
+                tweet.dict_id(input.semantic, input.value) AS id
+            FROM input
+            "#,
+        )
+        .bind(serde_json::to_value(missing)?)
+        .fetch_all(pool)
+        .await?;
+
+        for row in rows {
+            let semantic = semantic_from_db(row.get::<String, _>("semantic").as_str());
+            let value = row.get::<String, _>("value");
+            if let Some(id) = row.get::<Option<i16>, _>("id") {
+                self.insert_cached(id, semantic, value).await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn insert_cached(&self, id: i16, semantic: StringSemantic, value: String) {

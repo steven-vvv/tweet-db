@@ -10,6 +10,11 @@ The expected integration model is a Tampermonkey script using `GM_*` privileged 
 - [`docs/internal-api.md`](docs/internal-api.md): internal-only API under `/internal/v1/...`
 - [`docs/integrations.md`](docs/integrations.md): external integration entrypoints under `/integrations/...`
 
+## Design Docs
+
+- [`docs/tweet-v2-schema-design.md`](docs/tweet-v2-schema-design.md): tweet v2 table relations and write policy
+- [`docs/tweet-v2-schema-notes.md`](docs/tweet-v2-schema-notes.md): tweet v2 schema organization notes
+
 ## Layout
 
 - `server/`: Rust backend and database migrations

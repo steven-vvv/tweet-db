@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{admin, auth, db, error::AppResult, state::AppState};
+use crate::{admin, auth, db, error::AppResult, state::AppState, tweet_query, tweet_submit};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -41,6 +41,11 @@ fn internal_api_routes() -> Router<AppState> {
             "/internal/v1/auth/registration",
             post(auth::internal_register_complete),
         )
+        .route(
+            "/internal/v1/tweet/submit",
+            post(tweet_submit::submit_tweets),
+        )
+        .route("/internal/v1/tweet/query", post(tweet_query::query_tweets))
 }
 
 fn admin_api_routes() -> Router<AppState> {
@@ -128,6 +133,7 @@ mod tests {
                 ingest: IngestSection {
                     max_items_per_batch: 5000,
                     actor_metrics_min_interval_seconds: 86_400,
+                    stats_sample_interval_seconds: 3_600,
                 },
                 storage: StorageSection {
                     provider: "s3_compatible".to_owned(),
@@ -214,6 +220,20 @@ mod tests {
             (
                 Request::get("/internal/v1/admin/users")
                     .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::post("/internal/v1/tweet/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
+                    .unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::post("/internal/v1/tweet/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
                     .unwrap(),
                 StatusCode::UNAUTHORIZED,
             ),
