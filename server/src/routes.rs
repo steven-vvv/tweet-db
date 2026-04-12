@@ -28,7 +28,10 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
 }
 
 fn public_api_routes() -> Router<AppState> {
-    Router::new().route("/api/v1/session", get(auth::session_me))
+    Router::new()
+        .route("/api/v1/session", get(auth::session_me))
+        .route("/api/v1/tweet/submit", post(tweet_submit::submit_tweets))
+        .route("/api/v1/tweet/query", post(tweet_query::query_tweets))
 }
 
 fn internal_api_routes() -> Router<AppState> {
@@ -41,11 +44,6 @@ fn internal_api_routes() -> Router<AppState> {
             "/internal/v1/auth/registration",
             post(auth::internal_register_complete),
         )
-        .route(
-            "/internal/v1/tweet/submit",
-            post(tweet_submit::submit_tweets),
-        )
-        .route("/internal/v1/tweet/query", post(tweet_query::query_tweets))
 }
 
 fn admin_api_routes() -> Router<AppState> {
@@ -224,18 +222,32 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
             ),
             (
-                Request::post("/internal/v1/tweet/submit")
+                Request::post("/api/v1/tweet/submit")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
                     .unwrap(),
                 StatusCode::UNAUTHORIZED,
             ),
             (
-                Request::post("/internal/v1/tweet/query")
+                Request::post("/api/v1/tweet/query")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
                     .unwrap(),
                 StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::post("/internal/v1/tweet/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
+                    .unwrap(),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Request::post("/internal/v1/tweet/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))
+                    .unwrap(),
+                StatusCode::NOT_FOUND,
             ),
             (
                 Request::get("/internal/v1/admin/posts")
