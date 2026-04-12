@@ -2,7 +2,7 @@
 
 Centralized post capture storage and status service built with Axum, PostgreSQL, and Vue.
 
-The expected integration model is a Tampermonkey script using `GM_*` privileged network APIs as a centralized client for this service. Public API consumers only need one session-check endpoint plus post ingest/query endpoints; login and first-time registration are handled separately through the built-in `/account` SPA.
+The expected integration model is a Tampermonkey script using `GM_*` privileged network APIs as a centralized client for this service. Public API consumers use the session-check endpoint plus batch tweet submit/query endpoints; query requires a registered session, while submit is restricted to admin sessions. Login and first-time registration are handled separately through the built-in `/account` SPA.
 
 ## API Docs
 
