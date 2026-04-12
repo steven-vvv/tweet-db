@@ -110,7 +110,9 @@ pub async fn session_cookie_middleware(
     mut request: Request,
     next: Next,
 ) -> AppResult<Response> {
-    let cookie_action = resolve_request_session(&state, &jar, request.extensions_mut()).await?;
+    let auto_renew_session = should_auto_renew_session(request.uri().path());
+    let cookie_action =
+        resolve_request_session(&state, &jar, request.extensions_mut(), auto_renew_session).await?;
     let mut response = next.run(request).await;
     apply_cookie_action(&state, &mut response, cookie_action);
     Ok(response)
@@ -394,6 +396,7 @@ async fn resolve_request_session(
     state: &AppState,
     jar: &CookieJar,
     extensions: &mut Extensions,
+    auto_renew_session: bool,
 ) -> AppResult<CookieAction> {
     let Some(cookie) = jar.get(&state.settings.config.session.cookie_name) else {
         return Ok(CookieAction::None);
@@ -440,7 +443,7 @@ async fn resolve_request_session(
         AuthorizationRefreshOutcome::Revoked => return Ok(CookieAction::Clear),
     }
 
-    if state.settings.config.session.auto_renew {
+    if state.settings.config.session.auto_renew && auto_renew_session {
         let expires_at =
             session_expires_at(&state.settings.config.session, session.created_at, now);
         db::touch_session(&state.db, selector, now, expires_at).await?;
@@ -451,14 +454,20 @@ async fn resolve_request_session(
         record: session.clone(),
     });
 
-    Ok(if state.settings.config.session.auto_renew {
-        CookieAction::Renew {
-            value: cookie.value().to_owned(),
-            expires_at: session.expires_at,
-        }
-    } else {
-        CookieAction::None
-    })
+    Ok(
+        if state.settings.config.session.auto_renew && auto_renew_session {
+            CookieAction::Renew {
+                value: cookie.value().to_owned(),
+                expires_at: session.expires_at,
+            }
+        } else {
+            CookieAction::None
+        },
+    )
+}
+
+fn should_auto_renew_session(path: &str) -> bool {
+    !matches!(path, "/api/v1/tweet/submit" | "/api/v1/tweet/query")
 }
 
 fn apply_cookie_action(state: &AppState, response: &mut Response, action: CookieAction) {
@@ -888,5 +897,12 @@ mod tests {
         assert!(response.registered);
         assert!(response.is_admin);
         assert!(!response.disabled);
+    }
+
+    #[test]
+    fn batch_tweet_apis_skip_session_auto_renew() {
+        assert!(!should_auto_renew_session("/api/v1/tweet/submit"));
+        assert!(!should_auto_renew_session("/api/v1/tweet/query"));
+        assert!(should_auto_renew_session("/api/v1/session"));
     }
 }

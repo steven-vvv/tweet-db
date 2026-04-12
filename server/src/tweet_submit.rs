@@ -636,7 +636,7 @@ pub async fn submit_tweets(
     let store = TweetStore::new(&state.db, &state.string_dict);
     let stats_interval = state.settings.config.ingest.stats_sample_interval_seconds;
     let mut prepared = prepare_submit_batch(&store, payload).await;
-    execute_prepared_submit(&state, &store, &mut prepared, stats_interval).await;
+    execute_prepared_submit(&store, &mut prepared, stats_interval).await;
 
     let mut response = SubmitTweetResponse {
         users: prepared
@@ -712,7 +712,6 @@ struct IndexedTweetRelations {
     index: usize,
     tweet_id: i64,
     media_refs: Vec<TweetMediaRef>,
-    media_ref_count: usize,
     mention_refs: Vec<TweetMentionRef>,
     hashtag_refs: Vec<TweetHashtagRef>,
     symbol_refs: Vec<TweetSymbolRef>,
@@ -836,6 +835,12 @@ async fn prepare_submit_batch(
         payload.tweets.len(),
         payload.media.len(),
     );
+    let last_user_indices =
+        collect_last_valid_i64_indices(&payload.users, "user.id", |user| &user.id);
+    let last_tweet_indices =
+        collect_last_valid_i64_indices(&payload.tweets, "tweet.id", |tweet| &tweet.id);
+    let last_media_indices =
+        collect_last_valid_i64_indices(&payload.media, "media.id", |media| &media.id);
 
     for (index, user) in payload.users.into_iter().enumerate() {
         let now = OffsetDateTime::now_utc();
@@ -848,6 +853,11 @@ async fn prepare_submit_batch(
                 continue;
             }
         };
+        if last_user_indices.get(&user_id).copied() != Some(index) {
+            result.skipped("input", "shadowed_by_duplicate_input");
+            prepared.user_results.push(result);
+            continue;
+        }
 
         prepared.users.push(Indexed {
             index,
@@ -893,6 +903,11 @@ async fn prepare_submit_batch(
                 continue;
             }
         };
+        if last_media_indices.get(&media_id).copied() != Some(index) {
+            result.skipped("input", "shadowed_by_duplicate_input");
+            prepared.media_results.push(result);
+            continue;
+        }
 
         match convert_media(media_id, &media) {
             Ok(model) => prepared.media.push(Indexed {
@@ -926,6 +941,11 @@ async fn prepare_submit_batch(
                 continue;
             }
         };
+        if last_tweet_indices.get(&tweet_id).copied() != Some(index) {
+            result.skipped("input", "shadowed_by_duplicate_input");
+            prepared.tweet_results.push(result);
+            continue;
+        }
         let author_id = match parse_i64_id(&tweet.author_id, "tweet.authorId") {
             Ok(id) => id,
             Err(error) => {
@@ -1010,7 +1030,6 @@ async fn prepare_submit_batch(
             index,
             tweet_id,
             media_refs: converted.media_refs,
-            media_ref_count: converted.media_ref_count,
             mention_refs: converted.mention_refs,
             hashtag_refs: converted.hashtag_refs,
             symbol_refs: converted.symbol_refs,
@@ -1023,23 +1042,87 @@ async fn prepare_submit_batch(
 }
 
 async fn execute_prepared_submit(
-    state: &AppState,
     store: &TweetStore<'_>,
     prepared: &mut PreparedSubmitBatch,
     stats_interval: i64,
 ) {
-    write_user_batch(
+    let snapshots = prepared
+        .user_snapshots
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let places = prepared
+        .tweet_places
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let tweets = prepared
+        .tweets
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let policies = prepared
+        .tweet_policies
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let notes = prepared
+        .tweet_community_notes
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let media = prepared
+        .media
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    let resources = prepared
+        .media_resources
+        .iter()
+        .map(|item| item.value.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = store
+        .preload_submit_batch_dicts(
+            &snapshots, &places, &tweets, &policies, &notes, &media, &resources,
+        )
+        .await
+    {
+        let mut user_indices = HashSet::new();
+        user_indices.extend(prepared.users.iter().map(|item| item.index));
+        user_indices.extend(prepared.user_snapshots.iter().map(|item| item.index));
+        user_indices.extend(prepared.user_stats.iter().map(|item| item.index));
+        for index in user_indices {
+            prepared.user_results[index].failed("dict_preload", error.to_string());
+        }
+
+        let mut tweet_indices = HashSet::new();
+        tweet_indices.extend(prepared.tweet_authors.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_places.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweets.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_edits.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_policies.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_community_notes.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_stats.iter().map(|item| item.index));
+        tweet_indices.extend(prepared.tweet_relations.iter().map(|item| item.index));
+        for index in tweet_indices {
+            prepared.tweet_results[index].failed("dict_preload", error.to_string());
+        }
+
+        let mut media_indices = HashSet::new();
+        media_indices.extend(prepared.media.iter().map(|item| item.index));
+        media_indices.extend(prepared.media_resources.iter().map(|item| item.index));
+        for index in media_indices {
+            prepared.media_results[index].failed("dict_preload", error.to_string());
+        }
+        return;
+    }
+
+    write_combined_user_batch(
         store,
         &prepared.users,
-        &mut prepared.user_results,
-        "twitter_user",
-    )
-    .await;
-    write_user_batch(
-        store,
         &prepared.tweet_authors,
+        &mut prepared.user_results,
         &mut prepared.tweet_results,
-        "tweet_author",
     )
     .await;
     write_user_snapshots_batch(store, &prepared.user_snapshots, &mut prepared.user_results).await;
@@ -1074,63 +1157,86 @@ async fn execute_prepared_submit(
         stats_interval,
     )
     .await;
-    replace_prepared_tweet_relations(state, store, prepared).await;
+    replace_prepared_tweet_relations(store, prepared).await;
 }
 
-async fn write_user_batch(
+async fn write_combined_user_batch(
     store: &TweetStore<'_>,
-    items: &[Indexed<TwitterUser>],
-    results: &mut [ObjectResultBuilder],
-    operation: &'static str,
+    users: &[Indexed<TwitterUser>],
+    tweet_authors: &[Indexed<TwitterUser>],
+    user_results: &mut [ObjectResultBuilder],
+    tweet_results: &mut [ObjectResultBuilder],
 ) {
-    if items.is_empty() {
+    if users.is_empty() && tweet_authors.is_empty() {
         return;
     }
 
-    let values = items
+    #[derive(Clone)]
+    struct CombinedUserWrite {
+        value: TwitterUser,
+        user_indices: Vec<usize>,
+        tweet_indices: Vec<usize>,
+    }
+
+    let mut combined = HashMap::<i64, CombinedUserWrite>::new();
+    for item in users {
+        combined
+            .entry(item.value.id)
+            .and_modify(|entry| {
+                if entry.value.registered_at.is_none() && item.value.registered_at.is_some() {
+                    entry.value.registered_at = item.value.registered_at;
+                }
+                entry.user_indices.push(item.index);
+            })
+            .or_insert_with(|| CombinedUserWrite {
+                value: item.value.clone(),
+                user_indices: vec![item.index],
+                tweet_indices: Vec::new(),
+            });
+    }
+    for item in tweet_authors {
+        combined
+            .entry(item.value.id)
+            .and_modify(|entry| entry.tweet_indices.push(item.index))
+            .or_insert_with(|| CombinedUserWrite {
+                value: item.value.clone(),
+                user_indices: Vec::new(),
+                tweet_indices: vec![item.index],
+            });
+    }
+
+    let combined = combined.into_values().collect::<Vec<_>>();
+    let values = combined
         .iter()
         .map(|item| item.value.clone())
         .collect::<Vec<_>>();
     match store.insert_users_changed(&values).await {
         Ok(changed) => {
-            for item in items {
+            for item in &combined {
                 if changed.contains(&item.value.id) {
-                    let reason = if operation == "tweet_author" {
-                        "inserted_minimal"
-                    } else {
-                        "inserted_or_filled"
-                    };
-                    results[item.index].accepted(operation, reason);
+                    for index in &item.user_indices {
+                        user_results[*index].accepted("twitter_user", "inserted_or_filled");
+                    }
+                    for index in &item.tweet_indices {
+                        tweet_results[*index].accepted("tweet_author", "inserted_minimal");
+                    }
                 } else {
-                    let reason = if operation == "tweet_author" {
-                        "existing"
-                    } else {
-                        "unchanged_or_existing"
-                    };
-                    results[item.index].skipped(operation, reason);
+                    for index in &item.user_indices {
+                        user_results[*index].skipped("twitter_user", "unchanged_or_existing");
+                    }
+                    for index in &item.tweet_indices {
+                        tweet_results[*index].skipped("tweet_author", "existing");
+                    }
                 }
             }
         }
-        Err(_) => {
-            for item in items {
-                match store.insert_users(std::slice::from_ref(&item.value)).await {
-                    Ok(0) => {
-                        let reason = if operation == "tweet_author" {
-                            "existing"
-                        } else {
-                            "unchanged_or_existing"
-                        };
-                        results[item.index].skipped(operation, reason);
-                    }
-                    Ok(_) => {
-                        let reason = if operation == "tweet_author" {
-                            "inserted_minimal"
-                        } else {
-                            "inserted_or_filled"
-                        };
-                        results[item.index].accepted(operation, reason);
-                    }
-                    Err(error) => results[item.index].failed(operation, error.to_string()),
+        Err(error) => {
+            for item in &combined {
+                for index in &item.user_indices {
+                    user_results[*index].failed("twitter_user", error.to_string());
+                }
+                for index in &item.tweet_indices {
+                    tweet_results[*index].failed("tweet_author", error.to_string());
                 }
             }
         }
@@ -1163,14 +1269,9 @@ async fn write_user_snapshots_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store.append_user_snapshot_if_changed(&item.value).await {
-                    Ok(write) => {
-                        record_conditional_write(&mut results[item.index], "user_snapshot", write)
-                    }
-                    Err(error) => results[item.index].failed("user_snapshot", error.to_string()),
-                }
+                results[item.index].failed("user_snapshot", error.to_string());
             }
         }
     }
@@ -1205,17 +1306,9 @@ async fn write_user_stats_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store
-                    .append_user_stats_if_changed(&item.value, stats_interval)
-                    .await
-                {
-                    Ok(write) => {
-                        record_conditional_write(&mut results[item.index], "user_stats", write)
-                    }
-                    Err(error) => results[item.index].failed("user_stats", error.to_string()),
-                }
+                results[item.index].failed("user_stats", error.to_string());
             }
         }
     }
@@ -1244,13 +1337,9 @@ async fn write_media_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store.upsert_media(std::slice::from_ref(&item.value)).await {
-                    Ok(0) => results[item.index].skipped("media", "unchanged_or_existing"),
-                    Ok(_) => results[item.index].accepted("media", "inserted_or_filled"),
-                    Err(error) => results[item.index].failed("media", error.to_string()),
-                }
+                results[item.index].failed("media", error.to_string());
             }
         }
     }
@@ -1283,14 +1372,9 @@ async fn write_media_resources_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store.append_media_resource_if_changed(&item.value).await {
-                    Ok(write) => {
-                        record_conditional_write(&mut results[item.index], "media_resource", write)
-                    }
-                    Err(error) => results[item.index].failed("media_resource", error.to_string()),
-                }
+                results[item.index].failed("media_resource", error.to_string());
             }
         }
     }
@@ -1305,29 +1389,35 @@ async fn write_tweet_places_batch(
         return;
     }
 
-    let values = items
-        .iter()
-        .map(|item| item.value.clone())
+    let mut deduped = HashMap::<String, (TweetPlace, Vec<usize>)>::new();
+    for item in items {
+        deduped
+            .entry(item.value.id.clone())
+            .and_modify(|entry| entry.1.push(item.index))
+            .or_insert_with(|| (item.value.clone(), vec![item.index]));
+    }
+    let values = deduped
+        .values()
+        .map(|(value, _)| value.clone())
         .collect::<Vec<_>>();
     match store.upsert_tweet_places_changed(&values).await {
         Ok(changed) => {
-            for item in items {
-                if changed.contains(&item.value.id) {
-                    results[item.index].accepted("tweet_place", "inserted_or_filled");
+            for (place_id, (_, indices)) in deduped {
+                if changed.contains(&place_id) {
+                    for index in indices {
+                        results[index].accepted("tweet_place", "inserted_or_filled");
+                    }
                 } else {
-                    results[item.index].skipped("tweet_place", "unchanged_or_existing");
+                    for index in indices {
+                        results[index].skipped("tweet_place", "unchanged_or_existing");
+                    }
                 }
             }
         }
-        Err(_) => {
-            for item in items {
-                match store
-                    .upsert_tweet_places(std::slice::from_ref(&item.value))
-                    .await
-                {
-                    Ok(0) => results[item.index].skipped("tweet_place", "unchanged_or_existing"),
-                    Ok(_) => results[item.index].accepted("tweet_place", "inserted_or_filled"),
-                    Err(error) => results[item.index].failed("tweet_place", error.to_string()),
+        Err(error) => {
+            for (_, (_, indices)) in deduped {
+                for index in indices {
+                    results[index].failed("tweet_place", error.to_string());
                 }
             }
         }
@@ -1357,13 +1447,9 @@ async fn write_tweets_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store.insert_tweets(std::slice::from_ref(&item.value)).await {
-                    Ok(0) => results[item.index].skipped("tweet", "unchanged_or_existing"),
-                    Ok(_) => results[item.index].accepted("tweet", "inserted_or_filled"),
-                    Err(error) => results[item.index].failed("tweet", error.to_string()),
-                }
+                results[item.index].failed("tweet", error.to_string());
             }
         }
     }
@@ -1382,26 +1468,15 @@ async fn write_tweet_edits_batch(
         .iter()
         .map(|item| item.value.clone())
         .collect::<Vec<_>>();
-    match store.upsert_tweet_edits_changed(&values).await {
-        Ok(changed) => record_changed_tweet_keys(
-            items,
-            results,
-            &changed,
-            "tweet_edit",
-            "inserted_or_filled",
-            "unchanged_or_existing",
-            |value| value.tweet_id,
-        ),
-        Err(_) => {
+    match store.upsert_tweet_edits_write_statuses(&values).await {
+        Ok(statuses) => {
+            record_tweet_write_statuses(items, results, &statuses, "tweet_edit", |value| {
+                value.tweet_id
+            })
+        }
+        Err(error) => {
             for item in items {
-                match store
-                    .upsert_tweet_edits(std::slice::from_ref(&item.value))
-                    .await
-                {
-                    Ok(0) => results[item.index].skipped("tweet_edit", "unchanged_or_existing"),
-                    Ok(_) => results[item.index].accepted("tweet_edit", "inserted_or_filled"),
-                    Err(error) => results[item.index].failed("tweet_edit", error.to_string()),
-                }
+                results[item.index].failed("tweet_edit", error.to_string());
             }
         }
     }
@@ -1420,26 +1495,15 @@ async fn write_tweet_policies_batch(
         .iter()
         .map(|item| item.value.clone())
         .collect::<Vec<_>>();
-    match store.upsert_tweet_policies_changed(&values).await {
-        Ok(changed) => record_changed_tweet_keys(
-            items,
-            results,
-            &changed,
-            "tweet_policy",
-            "inserted_or_filled",
-            "unchanged_or_existing",
-            |value| value.tweet_id,
-        ),
-        Err(_) => {
+    match store.upsert_tweet_policies_write_statuses(&values).await {
+        Ok(statuses) => {
+            record_tweet_write_statuses(items, results, &statuses, "tweet_policy", |value| {
+                value.tweet_id
+            })
+        }
+        Err(error) => {
             for item in items {
-                match store
-                    .upsert_tweet_policies(std::slice::from_ref(&item.value))
-                    .await
-                {
-                    Ok(0) => results[item.index].skipped("tweet_policy", "unchanged_or_existing"),
-                    Ok(_) => results[item.index].accepted("tweet_policy", "inserted_or_filled"),
-                    Err(error) => results[item.index].failed("tweet_policy", error.to_string()),
-                }
+                results[item.index].failed("tweet_policy", error.to_string());
             }
         }
     }
@@ -1458,32 +1522,20 @@ async fn write_tweet_community_notes_batch(
         .iter()
         .map(|item| item.value.clone())
         .collect::<Vec<_>>();
-    match store.upsert_tweet_community_notes_changed(&values).await {
-        Ok(changed) => record_changed_tweet_keys(
+    match store
+        .upsert_tweet_community_notes_write_statuses(&values)
+        .await
+    {
+        Ok(statuses) => record_tweet_write_statuses(
             items,
             results,
-            &changed,
+            &statuses,
             "tweet_community_note",
-            "inserted_or_filled",
-            "unchanged_or_existing",
             |value| value.tweet_id,
         ),
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store
-                    .upsert_tweet_community_notes(std::slice::from_ref(&item.value))
-                    .await
-                {
-                    Ok(0) => {
-                        results[item.index].skipped("tweet_community_note", "unchanged_or_existing")
-                    }
-                    Ok(_) => {
-                        results[item.index].accepted("tweet_community_note", "inserted_or_filled")
-                    }
-                    Err(error) => {
-                        results[item.index].failed("tweet_community_note", error.to_string())
-                    }
-                }
+                results[item.index].failed("tweet_community_note", error.to_string());
             }
         }
     }
@@ -1518,42 +1570,51 @@ async fn write_tweet_stats_batch(
                 }
             }
         }
-        Err(_) => {
+        Err(error) => {
             for item in items {
-                match store
-                    .append_tweet_stats_if_changed(&item.value, stats_interval)
-                    .await
-                {
-                    Ok(write) => {
-                        record_conditional_write(&mut results[item.index], "tweet_stats", write)
-                    }
-                    Err(error) => results[item.index].failed("tweet_stats", error.to_string()),
-                }
+                results[item.index].failed("tweet_stats", error.to_string());
             }
         }
     }
 }
 
-fn record_changed_tweet_keys<T>(
+fn record_tweet_write_statuses<T>(
     items: &[Indexed<T>],
     results: &mut [ObjectResultBuilder],
-    changed: &HashSet<i64>,
+    statuses: &HashMap<i64, ConditionalWrite>,
     operation: &'static str,
-    accepted_reason: &'static str,
-    skipped_reason: &'static str,
     key: impl Fn(&T) -> i64,
 ) {
     for item in items {
-        if changed.contains(&key(&item.value)) {
-            results[item.index].accepted(operation, accepted_reason);
-        } else {
-            results[item.index].skipped(operation, skipped_reason);
+        match statuses.get(&key(&item.value)).copied() {
+            Some(write) => record_conditional_write(&mut results[item.index], operation, write),
+            None => results[item.index].failed(operation, "missing batch write status"),
         }
     }
 }
 
+fn record_relation_sync(
+    result: &mut ObjectResultBuilder,
+    operation: &'static str,
+    status: Option<crate::tweet_store::RelationSyncStatus>,
+) {
+    use crate::tweet_store::RelationSyncStatus;
+
+    match status {
+        Some(RelationSyncStatus::Replaced) => result.accepted(operation, "replaced"),
+        Some(RelationSyncStatus::ReplacedFiltered) => {
+            result.accepted(operation, "replaced_with_missing_media_skipped")
+        }
+        Some(RelationSyncStatus::SkippedUnchanged) => result.skipped(operation, "unchanged"),
+        Some(RelationSyncStatus::SkippedUnchangedFiltered) => {
+            result.skipped(operation, "unchanged_with_missing_media_skipped")
+        }
+        Some(RelationSyncStatus::SkippedMissingTweet) => result.skipped(operation, "missing_tweet"),
+        None => result.failed(operation, "missing relation sync status"),
+    }
+}
+
 async fn replace_prepared_tweet_relations(
-    state: &AppState,
     store: &TweetStore<'_>,
     prepared: &mut PreparedSubmitBatch,
 ) {
@@ -1566,184 +1627,96 @@ async fn replace_prepared_tweet_relations(
         .iter()
         .map(|item| item.tweet_id)
         .collect::<Vec<_>>();
-    let existing_tweet_ids = match existing_tweet_ids(&state.db, &tweet_ids).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            for item in &prepared.tweet_relations {
-                prepared.tweet_results[item.index].failed("tweet_lookup", error.to_string());
-                prepared.tweet_results[item.index].skipped("tweet_relations", "missing_tweet");
-            }
-            return;
-        }
-    };
-
-    let active = prepared
+    let media_refs = prepared
         .tweet_relations
-        .iter()
-        .filter(|item| existing_tweet_ids.contains(&item.tweet_id))
-        .collect::<Vec<_>>();
-    for item in prepared
-        .tweet_relations
-        .iter()
-        .filter(|item| !existing_tweet_ids.contains(&item.tweet_id))
-    {
-        prepared.tweet_results[item.index].skipped("tweet_relations", "missing_tweet");
-    }
-    if active.is_empty() {
-        return;
-    }
-
-    let active_tweet_ids = active.iter().map(|item| item.tweet_id).collect::<Vec<_>>();
-    let all_media_refs = active
         .iter()
         .flat_map(|item| item.media_refs.iter().cloned())
         .collect::<Vec<_>>();
-    let existing_media_ids = match existing_media_ids(&state.db, &all_media_refs).await {
-        Ok(ids) => ids,
+    match store.sync_tweet_media_refs(&tweet_ids, &media_refs).await {
+        Ok(statuses) => {
+            for item in &prepared.tweet_relations {
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_media_ref",
+                    statuses.get(&item.tweet_id).copied(),
+                );
+            }
+        }
         Err(error) => {
-            for item in &active {
+            for item in &prepared.tweet_relations {
                 prepared.tweet_results[item.index].failed("tweet_media_ref", error.to_string());
-            }
-            HashSet::new()
-        }
-    };
-    let filtered_media_refs = all_media_refs
-        .into_iter()
-        .filter(|reference| existing_media_ids.contains(&reference.media_id))
-        .collect::<Vec<_>>();
-    let filtered_media_counts =
-        filtered_media_refs
-            .iter()
-            .fold(HashMap::<i64, usize>::new(), |mut counts, reference| {
-                *counts.entry(reference.tweet_id).or_default() += 1;
-                counts
-            });
-
-    match store
-        .replace_tweet_media_refs(&active_tweet_ids, &filtered_media_refs)
-        .await
-    {
-        Ok(()) => {
-            for item in &active {
-                let filtered_count = filtered_media_counts
-                    .get(&item.tweet_id)
-                    .copied()
-                    .unwrap_or_default();
-                if filtered_count == item.media_ref_count {
-                    prepared.tweet_results[item.index].accepted("tweet_media_ref", "replaced");
-                } else {
-                    prepared.tweet_results[item.index]
-                        .accepted("tweet_media_ref", "replaced_with_missing_media_skipped");
-                }
-            }
-        }
-        Err(error) => {
-            for item in &active {
-                let refs = item
-                    .media_refs
-                    .iter()
-                    .filter(|reference| existing_media_ids.contains(&reference.media_id))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                match store
-                    .replace_tweet_media_refs(&[item.tweet_id], &refs)
-                    .await
-                {
-                    Ok(()) if refs.len() == item.media_ref_count => {
-                        prepared.tweet_results[item.index].accepted("tweet_media_ref", "replaced");
-                    }
-                    Ok(()) => prepared.tweet_results[item.index]
-                        .accepted("tweet_media_ref", "replaced_with_missing_media_skipped"),
-                    Err(_) => prepared.tweet_results[item.index]
-                        .failed("tweet_media_ref", error.to_string()),
-                }
             }
         }
     }
 
-    let mention_refs = active
+    let mention_refs = prepared
+        .tweet_relations
         .iter()
         .flat_map(|item| item.mention_refs.iter().cloned())
         .collect::<Vec<_>>();
     match store
-        .replace_tweet_mention_refs(&active_tweet_ids, &mention_refs)
+        .sync_tweet_mention_refs(&tweet_ids, &mention_refs)
         .await
     {
-        Ok(()) => {
-            for item in &active {
-                prepared.tweet_results[item.index].accepted("tweet_mention_ref", "replaced");
+        Ok(statuses) => {
+            for item in &prepared.tweet_relations {
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_mention_ref",
+                    statuses.get(&item.tweet_id).copied(),
+                );
             }
         }
         Err(error) => {
-            for item in &active {
-                match store
-                    .replace_tweet_mention_refs(&[item.tweet_id], &item.mention_refs)
-                    .await
-                {
-                    Ok(()) => {
-                        prepared.tweet_results[item.index].accepted("tweet_mention_ref", "replaced")
-                    }
-                    Err(_) => prepared.tweet_results[item.index]
-                        .failed("tweet_mention_ref", error.to_string()),
-                }
+            for item in &prepared.tweet_relations {
+                prepared.tweet_results[item.index].failed("tweet_mention_ref", error.to_string());
             }
         }
     }
 
-    let hashtag_refs = active
+    let hashtag_refs = prepared
+        .tweet_relations
         .iter()
         .flat_map(|item| item.hashtag_refs.iter().cloned())
         .collect::<Vec<_>>();
     match store
-        .replace_tweet_hashtag_refs(&active_tweet_ids, &hashtag_refs)
+        .sync_tweet_hashtag_refs(&tweet_ids, &hashtag_refs)
         .await
     {
-        Ok(()) => {
-            for item in &active {
-                prepared.tweet_results[item.index].accepted("tweet_hashtag_ref", "replaced");
+        Ok(statuses) => {
+            for item in &prepared.tweet_relations {
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_hashtag_ref",
+                    statuses.get(&item.tweet_id).copied(),
+                );
             }
         }
         Err(error) => {
-            for item in &active {
-                match store
-                    .replace_tweet_hashtag_refs(&[item.tweet_id], &item.hashtag_refs)
-                    .await
-                {
-                    Ok(()) => {
-                        prepared.tweet_results[item.index].accepted("tweet_hashtag_ref", "replaced")
-                    }
-                    Err(_) => prepared.tweet_results[item.index]
-                        .failed("tweet_hashtag_ref", error.to_string()),
-                }
+            for item in &prepared.tweet_relations {
+                prepared.tweet_results[item.index].failed("tweet_hashtag_ref", error.to_string());
             }
         }
     }
 
-    let symbol_refs = active
+    let symbol_refs = prepared
+        .tweet_relations
         .iter()
         .flat_map(|item| item.symbol_refs.iter().cloned())
         .collect::<Vec<_>>();
-    match store
-        .replace_tweet_symbol_refs(&active_tweet_ids, &symbol_refs)
-        .await
-    {
-        Ok(()) => {
-            for item in &active {
-                prepared.tweet_results[item.index].accepted("tweet_symbol_ref", "replaced");
+    match store.sync_tweet_symbol_refs(&tweet_ids, &symbol_refs).await {
+        Ok(statuses) => {
+            for item in &prepared.tweet_relations {
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_symbol_ref",
+                    statuses.get(&item.tweet_id).copied(),
+                );
             }
         }
         Err(error) => {
-            for item in &active {
-                match store
-                    .replace_tweet_symbol_refs(&[item.tweet_id], &item.symbol_refs)
-                    .await
-                {
-                    Ok(()) => {
-                        prepared.tweet_results[item.index].accepted("tweet_symbol_ref", "replaced")
-                    }
-                    Err(_) => prepared.tweet_results[item.index]
-                        .failed("tweet_symbol_ref", error.to_string()),
-                }
+            for item in &prepared.tweet_relations {
+                prepared.tweet_results[item.index].failed("tweet_symbol_ref", error.to_string());
             }
         }
     }
@@ -1756,7 +1729,6 @@ struct ConvertedTweet {
     stats: Option<TweetStats>,
     community_note: Option<TweetCommunityNote>,
     media_refs: Vec<TweetMediaRef>,
-    media_ref_count: usize,
     mention_refs: Vec<TweetMentionRef>,
     hashtag_refs: Vec<TweetHashtagRef>,
     symbol_refs: Vec<TweetSymbolRef>,
@@ -2018,8 +1990,7 @@ async fn convert_tweet(
                 .map_err(|_| AppError::bad_request("tweet.content.mediaIds is too large"))?,
         });
     }
-    let media_ref_count = media_refs.len();
-
+    dedupe_media_refs(&mut media_refs);
     let mut mention_refs = Vec::new();
     let mut hashtag_refs = Vec::new();
     let mut symbol_refs = Vec::new();
@@ -2048,7 +2019,6 @@ async fn convert_tweet(
         stats,
         community_note,
         media_refs,
-        media_ref_count,
         mention_refs,
         hashtag_refs,
         symbol_refs,
@@ -2552,35 +2522,23 @@ fn dedupe_refs(
     symbol_refs.retain(|reference| symbols.insert(reference.symbol_id));
 }
 
-async fn existing_tweet_ids(pool: &sqlx::PgPool, tweet_ids: &[i64]) -> AppResult<HashSet<i64>> {
-    if tweet_ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let rows =
-        sqlx::query_scalar::<_, i64>("SELECT id FROM tweet.tweet WHERE id = ANY($1::BIGINT[])")
-            .bind(tweet_ids)
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().collect())
+fn dedupe_media_refs(media_refs: &mut Vec<TweetMediaRef>) {
+    let mut seen = HashSet::new();
+    media_refs.retain(|reference| seen.insert(reference.media_id));
 }
 
-async fn existing_media_ids(
-    pool: &sqlx::PgPool,
-    refs: &[TweetMediaRef],
-) -> AppResult<HashSet<i64>> {
-    if refs.is_empty() {
-        return Ok(HashSet::new());
+fn collect_last_valid_i64_indices<T>(
+    items: &[T],
+    field: &str,
+    id: impl Fn(&T) -> &str,
+) -> HashMap<i64, usize> {
+    let mut last = HashMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if let Ok(parsed) = parse_i64_id(id(item), field) {
+            last.insert(parsed, index);
+        }
     }
-    let ids = refs
-        .iter()
-        .map(|reference| reference.media_id)
-        .collect::<Vec<_>>();
-    let rows =
-        sqlx::query_scalar::<_, i64>("SELECT id FROM tweet.media WHERE id = ANY($1::BIGINT[])")
-            .bind(&ids)
-            .fetch_all(pool)
-            .await?;
-    Ok(rows.into_iter().collect())
+    last
 }
 
 fn record_conditional_write(
@@ -2593,6 +2551,7 @@ fn record_conditional_write(
         ConditionalWrite::SkippedDuplicate => result.skipped(name, "duplicate_timestamp"),
         ConditionalWrite::SkippedUnchanged => result.skipped(name, "unchanged"),
         ConditionalWrite::SkippedInterval => result.skipped(name, "stats_interval_not_reached"),
+        ConditionalWrite::SkippedMissingParent => result.skipped(name, "missing_parent"),
     }
 }
 
@@ -2753,5 +2712,50 @@ mod tests {
 
         assert_eq!(summary.total, 1);
         assert_eq!(summary.partial, 1);
+    }
+
+    #[test]
+    fn collect_last_valid_indices_prefers_last_duplicate() {
+        let request: SubmitTweetRequest = serde_json::from_value(json!({
+            "users": [
+                {"id": "1"},
+                {"id": "2"},
+                {"id": "1"}
+            ]
+        }))
+        .unwrap();
+
+        let indices = collect_last_valid_i64_indices(&request.users, "user.id", |user| &user.id);
+
+        assert_eq!(indices.get(&1), Some(&2));
+        assert_eq!(indices.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn dedupe_media_refs_keeps_first_occurrence() {
+        let mut refs = vec![
+            TweetMediaRef {
+                tweet_id: 1,
+                media_id: 10,
+                display_order: 0,
+            },
+            TweetMediaRef {
+                tweet_id: 1,
+                media_id: 10,
+                display_order: 1,
+            },
+            TweetMediaRef {
+                tweet_id: 1,
+                media_id: 11,
+                display_order: 2,
+            },
+        ];
+
+        dedupe_media_refs(&mut refs);
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].media_id, 10);
+        assert_eq!(refs[0].display_order, 0);
+        assert_eq!(refs[1].media_id, 11);
     }
 }

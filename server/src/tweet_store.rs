@@ -28,6 +28,16 @@ pub enum ConditionalWrite {
     SkippedDuplicate,
     SkippedUnchanged,
     SkippedInterval,
+    SkippedMissingParent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationSyncStatus {
+    Replaced,
+    ReplacedFiltered,
+    SkippedUnchanged,
+    SkippedUnchangedFiltered,
+    SkippedMissingTweet,
 }
 
 impl<'a> TweetStore<'a> {
@@ -289,11 +299,19 @@ impl<'a> TweetStore<'a> {
                     tweets BIGINT,
                     listed BIGINT
                 )
+                ORDER BY item.user_id, item.recorded_at
+            ),
+            existing_parent AS (
+                SELECT input.user_id, input.recorded_at
+                FROM input
+                JOIN tweet.twitter_user AS parent
+                  ON parent.id = input.user_id
             ),
             classified AS (
                 SELECT
                     input.*,
                     CASE
+                        WHEN existing_parent.user_id IS NULL THEN 'missing_parent'
                         WHEN latest.recorded_at IS NOT NULL
                          AND latest.followers IS NOT DISTINCT FROM input.followers
                          AND latest.following IS NOT DISTINCT FROM input.following
@@ -308,6 +326,9 @@ impl<'a> TweetStore<'a> {
                         ELSE 'candidate'
                     END AS decision
                 FROM input
+                LEFT JOIN existing_parent
+                  ON existing_parent.user_id = input.user_id
+                 AND existing_parent.recorded_at = input.recorded_at
                 LEFT JOIN LATERAL (
                     SELECT recorded_at, followers, following, likes, media_posts, tweets, listed
                     FROM tweet.user_stats AS latest
@@ -346,6 +367,7 @@ impl<'a> TweetStore<'a> {
                 classified.user_id,
                 classified.recorded_at,
                 CASE
+                    WHEN classified.decision = 'missing_parent' THEN 'missing_parent'
                     WHEN inserted.user_id IS NOT NULL THEN 'inserted'
                     WHEN classified.decision = 'unchanged' THEN 'unchanged'
                     WHEN classified.decision = 'interval' THEN 'interval'
@@ -976,6 +998,97 @@ impl<'a> TweetStore<'a> {
             .collect())
     }
 
+    pub async fn upsert_tweet_edits_write_statuses(
+        &self,
+        edits: &[TweetEdit],
+    ) -> AppResult<HashMap<i64, ConditionalWrite>> {
+        if edits.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH input AS (
+                SELECT DISTINCT ON (item.tweet_id)
+                    item.tweet_id,
+                    COALESCE(item.version_ids, ARRAY[]::BIGINT[]) AS version_ids,
+                    item.editable_until,
+                    item.remaining_edits
+                FROM jsonb_to_recordset($1::jsonb) AS item(
+                    tweet_id BIGINT,
+                    version_ids BIGINT[],
+                    editable_until TIMESTAMPTZ,
+                    remaining_edits INTEGER
+                )
+                ORDER BY item.tweet_id
+            ),
+            existing_parent AS (
+                SELECT input.tweet_id
+                FROM input
+                JOIN tweet.tweet AS parent
+                  ON parent.id = input.tweet_id
+            ),
+            changed AS (
+                INSERT INTO tweet.tweet_edit (
+                    tweet_id,
+                    version_ids,
+                    editable_until,
+                    remaining_edits
+                )
+                SELECT
+                    input.tweet_id,
+                    input.version_ids,
+                    input.editable_until,
+                    input.remaining_edits
+                FROM input
+                JOIN existing_parent
+                  ON existing_parent.tweet_id = input.tweet_id
+                ON CONFLICT (tweet_id) DO UPDATE
+                SET version_ids = CASE
+                        WHEN COALESCE(cardinality(tweet.tweet_edit.version_ids), 0) = 0
+                         AND COALESCE(cardinality(EXCLUDED.version_ids), 0) > 0
+                        THEN EXCLUDED.version_ids
+                        ELSE tweet.tweet_edit.version_ids
+                    END,
+                    editable_until = COALESCE(tweet.tweet_edit.editable_until, EXCLUDED.editable_until),
+                    remaining_edits = COALESCE(tweet.tweet_edit.remaining_edits, EXCLUDED.remaining_edits),
+                    updated_at = NOW()
+                WHERE (
+                        COALESCE(cardinality(tweet.tweet_edit.version_ids), 0) = 0
+                    AND COALESCE(cardinality(EXCLUDED.version_ids), 0) > 0
+                )
+                   OR (tweet.tweet_edit.editable_until IS NULL AND EXCLUDED.editable_until IS NOT NULL)
+                   OR (tweet.tweet_edit.remaining_edits IS NULL AND EXCLUDED.remaining_edits IS NOT NULL)
+                RETURNING tweet_id
+            )
+            SELECT
+                input.tweet_id,
+                CASE
+                    WHEN existing_parent.tweet_id IS NULL THEN 'missing_parent'
+                    WHEN changed.tweet_id IS NOT NULL THEN 'inserted'
+                    ELSE 'unchanged'
+                END AS status
+            FROM input
+            LEFT JOIN existing_parent
+              ON existing_parent.tweet_id = input.tweet_id
+            LEFT JOIN changed
+              ON changed.tweet_id = input.tweet_id
+            "#,
+        )
+        .bind(serde_json::to_value(edits)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    conditional_write_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn upsert_tweet_policies(&self, policies: &[TweetPolicy]) -> AppResult<u64> {
         if policies.is_empty() {
             return Ok(0);
@@ -1144,6 +1257,124 @@ impl<'a> TweetStore<'a> {
             .collect())
     }
 
+    pub async fn upsert_tweet_policies_write_statuses(
+        &self,
+        policies: &[TweetPolicy],
+    ) -> AppResult<HashMap<i64, ConditionalWrite>> {
+        if policies.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.preload_tweet_policy_dicts(policies).await?;
+        let mut payloads = Vec::with_capacity(policies.len());
+        for policy in policies {
+            payloads.push(self.tweet_policy_payload(policy).await?);
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH input AS (
+                SELECT DISTINCT ON (item.tweet_id)
+                    item.tweet_id,
+                    item.reply_policy_id,
+                    item.followers_only,
+                    item.is_possibly_sensitive,
+                    COALESCE(item.available_action_ids, ARRAY[]::SMALLINT[]) AS available_action_ids,
+                    item.is_media_visibility_restricted,
+                    item.paid_promotion
+                FROM jsonb_to_recordset($1::jsonb) AS item(
+                    tweet_id BIGINT,
+                    reply_policy_id SMALLINT,
+                    followers_only BOOLEAN,
+                    is_possibly_sensitive BOOLEAN,
+                    available_action_ids SMALLINT[],
+                    is_media_visibility_restricted BOOLEAN,
+                    paid_promotion BOOLEAN
+                )
+                ORDER BY item.tweet_id
+            ),
+            existing_parent AS (
+                SELECT input.tweet_id
+                FROM input
+                JOIN tweet.tweet AS parent
+                  ON parent.id = input.tweet_id
+            ),
+            changed AS (
+                INSERT INTO tweet.tweet_policy (
+                    tweet_id,
+                    reply_policy_id,
+                    followers_only,
+                    is_possibly_sensitive,
+                    available_action_ids,
+                    is_media_visibility_restricted,
+                    paid_promotion
+                )
+                SELECT
+                    input.tweet_id,
+                    input.reply_policy_id,
+                    input.followers_only,
+                    input.is_possibly_sensitive,
+                    input.available_action_ids,
+                    input.is_media_visibility_restricted,
+                    input.paid_promotion
+                FROM input
+                JOIN existing_parent
+                  ON existing_parent.tweet_id = input.tweet_id
+                ON CONFLICT (tweet_id) DO UPDATE
+                SET reply_policy_id = COALESCE(tweet.tweet_policy.reply_policy_id, EXCLUDED.reply_policy_id),
+                    followers_only = COALESCE(tweet.tweet_policy.followers_only, EXCLUDED.followers_only),
+                    is_possibly_sensitive = COALESCE(tweet.tweet_policy.is_possibly_sensitive, EXCLUDED.is_possibly_sensitive),
+                    available_action_ids = CASE
+                        WHEN COALESCE(cardinality(tweet.tweet_policy.available_action_ids), 0) = 0
+                         AND COALESCE(cardinality(EXCLUDED.available_action_ids), 0) > 0
+                        THEN EXCLUDED.available_action_ids
+                        ELSE tweet.tweet_policy.available_action_ids
+                    END,
+                    is_media_visibility_restricted = COALESCE(tweet.tweet_policy.is_media_visibility_restricted, EXCLUDED.is_media_visibility_restricted),
+                    paid_promotion = COALESCE(tweet.tweet_policy.paid_promotion, EXCLUDED.paid_promotion),
+                    updated_at = NOW()
+                WHERE (tweet.tweet_policy.reply_policy_id IS NULL AND EXCLUDED.reply_policy_id IS NOT NULL)
+                   OR (tweet.tweet_policy.followers_only IS NULL AND EXCLUDED.followers_only IS NOT NULL)
+                   OR (tweet.tweet_policy.is_possibly_sensitive IS NULL AND EXCLUDED.is_possibly_sensitive IS NOT NULL)
+                   OR (
+                        COALESCE(cardinality(tweet.tweet_policy.available_action_ids), 0) = 0
+                    AND COALESCE(cardinality(EXCLUDED.available_action_ids), 0) > 0
+                   )
+                   OR (
+                        tweet.tweet_policy.is_media_visibility_restricted IS NULL
+                    AND EXCLUDED.is_media_visibility_restricted IS NOT NULL
+                   )
+                   OR (tweet.tweet_policy.paid_promotion IS NULL AND EXCLUDED.paid_promotion IS NOT NULL)
+                RETURNING tweet_id
+            )
+            SELECT
+                input.tweet_id,
+                CASE
+                    WHEN existing_parent.tweet_id IS NULL THEN 'missing_parent'
+                    WHEN changed.tweet_id IS NOT NULL THEN 'inserted'
+                    ELSE 'unchanged'
+                END AS status
+            FROM input
+            LEFT JOIN existing_parent
+              ON existing_parent.tweet_id = input.tweet_id
+            LEFT JOIN changed
+              ON changed.tweet_id = input.tweet_id
+            "#,
+        )
+        .bind(serde_json::to_value(payloads)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    conditional_write_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
+    }
+
     pub async fn append_tweet_stats(&self, stats: &[TweetStats]) -> AppResult<u64> {
         if stats.is_empty() {
             return Ok(0);
@@ -1258,11 +1489,19 @@ impl<'a> TweetStore<'a> {
                     likes BIGINT,
                     bookmarks BIGINT
                 )
+                ORDER BY item.tweet_id, item.recorded_at
+            ),
+            existing_parent AS (
+                SELECT input.tweet_id, input.recorded_at
+                FROM input
+                JOIN tweet.tweet AS parent
+                  ON parent.id = input.tweet_id
             ),
             classified AS (
                 SELECT
                     input.*,
                     CASE
+                        WHEN existing_parent.tweet_id IS NULL THEN 'missing_parent'
                         WHEN latest.recorded_at IS NOT NULL
                          AND latest.views IS NOT DISTINCT FROM input.views
                          AND latest.replies IS NOT DISTINCT FROM input.replies
@@ -1277,6 +1516,9 @@ impl<'a> TweetStore<'a> {
                         ELSE 'candidate'
                     END AS decision
                 FROM input
+                LEFT JOIN existing_parent
+                  ON existing_parent.tweet_id = input.tweet_id
+                 AND existing_parent.recorded_at = input.recorded_at
                 LEFT JOIN LATERAL (
                     SELECT recorded_at, views, replies, reposts, quotes, likes, bookmarks
                     FROM tweet.tweet_stats AS latest
@@ -1315,6 +1557,7 @@ impl<'a> TweetStore<'a> {
                 classified.tweet_id,
                 classified.recorded_at,
                 CASE
+                    WHEN classified.decision = 'missing_parent' THEN 'missing_parent'
                     WHEN inserted.tweet_id IS NOT NULL THEN 'inserted'
                     WHEN classified.decision = 'unchanged' THEN 'unchanged'
                     WHEN classified.decision = 'interval' THEN 'interval'
@@ -1496,6 +1739,116 @@ impl<'a> TweetStore<'a> {
             .into_iter()
             .map(|row| row.get::<i64, _>("tweet_id"))
             .collect())
+    }
+
+    pub async fn upsert_tweet_community_notes_write_statuses(
+        &self,
+        notes: &[TweetCommunityNote],
+    ) -> AppResult<HashMap<i64, ConditionalWrite>> {
+        if notes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.preload_tweet_community_note_dicts(notes).await?;
+        let mut payloads = Vec::with_capacity(notes.len());
+        for note in notes {
+            payloads.push(self.tweet_community_note_payload(note).await?);
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH input AS (
+                SELECT DISTINCT ON (item.tweet_id)
+                    item.tweet_id,
+                    item.note_id,
+                    item.title,
+                    item.short_title,
+                    item.subtitle,
+                    item.footer,
+                    item.destination_url
+                FROM jsonb_to_recordset($1::jsonb) AS item(
+                    tweet_id BIGINT,
+                    note_id BIGINT,
+                    title TEXT,
+                    short_title TEXT,
+                    subtitle tweet.annotated_text,
+                    footer tweet.annotated_text,
+                    destination_url TEXT
+                )
+                ORDER BY item.tweet_id
+            ),
+            existing_parent AS (
+                SELECT input.tweet_id
+                FROM input
+                JOIN tweet.tweet AS parent
+                  ON parent.id = input.tweet_id
+            ),
+            changed AS (
+                INSERT INTO tweet.tweet_community_note (
+                    tweet_id,
+                    note_id,
+                    title,
+                    short_title,
+                    subtitle,
+                    footer,
+                    destination_url
+                )
+                SELECT
+                    input.tweet_id,
+                    input.note_id,
+                    input.title,
+                    input.short_title,
+                    input.subtitle,
+                    input.footer,
+                    input.destination_url
+                FROM input
+                JOIN existing_parent
+                  ON existing_parent.tweet_id = input.tweet_id
+                ON CONFLICT (tweet_id) DO UPDATE
+                SET note_id = COALESCE(tweet.tweet_community_note.note_id, EXCLUDED.note_id),
+                    title = COALESCE(tweet.tweet_community_note.title, EXCLUDED.title),
+                    short_title = COALESCE(tweet.tweet_community_note.short_title, EXCLUDED.short_title),
+                    subtitle = COALESCE(tweet.tweet_community_note.subtitle, EXCLUDED.subtitle),
+                    footer = COALESCE(tweet.tweet_community_note.footer, EXCLUDED.footer),
+                    destination_url = COALESCE(tweet.tweet_community_note.destination_url, EXCLUDED.destination_url),
+                    updated_at = NOW()
+                WHERE (tweet.tweet_community_note.note_id IS NULL AND EXCLUDED.note_id IS NOT NULL)
+                   OR (tweet.tweet_community_note.title IS NULL AND EXCLUDED.title IS NOT NULL)
+                   OR (tweet.tweet_community_note.short_title IS NULL AND EXCLUDED.short_title IS NOT NULL)
+                   OR (tweet.tweet_community_note.subtitle IS NULL AND EXCLUDED.subtitle IS NOT NULL)
+                   OR (tweet.tweet_community_note.footer IS NULL AND EXCLUDED.footer IS NOT NULL)
+                   OR (
+                        tweet.tweet_community_note.destination_url IS NULL
+                    AND EXCLUDED.destination_url IS NOT NULL
+                   )
+                RETURNING tweet_id
+            )
+            SELECT
+                input.tweet_id,
+                CASE
+                    WHEN existing_parent.tweet_id IS NULL THEN 'missing_parent'
+                    WHEN changed.tweet_id IS NOT NULL THEN 'inserted'
+                    ELSE 'unchanged'
+                END AS status
+            FROM input
+            LEFT JOIN existing_parent
+              ON existing_parent.tweet_id = input.tweet_id
+            LEFT JOIN changed
+              ON changed.tweet_id = input.tweet_id
+            "#,
+        )
+        .bind(serde_json::to_value(payloads)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    conditional_write_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn insert_media(&self, media: &[Media]) -> AppResult<u64> {
@@ -1934,12 +2287,21 @@ impl<'a> TweetStore<'a> {
                     professional tweet.user_professional,
                     pinned_tweet_ids BIGINT[]
                 )
+                ORDER BY item.user_id, item.recorded_at
+            ),
+            existing_parent AS (
+                SELECT input.user_id, input.recorded_at
+                FROM input
+                JOIN tweet.twitter_user AS parent
+                  ON parent.id = input.user_id
             ),
             classified AS (
                 SELECT
                     input.*,
+                    (existing_parent.user_id IS NOT NULL) AS has_parent,
                     (
-                        latest.user_id IS NOT NULL
+                        existing_parent.user_id IS NOT NULL
+                    AND latest.user_id IS NOT NULL
                     AND latest.display_name IS NOT DISTINCT FROM input.display_name
                     AND latest.user_name IS NOT DISTINCT FROM input.user_name
                     AND latest.avatar_url IS NOT DISTINCT FROM input.avatar_url
@@ -1955,6 +2317,9 @@ impl<'a> TweetStore<'a> {
                     AND latest.pinned_tweet_ids IS NOT DISTINCT FROM input.pinned_tweet_ids
                     ) AS unchanged
                 FROM input
+                LEFT JOIN existing_parent
+                  ON existing_parent.user_id = input.user_id
+                 AND existing_parent.recorded_at = input.recorded_at
                 LEFT JOIN LATERAL (
                     SELECT *
                     FROM tweet.user_snapshot AS latest
@@ -1999,7 +2364,8 @@ impl<'a> TweetStore<'a> {
                     professional,
                     pinned_tweet_ids
                 FROM classified
-                WHERE NOT unchanged
+                WHERE has_parent
+                  AND NOT unchanged
                 ON CONFLICT (user_id, recorded_at) DO NOTHING
                 RETURNING user_id, recorded_at
             )
@@ -2007,6 +2373,7 @@ impl<'a> TweetStore<'a> {
                 classified.user_id,
                 classified.recorded_at,
                 CASE
+                    WHEN NOT classified.has_parent THEN 'missing_parent'
                     WHEN inserted.user_id IS NOT NULL THEN 'inserted'
                     WHEN classified.unchanged THEN 'unchanged'
                     ELSE 'duplicate'
@@ -2110,17 +2477,29 @@ impl<'a> TweetStore<'a> {
                     availability_id SMALLINT,
                     video tweet.media_video
                 )
+                ORDER BY item.media_id, item.recorded_at
+            ),
+            existing_parent AS (
+                SELECT input.media_id, input.recorded_at
+                FROM input
+                JOIN tweet.media AS parent
+                  ON parent.id = input.media_id
             ),
             classified AS (
                 SELECT
                     input.*,
+                    (existing_parent.media_id IS NOT NULL) AS has_parent,
                     (
-                        latest.media_id IS NOT NULL
+                        existing_parent.media_id IS NOT NULL
+                    AND latest.media_id IS NOT NULL
                     AND latest.media_url IS NOT DISTINCT FROM input.media_url
                     AND latest.availability_id IS NOT DISTINCT FROM input.availability_id
                     AND to_jsonb(latest.video) IS NOT DISTINCT FROM to_jsonb(input.video)
                     ) AS unchanged
                 FROM input
+                LEFT JOIN existing_parent
+                  ON existing_parent.media_id = input.media_id
+                 AND existing_parent.recorded_at = input.recorded_at
                 LEFT JOIN LATERAL (
                     SELECT *
                     FROM tweet.media_resource AS latest
@@ -2145,7 +2524,8 @@ impl<'a> TweetStore<'a> {
                     availability_id,
                     video
                 FROM classified
-                WHERE NOT unchanged
+                WHERE has_parent
+                  AND NOT unchanged
                 ON CONFLICT (media_id, recorded_at) DO NOTHING
                 RETURNING media_id, recorded_at
             )
@@ -2153,6 +2533,7 @@ impl<'a> TweetStore<'a> {
                 classified.media_id,
                 classified.recorded_at,
                 CASE
+                    WHEN NOT classified.has_parent THEN 'missing_parent'
                     WHEN inserted.media_id IS NOT NULL THEN 'inserted'
                     WHEN classified.unchanged THEN 'unchanged'
                     ELSE 'duplicate'
@@ -2262,6 +2643,468 @@ impl<'a> TweetStore<'a> {
             "#,
         )
         .await
+    }
+
+    pub async fn sync_tweet_media_refs(
+        &self,
+        tweet_ids: &[i64],
+        refs: &[TweetMediaRef],
+    ) -> AppResult<HashMap<i64, RelationSyncStatus>> {
+        if tweet_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH target_tweets AS (
+                SELECT DISTINCT UNNEST($1::BIGINT[]) AS tweet_id
+            ),
+            existing_tweets AS (
+                SELECT target_tweets.tweet_id
+                FROM target_tweets
+                JOIN tweet.tweet AS t
+                  ON t.id = target_tweets.tweet_id
+            ),
+            raw_input AS (
+                SELECT DISTINCT ON (item.tweet_id, item.media_id)
+                    item.tweet_id,
+                    item.media_id,
+                    item.display_order
+                FROM jsonb_to_recordset($2::jsonb) AS item(
+                    tweet_id BIGINT,
+                    media_id BIGINT,
+                    display_order SMALLINT
+                )
+                JOIN existing_tweets
+                  ON existing_tweets.tweet_id = item.tweet_id
+                ORDER BY item.tweet_id, item.media_id, item.display_order
+            ),
+            input_refs AS (
+                SELECT raw_input.tweet_id, raw_input.media_id, raw_input.display_order
+                FROM raw_input
+                JOIN tweet.media AS m
+                  ON m.id = raw_input.media_id
+            ),
+            requested_counts AS (
+                SELECT tweet_id, COUNT(*)::INTEGER AS requested_count
+                FROM raw_input
+                GROUP BY tweet_id
+            ),
+            effective_counts AS (
+                SELECT tweet_id, COUNT(*)::INTEGER AS effective_count
+                FROM input_refs
+                GROUP BY tweet_id
+            ),
+            desired_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(
+                            jsonb_build_object(
+                                'media_id', input_refs.media_id,
+                                'display_order', input_refs.display_order
+                            )
+                            ORDER BY input_refs.display_order, input_refs.media_id
+                        ) FILTER (WHERE input_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN input_refs
+                  ON input_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            current_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(
+                            jsonb_build_object(
+                                'media_id', current_refs.media_id,
+                                'display_order', current_refs.display_order
+                            )
+                            ORDER BY current_refs.display_order, current_refs.media_id
+                        ) FILTER (WHERE current_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN tweet.tweet_media_ref AS current_refs
+                  ON current_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            changed_tweets AS (
+                SELECT
+                    desired_state.tweet_id,
+                    COALESCE(requested_counts.requested_count, 0)
+                        > COALESCE(effective_counts.effective_count, 0) AS filtered
+                FROM desired_state
+                JOIN current_state
+                  ON current_state.tweet_id = desired_state.tweet_id
+                LEFT JOIN requested_counts
+                  ON requested_counts.tweet_id = desired_state.tweet_id
+                LEFT JOIN effective_counts
+                  ON effective_counts.tweet_id = desired_state.tweet_id
+                WHERE desired_state.refs IS DISTINCT FROM current_state.refs
+            ),
+            deleted AS (
+                DELETE FROM tweet.tweet_media_ref
+                WHERE tweet_id IN (SELECT tweet_id FROM changed_tweets)
+            ),
+            inserted AS (
+                INSERT INTO tweet.tweet_media_ref (tweet_id, media_id, display_order)
+                SELECT input_refs.tweet_id, input_refs.media_id, input_refs.display_order
+                FROM input_refs
+                JOIN changed_tweets
+                  ON changed_tweets.tweet_id = input_refs.tweet_id
+            )
+            SELECT
+                target_tweets.tweet_id,
+                CASE
+                    WHEN existing_tweets.tweet_id IS NULL THEN 'missing_tweet'
+                    WHEN changed_tweets.tweet_id IS NOT NULL AND changed_tweets.filtered THEN 'replaced_filtered'
+                    WHEN changed_tweets.tweet_id IS NOT NULL THEN 'replaced'
+                    WHEN COALESCE(requested_counts.requested_count, 0)
+                       > COALESCE(effective_counts.effective_count, 0) THEN 'unchanged_filtered'
+                    ELSE 'unchanged'
+                END AS status
+            FROM target_tweets
+            LEFT JOIN existing_tweets
+              ON existing_tweets.tweet_id = target_tweets.tweet_id
+            LEFT JOIN changed_tweets
+              ON changed_tweets.tweet_id = target_tweets.tweet_id
+            LEFT JOIN requested_counts
+              ON requested_counts.tweet_id = target_tweets.tweet_id
+            LEFT JOIN effective_counts
+              ON effective_counts.tweet_id = target_tweets.tweet_id
+            "#,
+        )
+        .bind(tweet_ids)
+        .bind(serde_json::to_value(refs)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    relation_sync_status_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn sync_tweet_mention_refs(
+        &self,
+        tweet_ids: &[i64],
+        refs: &[TweetMentionRef],
+    ) -> AppResult<HashMap<i64, RelationSyncStatus>> {
+        if tweet_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH target_tweets AS (
+                SELECT DISTINCT UNNEST($1::BIGINT[]) AS tweet_id
+            ),
+            existing_tweets AS (
+                SELECT target_tweets.tweet_id
+                FROM target_tweets
+                JOIN tweet.tweet AS t
+                  ON t.id = target_tweets.tweet_id
+            ),
+            input_refs AS (
+                SELECT DISTINCT ON (item.tweet_id, item.user_id)
+                    item.tweet_id,
+                    item.user_id
+                FROM jsonb_to_recordset($2::jsonb) AS item(
+                    tweet_id BIGINT,
+                    user_id BIGINT
+                )
+                JOIN existing_tweets
+                  ON existing_tweets.tweet_id = item.tweet_id
+                ORDER BY item.tweet_id, item.user_id
+            ),
+            desired_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(input_refs.user_id ORDER BY input_refs.user_id)
+                            FILTER (WHERE input_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN input_refs
+                  ON input_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            current_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(current_refs.user_id ORDER BY current_refs.user_id)
+                            FILTER (WHERE current_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN tweet.tweet_mention_ref AS current_refs
+                  ON current_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            changed_tweets AS (
+                SELECT desired_state.tweet_id
+                FROM desired_state
+                JOIN current_state
+                  ON current_state.tweet_id = desired_state.tweet_id
+                WHERE desired_state.refs IS DISTINCT FROM current_state.refs
+            ),
+            deleted AS (
+                DELETE FROM tweet.tweet_mention_ref
+                WHERE tweet_id IN (SELECT tweet_id FROM changed_tweets)
+            ),
+            inserted AS (
+                INSERT INTO tweet.tweet_mention_ref (tweet_id, user_id)
+                SELECT input_refs.tweet_id, input_refs.user_id
+                FROM input_refs
+                JOIN changed_tweets
+                  ON changed_tweets.tweet_id = input_refs.tweet_id
+            )
+            SELECT
+                target_tweets.tweet_id,
+                CASE
+                    WHEN existing_tweets.tweet_id IS NULL THEN 'missing_tweet'
+                    WHEN changed_tweets.tweet_id IS NOT NULL THEN 'replaced'
+                    ELSE 'unchanged'
+                END AS status
+            FROM target_tweets
+            LEFT JOIN existing_tweets
+              ON existing_tweets.tweet_id = target_tweets.tweet_id
+            LEFT JOIN changed_tweets
+              ON changed_tweets.tweet_id = target_tweets.tweet_id
+            "#,
+        )
+        .bind(tweet_ids)
+        .bind(serde_json::to_value(refs)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    relation_sync_status_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn sync_tweet_hashtag_refs(
+        &self,
+        tweet_ids: &[i64],
+        refs: &[TweetHashtagRef],
+    ) -> AppResult<HashMap<i64, RelationSyncStatus>> {
+        if tweet_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH target_tweets AS (
+                SELECT DISTINCT UNNEST($1::BIGINT[]) AS tweet_id
+            ),
+            existing_tweets AS (
+                SELECT target_tweets.tweet_id
+                FROM target_tweets
+                JOIN tweet.tweet AS t
+                  ON t.id = target_tweets.tweet_id
+            ),
+            input_refs AS (
+                SELECT DISTINCT ON (item.tweet_id, item.hashtag_id)
+                    item.tweet_id,
+                    item.hashtag_id
+                FROM jsonb_to_recordset($2::jsonb) AS item(
+                    tweet_id BIGINT,
+                    hashtag_id INTEGER
+                )
+                JOIN existing_tweets
+                  ON existing_tweets.tweet_id = item.tweet_id
+                ORDER BY item.tweet_id, item.hashtag_id
+            ),
+            desired_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(input_refs.hashtag_id ORDER BY input_refs.hashtag_id)
+                            FILTER (WHERE input_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN input_refs
+                  ON input_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            current_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(current_refs.hashtag_id ORDER BY current_refs.hashtag_id)
+                            FILTER (WHERE current_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN tweet.tweet_hashtag_ref AS current_refs
+                  ON current_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            changed_tweets AS (
+                SELECT desired_state.tweet_id
+                FROM desired_state
+                JOIN current_state
+                  ON current_state.tweet_id = desired_state.tweet_id
+                WHERE desired_state.refs IS DISTINCT FROM current_state.refs
+            ),
+            deleted AS (
+                DELETE FROM tweet.tweet_hashtag_ref
+                WHERE tweet_id IN (SELECT tweet_id FROM changed_tweets)
+            ),
+            inserted AS (
+                INSERT INTO tweet.tweet_hashtag_ref (tweet_id, hashtag_id)
+                SELECT input_refs.tweet_id, input_refs.hashtag_id
+                FROM input_refs
+                JOIN changed_tweets
+                  ON changed_tweets.tweet_id = input_refs.tweet_id
+            )
+            SELECT
+                target_tweets.tweet_id,
+                CASE
+                    WHEN existing_tweets.tweet_id IS NULL THEN 'missing_tweet'
+                    WHEN changed_tweets.tweet_id IS NOT NULL THEN 'replaced'
+                    ELSE 'unchanged'
+                END AS status
+            FROM target_tweets
+            LEFT JOIN existing_tweets
+              ON existing_tweets.tweet_id = target_tweets.tweet_id
+            LEFT JOIN changed_tweets
+              ON changed_tweets.tweet_id = target_tweets.tweet_id
+            "#,
+        )
+        .bind(tweet_ids)
+        .bind(serde_json::to_value(refs)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    relation_sync_status_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn sync_tweet_symbol_refs(
+        &self,
+        tweet_ids: &[i64],
+        refs: &[TweetSymbolRef],
+    ) -> AppResult<HashMap<i64, RelationSyncStatus>> {
+        if tweet_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH target_tweets AS (
+                SELECT DISTINCT UNNEST($1::BIGINT[]) AS tweet_id
+            ),
+            existing_tweets AS (
+                SELECT target_tweets.tweet_id
+                FROM target_tweets
+                JOIN tweet.tweet AS t
+                  ON t.id = target_tweets.tweet_id
+            ),
+            input_refs AS (
+                SELECT DISTINCT ON (item.tweet_id, item.symbol_id)
+                    item.tweet_id,
+                    item.symbol_id
+                FROM jsonb_to_recordset($2::jsonb) AS item(
+                    tweet_id BIGINT,
+                    symbol_id INTEGER
+                )
+                JOIN existing_tweets
+                  ON existing_tweets.tweet_id = item.tweet_id
+                ORDER BY item.tweet_id, item.symbol_id
+            ),
+            desired_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(input_refs.symbol_id ORDER BY input_refs.symbol_id)
+                            FILTER (WHERE input_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN input_refs
+                  ON input_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            current_state AS (
+                SELECT
+                    existing_tweets.tweet_id,
+                    COALESCE(
+                        jsonb_agg(current_refs.symbol_id ORDER BY current_refs.symbol_id)
+                            FILTER (WHERE current_refs.tweet_id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS refs
+                FROM existing_tweets
+                LEFT JOIN tweet.tweet_symbol_ref AS current_refs
+                  ON current_refs.tweet_id = existing_tweets.tweet_id
+                GROUP BY existing_tweets.tweet_id
+            ),
+            changed_tweets AS (
+                SELECT desired_state.tweet_id
+                FROM desired_state
+                JOIN current_state
+                  ON current_state.tweet_id = desired_state.tweet_id
+                WHERE desired_state.refs IS DISTINCT FROM current_state.refs
+            ),
+            deleted AS (
+                DELETE FROM tweet.tweet_symbol_ref
+                WHERE tweet_id IN (SELECT tweet_id FROM changed_tweets)
+            ),
+            inserted AS (
+                INSERT INTO tweet.tweet_symbol_ref (tweet_id, symbol_id)
+                SELECT input_refs.tweet_id, input_refs.symbol_id
+                FROM input_refs
+                JOIN changed_tweets
+                  ON changed_tweets.tweet_id = input_refs.tweet_id
+            )
+            SELECT
+                target_tweets.tweet_id,
+                CASE
+                    WHEN existing_tweets.tweet_id IS NULL THEN 'missing_tweet'
+                    WHEN changed_tweets.tweet_id IS NOT NULL THEN 'replaced'
+                    ELSE 'unchanged'
+                END AS status
+            FROM target_tweets
+            LEFT JOIN existing_tweets
+              ON existing_tweets.tweet_id = target_tweets.tweet_id
+            LEFT JOIN changed_tweets
+              ON changed_tweets.tweet_id = target_tweets.tweet_id
+            "#,
+        )
+        .bind(tweet_ids)
+        .bind(serde_json::to_value(refs)?)
+        .fetch_all(self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get::<i64, _>("tweet_id"),
+                    relation_sync_status_from_db(row.get::<String, _>("status").as_str())?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn fetch_latest_user_snapshot_json(&self, user_id: i64) -> AppResult<Option<Value>> {
@@ -2689,108 +3532,52 @@ impl<'a> TweetStore<'a> {
         Ok(())
     }
 
+    pub async fn preload_submit_batch_dicts(
+        &self,
+        snapshots: &[UserSnapshot],
+        places: &[TweetPlace],
+        tweets: &[Tweet],
+        policies: &[TweetPolicy],
+        notes: &[TweetCommunityNote],
+        media: &[Media],
+        resources: &[MediaResource],
+    ) -> AppResult<()> {
+        let mut entries = Vec::new();
+        collect_user_snapshot_dicts(&mut entries, snapshots);
+        collect_tweet_place_dicts(&mut entries, places);
+        collect_tweet_dicts(&mut entries, tweets);
+        collect_tweet_policy_dicts(&mut entries, policies);
+        collect_tweet_community_note_dicts(&mut entries, notes);
+        collect_media_dicts(&mut entries, media);
+        collect_media_resource_dicts(&mut entries, resources);
+        self.preload_dict_entries(entries).await
+    }
+
     async fn preload_dict_entries(&self, entries: Vec<(StringSemantic, String)>) -> AppResult<()> {
         self.string_dict.ensure_many(self.pool, entries).await
     }
 
     async fn preload_user_snapshot_dicts(&self, snapshots: &[UserSnapshot]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for snapshot in snapshots {
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetUserAvatarShape,
-                snapshot.avatar_shape.as_deref(),
-            );
-            if let Some(bio) = snapshot.bio.as_ref() {
-                collect_annotated_text_dicts(&mut entries, bio);
-            }
-            if let Some(identity) = snapshot.identity.as_ref() {
-                if let Some(verification) = identity.verification.as_ref() {
-                    push_optional_entry(
-                        &mut entries,
-                        StringSemantic::TweetUserVerificationType,
-                        verification.verified_type.as_deref(),
-                    );
-                }
-                if let Some(disclosure) = identity.disclosure.as_ref() {
-                    push_optional_entry(
-                        &mut entries,
-                        StringSemantic::TweetUserDisclosureRelation,
-                        disclosure.relation.as_deref(),
-                    );
-                }
-                push_optional_entry(
-                    &mut entries,
-                    StringSemantic::TweetUserParodyLabel,
-                    identity.parody_label.as_deref(),
-                );
-            }
-            if let Some(professional) = snapshot.professional.as_ref() {
-                push_optional_entry(
-                    &mut entries,
-                    StringSemantic::TweetUserProfessionalType,
-                    professional.professional_type.as_deref(),
-                );
-            }
-        }
+        collect_user_snapshot_dicts(&mut entries, snapshots);
         self.preload_dict_entries(entries).await
     }
 
     async fn preload_tweet_place_dicts(&self, places: &[TweetPlace]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for place in places {
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetCountryName,
-                place.country.as_deref(),
-            );
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetCountryCode,
-                place.country_code.as_deref(),
-            );
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetPlaceKind,
-                place.kind.as_deref(),
-            );
-        }
+        collect_tweet_place_dicts(&mut entries, places);
         self.preload_dict_entries(entries).await
     }
 
     async fn preload_tweet_dicts(&self, tweets: &[Tweet]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for tweet in tweets {
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetSource,
-                tweet.source.as_deref(),
-            );
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetLanguageCode,
-                tweet.language.as_deref(),
-            );
-            collect_annotated_text_dicts(&mut entries, &tweet.legacy_text);
-            if let Some(note_text) = tweet.note_text.as_ref() {
-                collect_annotated_text_dicts(&mut entries, note_text);
-            }
-        }
+        collect_tweet_dicts(&mut entries, tweets);
         self.preload_dict_entries(entries).await
     }
 
     async fn preload_tweet_policy_dicts(&self, policies: &[TweetPolicy]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for policy in policies {
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetReplyPolicyCode,
-                policy.reply_policy.as_deref(),
-            );
-            for action in &policy.available_actions {
-                entries.push((StringSemantic::TweetActionCode, action.clone()));
-            }
-        }
+        collect_tweet_policy_dicts(&mut entries, policies);
         self.preload_dict_entries(entries).await
     }
 
@@ -2799,64 +3586,19 @@ impl<'a> TweetStore<'a> {
         notes: &[TweetCommunityNote],
     ) -> AppResult<()> {
         let mut entries = Vec::new();
-        for note in notes {
-            if let Some(subtitle) = note.subtitle.as_ref() {
-                collect_annotated_text_dicts(&mut entries, subtitle);
-            }
-            if let Some(footer) = note.footer.as_ref() {
-                collect_annotated_text_dicts(&mut entries, footer);
-            }
-        }
+        collect_tweet_community_note_dicts(&mut entries, notes);
         self.preload_dict_entries(entries).await
     }
 
     async fn preload_media_dicts(&self, media: &[Media]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for item in media {
-            if let Some(size_variants) = item.size_variants.as_ref() {
-                collect_optional_media_size_variant_dicts(
-                    &mut entries,
-                    size_variants.large.as_ref(),
-                );
-                collect_optional_media_size_variant_dicts(
-                    &mut entries,
-                    size_variants.medium.as_ref(),
-                );
-                collect_optional_media_size_variant_dicts(
-                    &mut entries,
-                    size_variants.small.as_ref(),
-                );
-                collect_optional_media_size_variant_dicts(
-                    &mut entries,
-                    size_variants.thumb.as_ref(),
-                );
-            }
-            for tag in &item.tagged_users {
-                push_optional_entry(
-                    &mut entries,
-                    StringSemantic::TweetMediaTagKind,
-                    tag.kind.as_deref(),
-                );
-            }
-            for warning in &item.sensitivity_warnings {
-                entries.push((StringSemantic::TweetMediaSensitivityCode, warning.clone()));
-            }
-        }
+        collect_media_dicts(&mut entries, media);
         self.preload_dict_entries(entries).await
     }
 
     async fn preload_media_resource_dicts(&self, resources: &[MediaResource]) -> AppResult<()> {
         let mut entries = Vec::new();
-        for resource in resources {
-            push_optional_entry(
-                &mut entries,
-                StringSemantic::TweetMediaAvailabilityStatus,
-                resource.availability.as_deref(),
-            );
-            if let Some(video) = resource.video.as_ref() {
-                collect_media_video_dicts(&mut entries, video);
-            }
-        }
+        collect_media_resource_dicts(&mut entries, resources);
         self.preload_dict_entries(entries).await
     }
 
@@ -3457,6 +4199,156 @@ fn push_optional_entry(
     }
 }
 
+fn collect_user_snapshot_dicts(
+    entries: &mut Vec<(StringSemantic, String)>,
+    snapshots: &[UserSnapshot],
+) {
+    for snapshot in snapshots {
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetUserAvatarShape,
+            snapshot.avatar_shape.as_deref(),
+        );
+        if let Some(bio) = snapshot.bio.as_ref() {
+            collect_annotated_text_dicts(entries, bio);
+        }
+        if let Some(identity) = snapshot.identity.as_ref() {
+            if let Some(verification) = identity.verification.as_ref() {
+                push_optional_entry(
+                    entries,
+                    StringSemantic::TweetUserVerificationType,
+                    verification.verified_type.as_deref(),
+                );
+            }
+            if let Some(disclosure) = identity.disclosure.as_ref() {
+                push_optional_entry(
+                    entries,
+                    StringSemantic::TweetUserDisclosureRelation,
+                    disclosure.relation.as_deref(),
+                );
+            }
+            push_optional_entry(
+                entries,
+                StringSemantic::TweetUserParodyLabel,
+                identity.parody_label.as_deref(),
+            );
+        }
+        if let Some(professional) = snapshot.professional.as_ref() {
+            push_optional_entry(
+                entries,
+                StringSemantic::TweetUserProfessionalType,
+                professional.professional_type.as_deref(),
+            );
+        }
+    }
+}
+
+fn collect_tweet_place_dicts(entries: &mut Vec<(StringSemantic, String)>, places: &[TweetPlace]) {
+    for place in places {
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetCountryName,
+            place.country.as_deref(),
+        );
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetCountryCode,
+            place.country_code.as_deref(),
+        );
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetPlaceKind,
+            place.kind.as_deref(),
+        );
+    }
+}
+
+fn collect_tweet_dicts(entries: &mut Vec<(StringSemantic, String)>, tweets: &[Tweet]) {
+    for tweet in tweets {
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetSource,
+            tweet.source.as_deref(),
+        );
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetLanguageCode,
+            tweet.language.as_deref(),
+        );
+        collect_annotated_text_dicts(entries, &tweet.legacy_text);
+        if let Some(note_text) = tweet.note_text.as_ref() {
+            collect_annotated_text_dicts(entries, note_text);
+        }
+    }
+}
+
+fn collect_tweet_policy_dicts(
+    entries: &mut Vec<(StringSemantic, String)>,
+    policies: &[TweetPolicy],
+) {
+    for policy in policies {
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetReplyPolicyCode,
+            policy.reply_policy.as_deref(),
+        );
+        for action in &policy.available_actions {
+            entries.push((StringSemantic::TweetActionCode, action.clone()));
+        }
+    }
+}
+
+fn collect_tweet_community_note_dicts(
+    entries: &mut Vec<(StringSemantic, String)>,
+    notes: &[TweetCommunityNote],
+) {
+    for note in notes {
+        if let Some(subtitle) = note.subtitle.as_ref() {
+            collect_annotated_text_dicts(entries, subtitle);
+        }
+        if let Some(footer) = note.footer.as_ref() {
+            collect_annotated_text_dicts(entries, footer);
+        }
+    }
+}
+
+fn collect_media_dicts(entries: &mut Vec<(StringSemantic, String)>, media: &[Media]) {
+    for item in media {
+        if let Some(size_variants) = item.size_variants.as_ref() {
+            collect_optional_media_size_variant_dicts(entries, size_variants.large.as_ref());
+            collect_optional_media_size_variant_dicts(entries, size_variants.medium.as_ref());
+            collect_optional_media_size_variant_dicts(entries, size_variants.small.as_ref());
+            collect_optional_media_size_variant_dicts(entries, size_variants.thumb.as_ref());
+        }
+        for tag in &item.tagged_users {
+            push_optional_entry(
+                entries,
+                StringSemantic::TweetMediaTagKind,
+                tag.kind.as_deref(),
+            );
+        }
+        for warning in &item.sensitivity_warnings {
+            entries.push((StringSemantic::TweetMediaSensitivityCode, warning.clone()));
+        }
+    }
+}
+
+fn collect_media_resource_dicts(
+    entries: &mut Vec<(StringSemantic, String)>,
+    resources: &[MediaResource],
+) {
+    for resource in resources {
+        push_optional_entry(
+            entries,
+            StringSemantic::TweetMediaAvailabilityStatus,
+            resource.availability.as_deref(),
+        );
+        if let Some(video) = resource.video.as_ref() {
+            collect_media_video_dicts(entries, video);
+        }
+    }
+}
+
 fn collect_annotated_text_dicts(entries: &mut Vec<(StringSemantic, String)>, text: &AnnotatedText) {
     for style in &text.styles {
         for name in &style.styles {
@@ -3576,8 +4468,22 @@ fn conditional_write_from_db(value: &str) -> AppResult<ConditionalWrite> {
         "duplicate" => Ok(ConditionalWrite::SkippedDuplicate),
         "unchanged" => Ok(ConditionalWrite::SkippedUnchanged),
         "interval" => Ok(ConditionalWrite::SkippedInterval),
+        "missing_parent" => Ok(ConditionalWrite::SkippedMissingParent),
         other => Err(AppError::upstream(format!(
             "unexpected conditional write status: {other}"
+        ))),
+    }
+}
+
+fn relation_sync_status_from_db(value: &str) -> AppResult<RelationSyncStatus> {
+    match value {
+        "replaced" => Ok(RelationSyncStatus::Replaced),
+        "replaced_filtered" => Ok(RelationSyncStatus::ReplacedFiltered),
+        "unchanged" => Ok(RelationSyncStatus::SkippedUnchanged),
+        "unchanged_filtered" => Ok(RelationSyncStatus::SkippedUnchangedFiltered),
+        "missing_tweet" => Ok(RelationSyncStatus::SkippedMissingTweet),
+        other => Err(AppError::upstream(format!(
+            "unexpected relation sync status: {other}"
         ))),
     }
 }

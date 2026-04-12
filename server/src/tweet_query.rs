@@ -142,15 +142,14 @@ async fn query_users(
         }
     }
 
-    let hashtags = store
-        .fetch_hashtags(&hashtag_ids.into_iter().collect::<Vec<_>>())
-        .await?;
-    let symbols = store
-        .fetch_symbols(&symbol_ids.into_iter().collect::<Vec<_>>())
-        .await?;
-    let categories = store
-        .fetch_user_categories(&category_ids.into_iter().collect::<Vec<_>>())
-        .await?;
+    let hashtag_ids = hashtag_ids.into_iter().collect::<Vec<_>>();
+    let symbol_ids = symbol_ids.into_iter().collect::<Vec<_>>();
+    let category_ids = category_ids.into_iter().collect::<Vec<_>>();
+    let (hashtags, symbols, categories) = tokio::try_join!(
+        store.fetch_hashtags(&hashtag_ids),
+        store.fetch_symbols(&symbol_ids),
+        store.fetch_user_categories(&category_ids),
+    )?;
 
     let mut results = Vec::with_capacity(selections.len());
     for selection in selections {
@@ -233,8 +232,6 @@ async fn query_tweet_objects(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let places_raw = store.fetch_tweet_places_json_many(&place_ids).await?;
-    let places = decode_string_map::<DbTweetPlace>(places_raw, "tweet place");
 
     let mut hashtag_ids = HashSet::new();
     let mut symbol_ids = HashSet::new();
@@ -259,12 +256,14 @@ async fn query_tweet_objects(
         );
     }
 
-    let hashtags = store
-        .fetch_hashtags(&hashtag_ids.into_iter().collect::<Vec<_>>())
-        .await?;
-    let symbols = store
-        .fetch_symbols(&symbol_ids.into_iter().collect::<Vec<_>>())
-        .await?;
+    let hashtag_ids = hashtag_ids.into_iter().collect::<Vec<_>>();
+    let symbol_ids = symbol_ids.into_iter().collect::<Vec<_>>();
+    let (places_raw, hashtags, symbols) = tokio::try_join!(
+        store.fetch_tweet_places_json_many(&place_ids),
+        store.fetch_hashtags(&hashtag_ids),
+        store.fetch_symbols(&symbol_ids),
+    )?;
+    let places = decode_string_map::<DbTweetPlace>(places_raw, "tweet place");
 
     let mut results = Vec::with_capacity(selections.len());
     for selection in selections {
