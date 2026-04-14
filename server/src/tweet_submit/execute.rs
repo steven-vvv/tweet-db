@@ -591,90 +591,61 @@ async fn replace_prepared_tweet_relations(
         .iter()
         .flat_map(|item| item.media_refs.iter().cloned())
         .collect::<Vec<_>>();
-    match store.sync_tweet_media_refs(&tweet_ids, &media_refs).await {
+    let mention_refs = prepared
+        .tweet_relations
+        .iter()
+        .flat_map(|item| item.mention_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    let hashtag_refs = prepared
+        .tweet_relations
+        .iter()
+        .flat_map(|item| item.hashtag_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    let symbol_refs = prepared
+        .tweet_relations
+        .iter()
+        .flat_map(|item| item.symbol_refs.iter().cloned())
+        .collect::<Vec<_>>();
+    match store
+        .sync_tweet_relations(
+            &tweet_ids,
+            &media_refs,
+            &mention_refs,
+            &hashtag_refs,
+            &symbol_refs,
+        )
+        .await
+    {
         Ok(statuses) => {
             for item in &prepared.tweet_relations {
+                let status = statuses.get(&item.tweet_id).copied();
                 record_relation_sync(
                     &mut prepared.tweet_results[item.index],
                     "tweet_media_ref",
-                    statuses.get(&item.tweet_id).copied(),
+                    status.map(|value| value.media),
+                );
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_mention_ref",
+                    status.map(|value| value.mention),
+                );
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_hashtag_ref",
+                    status.map(|value| value.hashtag),
+                );
+                record_relation_sync(
+                    &mut prepared.tweet_results[item.index],
+                    "tweet_symbol_ref",
+                    status.map(|value| value.symbol),
                 );
             }
         }
         Err(error) => {
             for item in &prepared.tweet_relations {
                 prepared.tweet_results[item.index].failed("tweet_media_ref", error.to_string());
-            }
-        }
-    }
-
-    let mention_refs = prepared
-        .tweet_relations
-        .iter()
-        .flat_map(|item| item.mention_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    match store
-        .sync_tweet_mention_refs(&tweet_ids, &mention_refs)
-        .await
-    {
-        Ok(statuses) => {
-            for item in &prepared.tweet_relations {
-                record_relation_sync(
-                    &mut prepared.tweet_results[item.index],
-                    "tweet_mention_ref",
-                    statuses.get(&item.tweet_id).copied(),
-                );
-            }
-        }
-        Err(error) => {
-            for item in &prepared.tweet_relations {
                 prepared.tweet_results[item.index].failed("tweet_mention_ref", error.to_string());
-            }
-        }
-    }
-
-    let hashtag_refs = prepared
-        .tweet_relations
-        .iter()
-        .flat_map(|item| item.hashtag_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    match store
-        .sync_tweet_hashtag_refs(&tweet_ids, &hashtag_refs)
-        .await
-    {
-        Ok(statuses) => {
-            for item in &prepared.tweet_relations {
-                record_relation_sync(
-                    &mut prepared.tweet_results[item.index],
-                    "tweet_hashtag_ref",
-                    statuses.get(&item.tweet_id).copied(),
-                );
-            }
-        }
-        Err(error) => {
-            for item in &prepared.tweet_relations {
                 prepared.tweet_results[item.index].failed("tweet_hashtag_ref", error.to_string());
-            }
-        }
-    }
-
-    let symbol_refs = prepared
-        .tweet_relations
-        .iter()
-        .flat_map(|item| item.symbol_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    match store.sync_tweet_symbol_refs(&tweet_ids, &symbol_refs).await {
-        Ok(statuses) => {
-            for item in &prepared.tweet_relations {
-                record_relation_sync(
-                    &mut prepared.tweet_results[item.index],
-                    "tweet_symbol_ref",
-                    statuses.get(&item.tweet_id).copied(),
-                );
-            }
-        }
-        Err(error) => {
-            for item in &prepared.tweet_relations {
                 prepared.tweet_results[item.index].failed("tweet_symbol_ref", error.to_string());
             }
         }
