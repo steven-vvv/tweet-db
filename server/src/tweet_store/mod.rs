@@ -52,6 +52,14 @@ pub enum RelationSyncStatus {
     SkippedMissingTweet,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TweetRelationSyncStatuses {
+    pub media: RelationSyncStatus,
+    pub mention: RelationSyncStatus,
+    pub hashtag: RelationSyncStatus,
+    pub symbol: RelationSyncStatus,
+}
+
 impl<'a> TweetStore<'a> {
     pub fn new(pool: &'a PgPool, string_dict: &'a StringDictCache) -> Self {
         Self { pool, string_dict }

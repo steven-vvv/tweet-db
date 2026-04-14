@@ -1,50 +1,6 @@
 use super::*;
 
 #[derive(Debug, sqlx::FromRow)]
-pub(super) struct UserStatsRow {
-    pub(super) recorded_at: time::OffsetDateTime,
-    pub(super) followers: Option<i64>,
-    pub(super) following: Option<i64>,
-    pub(super) likes: Option<i64>,
-    pub(super) media_posts: Option<i64>,
-    pub(super) tweets: Option<i64>,
-    pub(super) listed: Option<i64>,
-}
-
-impl UserStatsRow {
-    pub(super) fn same_user_stats(&self, value: &UserStats) -> bool {
-        self.followers == value.followers
-            && self.following == value.following
-            && self.likes == value.likes
-            && self.media_posts == value.media_posts
-            && self.tweets == value.tweets
-            && self.listed == value.listed
-    }
-}
-
-#[derive(Debug, sqlx::FromRow)]
-pub(super) struct TweetStatsRow {
-    pub(super) recorded_at: time::OffsetDateTime,
-    pub(super) views: Option<i64>,
-    pub(super) replies: Option<i64>,
-    pub(super) reposts: Option<i64>,
-    pub(super) quotes: Option<i64>,
-    pub(super) likes: Option<i64>,
-    pub(super) bookmarks: Option<i64>,
-}
-
-impl TweetStatsRow {
-    pub(super) fn same_tweet_stats(&self, value: &TweetStats) -> bool {
-        self.views == value.views
-            && self.replies == value.replies
-            && self.reposts == value.reposts
-            && self.quotes == value.quotes
-            && self.likes == value.likes
-            && self.bookmarks == value.bookmarks
-    }
-}
-
-#[derive(Debug, sqlx::FromRow)]
 pub(super) struct JsonRowI64 {
     pub(super) id: i64,
     pub(super) data: Value,
@@ -107,5 +63,58 @@ pub(super) fn relation_sync_status_from_db(value: &str) -> AppResult<RelationSyn
         other => Err(AppError::upstream(format!(
             "unexpected relation sync status: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditional_write_status_mapping_covers_submit_statuses() {
+        assert_eq!(
+            conditional_write_from_db("inserted").unwrap(),
+            ConditionalWrite::Inserted
+        );
+        assert_eq!(
+            conditional_write_from_db("duplicate").unwrap(),
+            ConditionalWrite::SkippedDuplicate
+        );
+        assert_eq!(
+            conditional_write_from_db("unchanged").unwrap(),
+            ConditionalWrite::SkippedUnchanged
+        );
+        assert_eq!(
+            conditional_write_from_db("interval").unwrap(),
+            ConditionalWrite::SkippedInterval
+        );
+        assert_eq!(
+            conditional_write_from_db("missing_parent").unwrap(),
+            ConditionalWrite::SkippedMissingParent
+        );
+    }
+
+    #[test]
+    fn relation_sync_status_mapping_covers_relation_statuses() {
+        assert_eq!(
+            relation_sync_status_from_db("replaced").unwrap(),
+            RelationSyncStatus::Replaced
+        );
+        assert_eq!(
+            relation_sync_status_from_db("replaced_filtered").unwrap(),
+            RelationSyncStatus::ReplacedFiltered
+        );
+        assert_eq!(
+            relation_sync_status_from_db("unchanged").unwrap(),
+            RelationSyncStatus::SkippedUnchanged
+        );
+        assert_eq!(
+            relation_sync_status_from_db("unchanged_filtered").unwrap(),
+            RelationSyncStatus::SkippedUnchangedFiltered
+        );
+        assert_eq!(
+            relation_sync_status_from_db("missing_tweet").unwrap(),
+            RelationSyncStatus::SkippedMissingTweet
+        );
     }
 }
