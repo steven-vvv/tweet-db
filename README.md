@@ -14,6 +14,7 @@ The expected integration model is a Tampermonkey script using `GM_*` privileged 
 
 - [`docs/tweet-v2-schema-design.md`](docs/tweet-v2-schema-design.md): tweet v2 table relations and write policy
 - [`docs/tweet-v2-schema-notes.md`](docs/tweet-v2-schema-notes.md): tweet v2 schema organization notes
+- [`docs/product-discovery-questions.md`](docs/product-discovery-questions.md): product-oriented question list for clarifying desired scope and workflows
 
 ## Layout
 
