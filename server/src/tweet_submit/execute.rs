@@ -1,6 +1,8 @@
 use super::*;
+use crate::transfer::{self, EnqueueTransferTask, TransferEnqueueStatus};
 
 pub(super) async fn execute_prepared_submit(
+    state: &AppState,
     store: &TweetStore<'_>,
     prepared: &mut PreparedSubmitBatch,
     stats_interval: i64,
@@ -93,9 +95,17 @@ pub(super) async fn execute_prepared_submit(
     )
     .await;
     write_media_batch(store, &prepared.media, &mut prepared.media_results).await;
-    write_media_resources_batch(
+    let media_resource_statuses = write_media_resources_batch(
         store,
         &prepared.media_resources,
+        &mut prepared.media_results,
+    )
+    .await;
+    enqueue_prepared_media_transfers(
+        state,
+        &prepared.media,
+        &prepared.media_resources,
+        &media_resource_statuses,
         &mut prepared.media_results,
     )
     .await;
@@ -308,9 +318,9 @@ async fn write_media_resources_batch(
     store: &TweetStore<'_>,
     items: &[Indexed<MediaResource>],
     results: &mut [ObjectResultBuilder],
-) {
+) -> HashMap<(i64, OffsetDateTime), ConditionalWrite> {
     if items.is_empty() {
-        return;
+        return HashMap::new();
     }
 
     let values = items
@@ -330,10 +340,92 @@ async fn write_media_resources_batch(
                     }
                 }
             }
+            statuses
         }
         Err(error) => {
             for item in items {
                 results[item.index].failed("media_resource", error.to_string());
+            }
+            HashMap::new()
+        }
+    }
+}
+
+async fn enqueue_prepared_media_transfers(
+    state: &AppState,
+    media_items: &[Indexed<Media>],
+    resource_items: &[Indexed<MediaResource>],
+    resource_statuses: &HashMap<(i64, OffsetDateTime), ConditionalWrite>,
+    results: &mut [ObjectResultBuilder],
+) {
+    let mut media_by_index = HashMap::with_capacity(media_items.len());
+    for item in media_items {
+        media_by_index.insert(item.index, &item.value);
+    }
+
+    let transfer_status = transfer::status(&state.settings.config.transfer);
+    let mut tasks = Vec::new();
+    let mut task_indices = Vec::new();
+
+    for item in resource_items {
+        let key = (item.value.media_id, item.value.recorded_at);
+        if !matches!(
+            resource_statuses.get(&key),
+            Some(ConditionalWrite::Inserted)
+        ) {
+            continue;
+        }
+
+        if !transfer_status.active {
+            results[item.index].skipped("media_transfer", "transfer_disabled");
+            continue;
+        }
+
+        let Some(media) = media_by_index.get(&item.index).copied() else {
+            results[item.index].failed("media_transfer", "missing_media_payload");
+            continue;
+        };
+
+        let Some(source) = transfer::select_source(media, &item.value) else {
+            results[item.index].skipped("media_transfer", "source_unavailable");
+            continue;
+        };
+
+        tasks.push(EnqueueTransferTask {
+            id: Uuid::now_v7(),
+            media_id: item.value.media_id,
+            source_recorded_at: item.value.recorded_at,
+            source_url: source.source_url,
+            source_kind: source.source_kind.to_owned(),
+            source_content_type: source.source_content_type,
+        });
+        task_indices.push((item.index, key));
+    }
+
+    if tasks.is_empty() {
+        return;
+    }
+
+    match transfer::enqueue_tasks(&state.db, &tasks).await {
+        Ok(statuses) => {
+            for (index, key) in task_indices {
+                match statuses.get(&key).copied() {
+                    Some(TransferEnqueueStatus::Enqueued) => {
+                        results[index].accepted("media_transfer", "enqueued");
+                    }
+                    Some(TransferEnqueueStatus::AlreadyQueued) => {
+                        results[index].skipped("media_transfer", "already_enqueued");
+                    }
+                    Some(TransferEnqueueStatus::MissingSourceRecord) => {
+                        results[index].failed("media_transfer", "missing_source_record");
+                    }
+                    None => results[index].failed("media_transfer", "missing_enqueue_status"),
+                }
+            }
+        }
+        Err(error) => {
+            for (index, _) in task_indices {
+                results[index].failed("media_transfer", error.to_string());
             }
         }
     }

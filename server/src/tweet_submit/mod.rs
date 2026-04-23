@@ -636,7 +636,7 @@ pub async fn submit_tweets(
     let store = TweetStore::new(&state.db, &state.string_dict);
     let stats_interval = state.settings.config.ingest.stats_sample_interval_seconds;
     let mut prepared = prepare_submit_batch(&store, payload).await;
-    execute_prepared_submit(&store, &mut prepared, stats_interval).await;
+    execute_prepared_submit(&state, &store, &mut prepared, stats_interval).await;
 
     let mut response = SubmitTweetResponse {
         users: prepared
