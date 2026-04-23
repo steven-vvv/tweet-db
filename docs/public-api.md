@@ -141,6 +141,11 @@
           "name": "tweet_media_ref",
           "status": "accepted",
           "reason": "replaced"
+        },
+        {
+          "name": "media_transfer",
+          "status": "accepted",
+          "reason": "enqueued"
         }
       ]
     }
@@ -157,11 +162,13 @@
 - `status = skipped`：该对象未产生有效写入，例如重复输入被遮蔽、数据未变化或统计采样间隔未到。
 - `status = partial`：同一对象的部分子操作成功、部分失败。
 - `status = failed`：该对象未能完成有效处理。
-- `operations`：列出对象内部各子步骤，例如 `twitter_user`、`user_snapshot`、`tweet`、`tweet_stats`、`tweet_media_ref` 等。
+- `operations`：列出对象内部各子步骤，例如 `twitter_user`、`user_snapshot`、`tweet`、`tweet_stats`、`tweet_media_ref`、`media_transfer` 等。
 
 处理特性：
 
 - 这是对象级 best-effort 批处理接口。单个对象失败通常不会使整个批次返回非 `200`。
+- 当某个 `media` 对象在本次提交中写入了新的 `media_resource` 版本时，服务端会尝试自动创建 `media_transfer` 队列任务。
+- `media_transfer` 的常见结果包括 `enqueued`、`already_enqueued`、`source_unavailable`、`transfer_disabled`。
 - 请求级错误仅在鉴权失败、JSON 反序列化失败或对象总数超限等场景下返回非 `200`。
 
 ## `POST /api/v1/tweet/query`

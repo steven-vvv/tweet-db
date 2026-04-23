@@ -5,7 +5,6 @@
 ## Deferred
 
 - 基于新 schema 重建管理员帖子、作者、媒体浏览接口与对应 Web UI。
-- 重新接入 `media` schema 下的 transfer/storage 子系统，并确定新 tweet `media` 主表之外的本地资产建模方式。
 - 为用户头像、横幅等非 tweet media 资源设计独立资产注册与转存方案。
 - 设计 `vector` schema 下的 embedding、索引与召回结构。
 - 扩展 `audit` schema，使其覆盖 tweet 管理动作而不止用户管理审计。
