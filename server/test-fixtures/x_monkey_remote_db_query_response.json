@@ -1,0 +1,240 @@
+{
+  "summary": {
+    "total": 3,
+    "found": 3,
+    "missing": 0,
+    "failed": 0
+  },
+  "users": [
+    {
+      "id": "1234567890",
+      "status": "found",
+      "data": {
+        "id": "1234567890",
+        "registeredAt": "2024-01-01T00:00:00Z",
+        "profile": {
+          "fetchedAt": "2026-04-22T12:34:56Z",
+          "displayName": "Demo User",
+          "userName": "demo_user",
+          "avatarUrl": "https://pbs.twimg.com/profile_images/demo-avatar.jpg",
+          "usesDefaultAvatar": false,
+          "avatarShape": "Circle",
+          "bannerUrl": "https://pbs.twimg.com/profile_banners/demo-banner.jpg",
+          "location": "Shanghai",
+          "bio": {
+            "text": "hello #tweetdb",
+            "displayRange": {
+              "start": 0,
+              "end": 14
+            },
+            "entities": {
+              "hashtags": [
+                {
+                  "text": "tweetdb",
+                  "range": {
+                    "start": 6,
+                    "end": 14
+                  }
+                }
+              ],
+              "symbols": [],
+              "urls": [],
+              "mentions": [],
+              "media": []
+            },
+            "styles": []
+          },
+          "profileLinks": [
+            {
+              "url": "https://t.co/demo",
+              "expandedUrl": "https://example.com/demo",
+              "displayText": "example.com/demo"
+            }
+          ]
+        },
+        "pinnedTweetIds": [
+          "1912345678901234567"
+        ],
+        "identity": {
+          "verification": {
+            "isBlueVerified": true,
+            "type": "Business"
+          },
+          "parodyLabel": "None",
+          "hasCompletedNewAccountReview": true,
+          "isPossiblySensitive": false
+        },
+        "professional": {
+          "id": "1001",
+          "type": "Business",
+          "categories": [
+            {
+              "id": "101",
+              "name": "Technology"
+            }
+          ]
+        },
+        "stats": {
+          "fetchedAt": "2026-04-22T12:34:56Z",
+          "followers": 42,
+          "following": 7,
+          "likes": 9,
+          "mediaPosts": 3,
+          "tweets": 12,
+          "listed": 1
+        },
+        "features": {
+          "canDm": true,
+          "canTagMedia": true,
+          "isProtected": false,
+          "canBeSubscribed": false
+        }
+      }
+    }
+  ],
+  "tweets": [
+    {
+      "id": "1912345678901234567",
+      "status": "found",
+      "data": {
+        "id": "1912345678901234567",
+        "publishedAt": "2026-04-22T12:00:00Z",
+        "source": "Twitter Web App",
+        "authorId": "1234567890",
+        "place": null,
+        "content": {
+          "legacyText": {
+            "text": "hello world https://t.co/media",
+            "displayRange": {
+              "start": 0,
+              "end": 11
+            },
+            "entities": {
+              "hashtags": [],
+              "symbols": [],
+              "urls": [],
+              "mentions": [],
+              "media": [
+                {
+                  "mediaId": "1712345678901234567",
+                  "range": {
+                    "start": 12,
+                    "end": 30
+                  },
+                  "displayText": "pic.twitter.com/media",
+                  "expandedUrl": "https://x.com/demo/status/1912345678901234567/photo/1",
+                  "url": "https://t.co/media",
+                  "origin": {
+                    "tweetId": "1912345678901234567",
+                    "userId": "1234567890"
+                  }
+                }
+              ]
+            },
+            "styles": []
+          },
+          "mediaIds": [
+            "1712345678901234567"
+          ],
+          "language": "en"
+        },
+        "conversation": {
+          "conversationId": "1912345678901234567"
+        },
+        "stats": {
+          "fetchedAt": "2026-04-22T12:34:56Z",
+          "views": "88",
+          "replies": 1,
+          "reposts": 2,
+          "quotes": 0,
+          "likes": 5,
+          "bookmarks": 1
+        },
+        "edit": {
+          "versionIds": [
+            "1912345678901234500",
+            "1912345678901234567"
+          ],
+          "editableUntilAt": "2026-04-22T13:00:00Z",
+          "remainingEdits": "4"
+        },
+        "policy": {
+          "replyPolicy": "ByInvitation",
+          "followersOnly": false,
+          "isPossiblySensitive": false,
+          "availableActions": [
+            "reply",
+            "repost",
+            "like"
+          ],
+          "isMediaVisibilityRestricted": false,
+          "paidPromotion": false
+        },
+        "communityNote": null
+      }
+    }
+  ],
+  "media": [
+    {
+      "id": "1712345678901234567",
+      "status": "found",
+      "data": {
+        "id": "1712345678901234567",
+        "type": "photo",
+        "altText": "demo photo",
+        "grokPostId": null,
+        "geometry": {
+          "width": 1600,
+          "height": 900,
+          "focusRects": []
+        },
+        "variants": {
+          "large": {
+            "width": 1600,
+            "height": 900,
+            "resizeMode": "fit"
+          },
+          "medium": {
+            "width": 1200,
+            "height": 675,
+            "resizeMode": "fit"
+          },
+          "small": {
+            "width": 680,
+            "height": 383,
+            "resizeMode": "fit"
+          },
+          "thumb": {
+            "width": 150,
+            "height": 150,
+            "resizeMode": "crop"
+          }
+        },
+        "taggedUsers": [
+          {
+            "userId": "1234567890",
+            "kind": "user"
+          }
+        ],
+        "sensitivityWarnings": [],
+        "origin": {
+          "tweetId": "1912345678901234567",
+          "userId": "1234567890"
+        },
+        "details": {
+          "title": "Demo media",
+          "description": "Fixture payload for tweet-db remote db integration",
+          "siteUrl": "https://example.com/demo-media",
+          "isEmbeddable": true,
+          "isMonetizable": false
+        },
+        "resource": {
+          "fetchedAt": "2026-04-22T12:34:56Z",
+          "mediaUrl": "https://pbs.twimg.com/media/demo-photo.jpg",
+          "availability": "Available",
+          "video": null
+        }
+      }
+    }
+  ]
+}

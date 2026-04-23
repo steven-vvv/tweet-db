@@ -836,4 +836,24 @@ mod tests {
         assert_eq!(refs[0].display_order, 0);
         assert_eq!(refs[1].media_id, 11);
     }
+
+    #[test]
+    fn x_monkey_remote_db_submit_fixture_matches_request_contract() {
+        let request: SubmitTweetRequest = serde_json::from_str(include_str!(
+            "../../test-fixtures/x_monkey_remote_db_submit_payload.json"
+        ))
+        .unwrap();
+
+        assert_eq!(request.users.len(), 1);
+        assert_eq!(request.tweets.len(), 1);
+        assert_eq!(request.media.len(), 1);
+        assert_eq!(
+            request.tweets[0].edit.as_ref().unwrap().version_ids,
+            vec![
+                "1912345678901234500".to_owned(),
+                "1912345678901234567".to_owned()
+            ]
+        );
+        assert_eq!(request.media[0].availability.as_deref(), Some("Available"));
+    }
 }

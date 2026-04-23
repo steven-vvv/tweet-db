@@ -37,7 +37,7 @@ pub struct QueryIdSelector {
     pub id: String,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryTweetResponse {
     pub summary: QuerySummary,
@@ -46,7 +46,7 @@ pub struct QueryTweetResponse {
     pub media: Vec<QueryObjectResult>,
 }
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct QuerySummary {
     pub total: usize,
@@ -55,7 +55,7 @@ pub struct QuerySummary {
     pub failed: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryObjectResult {
     pub id: Option<String>,
@@ -66,7 +66,7 @@ pub struct QueryObjectResult {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryObjectStatus {
     Found,
@@ -145,5 +145,25 @@ mod tests {
         assert_eq!(summary.found, 1);
         assert_eq!(summary.missing, 1);
         assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn x_monkey_remote_db_query_fixture_matches_response_contract() {
+        let response: QueryTweetResponse = serde_json::from_str(include_str!(
+            "../../test-fixtures/x_monkey_remote_db_query_response.json"
+        ))
+        .unwrap();
+
+        assert_eq!(response.summary.total, 3);
+        assert_eq!(response.summary.found, 3);
+        assert_eq!(response.tweets[0].status, QueryObjectStatus::Found);
+        assert_eq!(
+            response.tweets[0].data.as_ref().unwrap()["edit"]["versionIds"][0],
+            "1912345678901234500"
+        );
+        assert_eq!(
+            response.media[0].data.as_ref().unwrap()["resource"]["availability"],
+            "Available"
+        );
     }
 }
