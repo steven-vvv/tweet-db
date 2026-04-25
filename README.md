@@ -1,35 +1,42 @@
 # tweet-db
 
-Centralized post capture storage and status service built with Axum, PostgreSQL, and Vue.
+`tweet-db` 是一个保存 X 帖子、查询同步状态、转储媒体文件的服务。后端使用 Axum 和 PostgreSQL，前端使用 Vue。
 
-The expected integration model is a Tampermonkey script using `GM_*` privileged network APIs as a centralized client for this service. Public API consumers use the session-check endpoint plus batch tweet submit/query endpoints; query requires a registered session, while submit is restricted to admin sessions. Login and first-time registration are handled separately through the built-in `/account` SPA.
+主要调用方是浏览器脚本，例如使用 `GM_*` 网络能力的 Tampermonkey 脚本。外部调用方可以检查会话、批量提交 tweet v2 数据、批量查询已保存数据。查询需要已注册会话，提交需要管理员会话。登录和首次绑定账号通过内置 `/account` 页面完成。
 
-## API Docs
+## 目录
 
-- [`docs/public-api.md`](docs/public-api.md): public business API under `/api/v1/...`
-- [`docs/internal-api.md`](docs/internal-api.md): internal-only API under `/internal/v1/...`
-- [`docs/integrations.md`](docs/integrations.md): external integration entrypoints under `/integrations/...`
+- `server/`：Rust 后端、数据库迁移、媒体转储 worker。
+- `webui/`：Vue 前端，包含 `/account` 和 `/admin` 页面。
+- `docs/`：当前项目文档。
 
-## Product Docs
+## 文档
 
-- [`docs/product-requirements.md`](docs/product-requirements.md): product feature scope, roles, and business requirements
+- [`docs/api.md`](docs/api.md)：HTTP API。
+- [`docs/architecture.md`](docs/architecture.md)：服务端、数据库、tweet 写入和媒体转储说明。
+- [`docs/roadmap.md`](docs/roadmap.md)：已完成内容、未完成内容和后续开发约束。
 
-## Design Docs
+## 本地检查
 
-- [`docs/tweet-v2-schema-design.md`](docs/tweet-v2-schema-design.md): tweet v2 table relations and write policy
-- [`docs/tweet-v2-schema-notes.md`](docs/tweet-v2-schema-notes.md): tweet v2 schema organization notes
-- [`docs/media-transfer-lifecycle.md`](docs/media-transfer-lifecycle.md): media transfer queue, worker lifecycle, and local verification flow
+在 `server/` 下运行：
 
-## Layout
+```bash
+cargo test
+cargo fmt -- --check
+```
 
-- `server/`: Rust backend and database migrations
-- `webui/`: Vue frontend for `/account` plus the internal `/admin` management console
+在 `webui/` 下运行：
 
-## Server TLS
+```bash
+bun run type
+bun run build
+```
 
-The backend server now supports protocol selection through the `server` section in TOML configuration:
+## HTTPS 配置
 
-- `server.mode = "http"` keeps the current plaintext listener behavior.
-- `server.mode = "https"` requires `server.tls.certificate_chain_path` and `server.tls.private_key_path`, both resolved relative to the loaded TOML file unless absolute paths are used.
+后端通过 TOML 配置中的 `[server]` 选择 HTTP 或 HTTPS：
 
-When `server.mode = "https"`, startup fails fast unless `app.base_url` and `sso.login_redirect_uri` use `https://`, and `session.cookie_secure = true`.
+- `server.mode = "http"`：使用普通 HTTP。
+- `server.mode = "https"`：需要配置 `server.tls.certificate_chain_path` 和 `server.tls.private_key_path`。相对路径按当前 TOML 文件所在目录解析。
+
+启用 HTTPS 时，`app.base_url` 和 `sso.login_redirect_uri` 必须使用 `https://`，并且 `session.cookie_secure = true`，否则服务会启动失败。

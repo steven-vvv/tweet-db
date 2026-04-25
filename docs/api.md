@@ -1,0 +1,345 @@
+# API 参考
+
+本文档记录当前服务端提供的 HTTP 接口。接口实现以 `server/src/routes.rs` 为准。
+
+通用约定：
+
+- 业务接口返回 JSON。
+- 认证使用会话 Cookie。
+- 请求级错误通常返回：
+
+```json
+{
+  "error": "..."
+}
+```
+
+## Public API
+
+公开接口统一使用 `/api/v1/...` 前缀。公开接口给浏览器脚本和外部调用方使用。
+
+### `GET /api/v1/session`
+
+查询当前请求的登录状态。未登录也返回 `200`。
+
+已登录并完成注册：
+
+```json
+{
+  "authenticated": true,
+  "registered": true,
+  "username": "demo_user",
+  "expires_at": "2026-04-01T08:00:00Z",
+  "account_url": null
+}
+```
+
+未登录：
+
+```json
+{
+  "authenticated": false,
+  "registered": false,
+  "username": null,
+  "expires_at": null,
+  "account_url": "http://127.0.0.1:3001/account"
+}
+```
+
+字段说明：
+
+- `authenticated`：是否有有效会话。
+- `registered`：是否完成本地账号绑定。
+- `username`：本地用户名；未登录或未绑定时为 `null`。
+- `expires_at`：会话过期时间。
+- `account_url`：需要用户继续登录或绑定账号时可跳转的地址。
+
+### `POST /api/v1/tweet/submit`
+
+批量提交用户、帖子和媒体对象。
+
+认证要求：需要已登录、已完成注册并且是管理员。缺少会话或未完成注册返回 `401`，非管理员返回 `403`。
+
+请求体根结构：
+
+```json
+{
+  "users": [],
+  "tweets": [],
+  "media": []
+}
+```
+
+请求规则：
+
+- `users`、`tweets`、`media` 可省略，服务端按空数组处理。
+- 对象 ID 和关联 ID 使用字符串形式的有符号 64 位整数。
+- 同一根数组中重复 ID 只处理最后一个合法输入，前面的结果会标记为 `skipped`。
+- 三个数组合计对象数不能超过 `ingest.max_items_per_batch`。
+
+最小请求示例：
+
+```json
+{
+  "tweets": [
+    {
+      "id": "1912345678901234567",
+      "publishedAt": "2026-04-10T08:30:00Z",
+      "authorId": "1234567890",
+      "content": {
+        "legacyText": {
+          "text": "hello world",
+          "entities": {}
+        },
+        "mediaIds": []
+      },
+      "conversation": {
+        "conversationId": "1912345678901234567"
+      }
+    }
+  ]
+}
+```
+
+成功响应结构：
+
+```json
+{
+  "summary": {
+    "total": 1,
+    "accepted": 1,
+    "skipped": 0,
+    "partial": 0,
+    "failed": 0
+  },
+  "users": [],
+  "tweets": [
+    {
+      "id": "1912345678901234567",
+      "status": "accepted",
+      "operations": [
+        {
+          "name": "tweet_author",
+          "status": "accepted",
+          "reason": "inserted_minimal"
+        },
+        {
+          "name": "tweet",
+          "status": "accepted",
+          "reason": "inserted_or_filled"
+        }
+      ]
+    }
+  ],
+  "media": []
+}
+```
+
+响应说明：
+
+- `summary` 按对象数量统计 `accepted`、`skipped`、`partial`、`failed`。
+- `users`、`tweets`、`media` 与输入顺序对应。
+- `accepted` 表示对象相关操作成功或无需重复写入。
+- `skipped` 表示没有产生有效写入，例如重复输入、数据未变化或采样间隔未到。
+- `partial` 表示部分操作成功、部分失败。
+- `failed` 表示对象没有完成有效处理。
+- 当提交写入新的 `media_resource` 版本时，服务端会尝试创建媒体转储任务。
+
+### `POST /api/v1/tweet/query`
+
+按对象 ID 批量查询当前保存的数据。
+
+认证要求：需要已登录并完成注册。缺少会话或未完成注册返回 `401`。
+
+请求体根结构：
+
+```json
+{
+  "users": [{ "id": "1234567890" }],
+  "tweets": [{ "id": "1912345678901234567" }],
+  "media": [{ "id": "1712345678901234567" }]
+}
+```
+
+请求规则：
+
+- `users`、`tweets`、`media` 可省略，服务端按空数组处理。
+- 三个数组合计对象数不能超过 `ingest.max_items_per_batch`。
+- 单个选择器中的 `id` 无效时，不会导致整个请求失败；对应结果返回 `status = failed`。
+
+成功响应结构：
+
+```json
+{
+  "summary": {
+    "total": 2,
+    "found": 1,
+    "missing": 1,
+    "failed": 0
+  },
+  "users": [
+    {
+      "id": "1234567890",
+      "status": "found",
+      "data": {
+        "id": "1234567890",
+        "registeredAt": "2020-01-01T00:00:00Z",
+        "profile": null,
+        "pinnedTweetIds": [],
+        "identity": null,
+        "professional": null,
+        "stats": null,
+        "features": null
+      }
+    }
+  ],
+  "tweets": [
+    {
+      "id": "1912345678901234567",
+      "status": "missing"
+    }
+  ],
+  "media": []
+}
+```
+
+响应说明：
+
+- `summary` 按对象数量统计 `found`、`missing`、`failed`。
+- `found` 表示查到对象，`data` 是当前规范化 JSON。
+- `missing` 表示对象不存在。
+- `failed` 表示选择器无效或服务端解码失败。
+- `data` 字段使用提交接口的 `camelCase` 命名，不保证和原始提交内容逐字节一致。
+
+## Internal API
+
+内部接口统一使用 `/internal/v1/...` 前缀，只给本站 Vue 前端和内部功能使用。
+
+### `GET /internal/v1/session`
+
+返回当前会话的内部视图，用于 `/account` 页面判断登录、注册和管理员状态。
+
+```json
+{
+  "authenticated": true,
+  "registered": true,
+  "is_admin": true,
+  "disabled": false,
+  "user_id": "0195f1df-0d69-7f7d-8c24-0c1af2d75001",
+  "username": "demo_user",
+  "subject_id": "0195f1de-fce0-7d91-b86d-7d7e8f2c1001",
+  "authorization_id": "0195f1df-0730-7f69-9a92-cd8e4eb4d001",
+  "expires_at": "2026-04-01T08:00:00Z"
+}
+```
+
+### `POST /internal/v1/auth/registration`
+
+首登后绑定本地用户名。
+
+认证要求：需要有效会话，并且当前会话处于待注册状态。
+
+```json
+{
+  "username": "demo_user"
+}
+```
+
+### `DELETE /internal/v1/session`
+
+注销当前会话，并尝试撤销对应 SSO 授权。未登录也允许调用。
+
+```json
+{
+  "ok": true
+}
+```
+
+### `GET /internal/v1/admin/users`
+
+查询用户列表。
+
+认证要求：需要管理员会话。
+
+查询参数：
+
+- `q`
+- `status=all|active|disabled`
+- `limit`
+- `cursor`
+
+响应结构：
+
+```json
+{
+  "items": [],
+  "nextCursor": "..."
+}
+```
+
+### `GET /internal/v1/admin/users/:user_id`
+
+查询用户详情，包括摘要、原始用户记录、最近会话、授权和审计记录。
+
+```json
+{
+  "summary": {},
+  "record": {},
+  "related": {}
+}
+```
+
+### `POST /internal/v1/admin/users/:user_id/disable`
+
+禁用其他用户，并清除该用户的会话。当前不允许管理员禁用自己。
+
+### `POST /internal/v1/admin/users/:user_id/enable`
+
+恢复已禁用用户。
+
+## Integrations
+
+集成入口使用 `/integrations/...` 前缀。
+
+### `GET /integrations/sso/callback`
+
+SSO 登录回调。外部 SSO 完成授权后跳转到这里，服务端换取授权结果并创建本地会话。
+
+当前行为：
+
+- 成功后重定向到 `/account`。
+- 上游返回错误时重定向到 `/account?error=<error>`。
+
+### `POST /integrations/sso/webhooks/revocations`
+
+SSO 授权撤销 webhook。服务端收到通知后更新授权状态，并删除相关会话。
+
+请求体：
+
+```json
+{
+  "authorization_id": "0195f1df-0730-7f69-9a92-cd8e4eb4d001"
+}
+```
+
+成功响应：`204 No Content`。
+
+## Removed Endpoints
+
+以下旧公开接口已移除：
+
+- `POST /api/v1/ingest/submissions`
+- `POST /api/v1/posts/status/query`
+- `POST /api/v1/auth/login-url`
+- `POST /api/v1/auth/registration`
+- `DELETE /api/v1/session`
+
+以下旧内部接口已移除：
+
+- `/internal/v1/admin/posts/*`
+- `/internal/v1/admin/actors/*`
+- `/internal/v1/admin/media/*`
+- `/internal/v1/admin/storage-objects/*`
+- `/internal/v1/admin/transfers/*`
+
+后续新增接口应继续使用当前 tweet v2 请求和响应形状，不回到旧版 ingest/status 协议。
