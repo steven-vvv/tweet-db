@@ -18,6 +18,19 @@
 5. 按 `[transfer]` 配置启动媒体转储 worker。
 6. 挂载 API 路由和前端静态文件路由。
 
+## 服务端代码组织
+
+服务端模块按领域和执行阶段分层：
+
+- `config/`：配置模型、路径解析、TLS/HTTPS 校验和配置测试。
+- `admin/`：管理员用户接口、cursor 时间兼容、分页和响应格式化。
+- `tweet_submit/`：提交 API 合同、handler、批处理状态、结果汇总、转换和写入执行。
+- `tweet_query/`：查询 API 合同、数据库读取类型、查询 fetch、decode 和 JSON build。
+- `tweet_store/`：数据库读写封装，tweet 写入按 places、tweets、edits、policies、stats、community notes 拆分。
+- `transfer/`：媒体转储队列、worker、下载、range 分片、上传和传输测试。
+
+对外入口集中在各领域的 `mod.rs`，路由层继续通过 `admin::*`、`tweet_submit::submit_tweets`、`tweet_query::query_tweets` 和 `transfer::*` 调用。
+
 ## 数据库结构
 
 数据库对象按 schema 分开：
