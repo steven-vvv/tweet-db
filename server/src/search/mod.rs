@@ -616,3 +616,140 @@ async fn fetch_tweet_document(
         published_at: row.get("published_at"),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn test_search_state(temp_dir: &TempDir) -> SearchState {
+        let config = SearchSection {
+            enabled: true,
+            index_dir: temp_dir.path().to_path_buf(),
+            worker_count: 1,
+            queue_batch_size: 200,
+            writer_memory_mb: 128,
+            commit_interval_seconds: 5,
+            stale_timeout_seconds: 300,
+            max_attempts: 8,
+        };
+
+        SearchState {
+            inner: Arc::new(SearchRuntime {
+                users: open_user_index(&config).unwrap(),
+                tweets: open_tweet_index(&config).unwrap(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_search_matches_chinese_display_name_and_handle() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.users;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 1001i64,
+                    index.fields.id_prefix => "1001",
+                    index.fields.user_name => "research_cn",
+                    index.fields.user_name_prefix => "research_cn",
+                    index.fields.display_name => "北京大学研究员",
+                    index.fields.updated_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let chinese_hits = state
+            .search_users(Some("北京"), SearchSort::Relevance, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(chinese_hits[0].id, 1001);
+
+        let handle_hits = state
+            .search_users(Some("research"), SearchSort::Relevance, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(handle_hits[0].id, 1001);
+    }
+
+    #[tokio::test]
+    async fn tweet_search_matches_body_filters_and_time_sort() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.tweets;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2001i64,
+                    index.fields.id_prefix => "2001",
+                    index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
+                    index.fields.body => "人工智能 搜索 排序",
+                    index.fields.relation => "original",
+                    index.fields.published_at => 10i64,
+                ))
+                .unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2002i64,
+                    index.fields.id_prefix => "2002",
+                    index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
+                    index.fields.body => "人工智能 搜索 新帖子",
+                    index.fields.relation => "reply",
+                    index.fields.published_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let hits = state
+            .search_tweets(
+                Some("人工智能"),
+                &TweetSearchFilters {
+                    author_id: Some(9001),
+                    relation: Some("all".to_owned()),
+                },
+                SearchSort::Time,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2002, 2001]
+        );
+
+        let reply_hits = state
+            .search_tweets(
+                Some("人工智能"),
+                &TweetSearchFilters {
+                    author_id: Some(9001),
+                    relation: Some("reply".to_owned()),
+                },
+                SearchSort::Time,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2002]
+        );
+    }
+
+    #[test]
+    fn normalizes_query_for_simplified_query_parser() {
+        assert_eq!(
+            normalized_query(Some(r#"field:value +(测试) OR rust"#)).unwrap(),
+            "field value 测试 or rust"
+        );
+    }
+}

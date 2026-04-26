@@ -28,6 +28,7 @@
 - `tweet_query/`：查询 API 合同、数据库读取类型、查询 fetch、decode 和 JSON build。
 - `tweet_store/`：数据库读写封装，tweet 写入按 places、tweets、edits、policies、stats、community notes 拆分。
 - `transfer/`：媒体转储队列、worker、下载、range 分片、上传和传输测试。
+- `search/`：Tantivy 全文索引、分词器、索引队列、worker 和管理台搜索辅助。
 
 对外入口集中在各领域的 `mod.rs`，路由层继续通过 `admin::*`、`tweet_submit::submit_tweets`、`tweet_query::query_tweets` 和 `transfer::*` 调用。
 
@@ -38,9 +39,10 @@
 - Overview 汇总账号、tweet v2 对象、转储队列和近期失败任务。
 - Accounts 管理本地账号启停。
 - X Users、Tweets、Media、Storage Objects 提供列表、详情、关联对象和原始 JSON。
+- X Users 和 Tweets 的 `q` 搜索使用 Tantivy；空 `q` 列表继续按数据库时间 cursor 分页。
 - Transfers 提供状态筛选、失败重试、排队取消和处理中任务释放。
 
-管理列表使用无状态 cursor 分页。cursor 中包含版本号、筛选条件和排序锚点；服务端每次按当前数据库状态查询。正文检索当前交给外部搜索引擎规划，管理台只做 ID、状态、类型和前缀类筛选。
+管理列表使用无状态 cursor 分页。cursor 中包含版本号、筛选条件和排序锚点；服务端每次按当前数据库状态查询。Tantivy 搜索路径使用 offset cursor，命中 ID 再回表读取管理台展示字段。
 
 ## 数据库结构
 
@@ -49,6 +51,7 @@
 - `tweet`：X 用户、帖子、媒体、关系表、字典和查询视图。
 - `iam`：本地用户、SSO subject、授权和会话。
 - `media`：媒体转储任务和对象存储记录。
+- `search`：Tantivy 索引任务队列和索引 worker 状态。
 - `audit`：后台操作审计。
 - `vector`：预留给后续 embedding 和检索。
 
@@ -90,7 +93,30 @@
 - 当前不保存帖子正文历史版本。
 - `tweet_mention_ref.user_id` 没有物理外键，用于兼容只知道被提及用户 ID 的情况。
 - `tweet_media_ref.media_id` 有物理外键，只能引用已存在媒体。
-- 数据库不做全文检索、模糊搜索或 URL 搜索。
+- 全文检索由 Tantivy 子系统负责。PostgreSQL 保存事实数据、索引任务和回表展示数据。
+
+## 全文搜索
+
+搜索子系统使用 Tantivy 嵌入在服务进程内。索引目录由 `[search].index_dir` 配置，当前包含 `users-v1` 和 `tweets-v1` 两个索引。
+
+索引内容：
+
+- Users：`tweet.user_snapshot` 最新版本的 `user_name` 和 `display_name`。
+- Tweets：`tweet.tweet` 的正文，优先使用 `note_text.body`，缺失时使用 `legacy_text.body`。
+- Tweets 同时写入 author、relation、published_at fast field，用于筛选和时间排序。
+
+写入流程：
+
+1. 提交接口完成数据库写入。
+2. 用户 snapshot 或 tweet 主体发生变化时写入 `search.index_queue`。
+3. search worker 领取 pending 任务，读取数据库最新态，更新 Tantivy 文档并 commit。
+4. 管理台搜索从 Tantivy 取命中 ID，再按 ID 回表生成列表 JSON。
+
+分词：
+
+- 正文、display name 和 handle 的主要全文字段使用 `tantivy-jieba`。
+- ID、handle 辅助字段使用 Tantivy ngram tokenizer，支持前缀和片段匹配。
+- 查询框使用简化语法，默认 AND，支持引号短语，字段名和范围语法会被清洗为普通文本。
 
 ## 字符串字典
 

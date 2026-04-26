@@ -323,7 +323,8 @@
 
 查询 X 用户列表。查询参数：
 
-- `q`：用户 ID、handle 或 display name 前缀。
+- `q`：用户 ID、handle、display name 搜索。传入 `q` 时使用 Tantivy 全文索引。
+- `sort=relevance|time`：传入 `q` 时可选；默认 `relevance`。
 - `limit`
 - `cursor`
 
@@ -335,9 +336,10 @@
 
 查询帖子列表。查询参数：
 
-- `q`：tweet ID 或 author ID 前缀。
+- `q`：tweet ID、author ID 或帖子正文搜索。帖子正文索引使用 `note_text.body` 优先，缺失时使用 `legacy_text.body`。
 - `authorId`
 - `relation=all|original|reply|quote|repost`
+- `sort=relevance|time`：传入 `q` 时可选；默认 `relevance`。
 - `limit`
 - `cursor`
 
