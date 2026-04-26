@@ -146,10 +146,7 @@ pub(super) async fn enqueue_prepared_media_transfers(
 }
 
 fn should_enqueue_media_transfer(status: Option<ConditionalWrite>) -> bool {
-    matches!(
-        status,
-        Some(ConditionalWrite::Inserted | ConditionalWrite::SkippedUnchanged)
-    )
+    matches!(status, Some(ConditionalWrite::Inserted))
 }
 
 #[cfg(test)]
@@ -157,11 +154,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_transfer_enqueue_covers_inserted_and_unchanged_resources() {
+    fn media_transfer_enqueue_requires_inserted_resource() {
         assert!(should_enqueue_media_transfer(Some(
             ConditionalWrite::Inserted
         )));
-        assert!(should_enqueue_media_transfer(Some(
+        assert!(!should_enqueue_media_transfer(Some(
             ConditionalWrite::SkippedUnchanged
         )));
         assert!(!should_enqueue_media_transfer(Some(
