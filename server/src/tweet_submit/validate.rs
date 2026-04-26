@@ -112,3 +112,9 @@ pub(super) fn validate_range(range: SubmitTextRange, field: &str) -> AppResult<S
     }
     Ok(range)
 }
+
+pub(super) fn postgres_timestamptz(value: OffsetDateTime) -> OffsetDateTime {
+    let nanosecond = value.nanosecond();
+    let truncated = nanosecond - (nanosecond % 1_000);
+    value.replace_nanosecond(truncated).unwrap_or(value)
+}

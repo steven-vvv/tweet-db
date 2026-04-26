@@ -86,10 +86,7 @@ pub(super) async fn enqueue_prepared_media_transfers(
 
     for item in resource_items {
         let key = (item.value.media_id, item.value.recorded_at);
-        if !matches!(
-            resource_statuses.get(&key),
-            Some(ConditionalWrite::Inserted)
-        ) {
+        if !should_enqueue_media_transfer(resource_statuses.get(&key).copied()) {
             continue;
         }
 
@@ -145,5 +142,34 @@ pub(super) async fn enqueue_prepared_media_transfers(
                 results[index].failed("media_transfer", error.to_string());
             }
         }
+    }
+}
+
+fn should_enqueue_media_transfer(status: Option<ConditionalWrite>) -> bool {
+    matches!(
+        status,
+        Some(ConditionalWrite::Inserted | ConditionalWrite::SkippedUnchanged)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_transfer_enqueue_covers_inserted_and_unchanged_resources() {
+        assert!(should_enqueue_media_transfer(Some(
+            ConditionalWrite::Inserted
+        )));
+        assert!(should_enqueue_media_transfer(Some(
+            ConditionalWrite::SkippedUnchanged
+        )));
+        assert!(!should_enqueue_media_transfer(Some(
+            ConditionalWrite::SkippedDuplicate
+        )));
+        assert!(!should_enqueue_media_transfer(Some(
+            ConditionalWrite::SkippedMissingParent
+        )));
+        assert!(!should_enqueue_media_transfer(None));
     }
 }

@@ -79,10 +79,12 @@ pub(in crate::tweet_submit) fn convert_media_resource(
 
     Some(Ok(MediaResource {
         media_id,
-        recorded_at: resource
-            .and_then(|resource| resource.fetched_at)
-            .or(media.fetched_at)
-            .unwrap_or(now),
+        recorded_at: postgres_timestamptz(
+            resource
+                .and_then(|resource| resource.fetched_at)
+                .or(media.fetched_at)
+                .unwrap_or(now),
+        ),
         media_url,
         availability,
         video,

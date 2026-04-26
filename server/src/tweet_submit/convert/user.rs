@@ -10,7 +10,7 @@ pub(in crate::tweet_submit) async fn convert_user_snapshot(
 ) -> AppResult<UserSnapshot> {
     Ok(UserSnapshot {
         user_id,
-        recorded_at: profile.fetched_at.or(user.fetched_at).unwrap_or(now),
+        recorded_at: postgres_timestamptz(profile.fetched_at.or(user.fetched_at).unwrap_or(now)),
         display_name: profile.display_name.clone(),
         user_name: profile.user_name.clone(),
         avatar_url: profile.avatar_url.clone(),
@@ -59,7 +59,7 @@ pub(in crate::tweet_submit) fn convert_user_stats(
 
     Ok(UserStats {
         user_id,
-        recorded_at: stats.fetched_at.or(parent_fetched_at).unwrap_or(now),
+        recorded_at: postgres_timestamptz(stats.fetched_at.or(parent_fetched_at).unwrap_or(now)),
         followers: stats.followers,
         following: stats.following,
         likes: stats.likes,

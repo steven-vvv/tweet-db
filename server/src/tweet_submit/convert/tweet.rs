@@ -180,7 +180,7 @@ pub(in crate::tweet_submit) fn convert_tweet_stats(
 
     Ok(TweetStats {
         tweet_id,
-        recorded_at: stats.fetched_at.or(parent_fetched_at).unwrap_or(now),
+        recorded_at: postgres_timestamptz(stats.fetched_at.or(parent_fetched_at).unwrap_or(now)),
         views: parse_optional_i64_string(stats.views.as_deref(), "tweet.stats.views")?,
         replies: stats.replies,
         reposts: stats.reposts,

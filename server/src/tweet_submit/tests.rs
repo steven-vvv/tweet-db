@@ -92,6 +92,14 @@ fn dedupe_media_refs_keeps_first_occurrence() {
 }
 
 #[test]
+fn submit_recorded_at_uses_postgres_microsecond_precision() {
+    let value = OffsetDateTime::from_unix_timestamp_nanos(1_234_567_890_123_456_789).unwrap();
+    let normalized = postgres_timestamptz(value);
+
+    assert_eq!(normalized.unix_timestamp_nanos(), 1_234_567_890_123_456_000);
+}
+
+#[test]
 fn x_monkey_remote_db_submit_fixture_matches_request_contract() {
     let request: SubmitTweetRequest = serde_json::from_str(include_str!(
         "../../test-fixtures/x_monkey_remote_db_submit_payload.json"
