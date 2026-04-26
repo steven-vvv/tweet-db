@@ -54,5 +54,15 @@ task_stale_timeout_seconds = 900
 worker_poll_interval_seconds = 5
 max_attempts = 8
 
+[search]
+enabled = true
+index_dir = "var/search"
+worker_count = 1
+queue_batch_size = 200
+writer_memory_mb = 128
+commit_interval_seconds = 5
+stale_timeout_seconds = 300
+max_attempts = 8
+
 [observability]
 log_filter = "tweet_db_server=info,tower_http=info,sqlx=warn"

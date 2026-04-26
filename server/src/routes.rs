@@ -148,8 +148,9 @@ mod tests {
     use super::*;
     use crate::{
         config::{
-            AppConfig, AppSecrets, AppSection, IngestSection, ObservabilitySection, ServerMode,
-            ServerSection, SessionSection, Settings, SsoSection, StorageSection, TransferSection,
+            AppConfig, AppSecrets, AppSection, IngestSection, ObservabilitySection, SearchSection,
+            ServerMode, ServerSection, SessionSection, Settings, SsoSection, StorageSection,
+            TransferSection,
         },
         state::AppState,
         string_dict::StringDictCache,
@@ -210,6 +211,16 @@ mod tests {
                     task_stale_timeout_seconds: 900,
                     worker_poll_interval_seconds: 5,
                     max_attempts: 1,
+                },
+                search: SearchSection {
+                    enabled: false,
+                    index_dir: "var/search".into(),
+                    worker_count: 1,
+                    queue_batch_size: 200,
+                    writer_memory_mb: 128,
+                    commit_interval_seconds: 5,
+                    stale_timeout_seconds: 300,
+                    max_attempts: 8,
                 },
                 observability: ObservabilitySection {
                     log_filter: "info".to_owned(),

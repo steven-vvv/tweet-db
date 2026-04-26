@@ -219,6 +219,54 @@ webui_dist_dir = "../../webui/dist"
     );
 }
 
+#[test]
+fn resolves_search_index_dir_relative_to_config_file() {
+    let temp_dir = TempDir::new();
+    let config_path = temp_dir.write(
+        "config/config.toml",
+        &test_config(
+            r#"
+listen_addr = "127.0.0.1:3001"
+webui_dist_dir = "../../webui/dist"
+"#,
+            "http://127.0.0.1:3001",
+            false,
+            "http://127.0.0.1:3001/integrations/sso/callback",
+        )
+        .replace(
+            "index_dir = \"var/search\"",
+            "index_dir = \"../search-index\"",
+        ),
+    );
+
+    let config = AppConfig::load(Some(&config_path)).unwrap();
+
+    assert_eq!(config.search.index_dir, temp_dir.path.join("search-index"));
+}
+
+#[test]
+fn rejects_zero_search_worker_count_when_enabled() {
+    let temp_dir = TempDir::new();
+    let config = test_config(
+        r#"
+listen_addr = "127.0.0.1:3001"
+webui_dist_dir = "../../webui/dist"
+"#,
+        "http://127.0.0.1:3001",
+        false,
+        "http://127.0.0.1:3001/integrations/sso/callback",
+    )
+    .replace(
+        "[search]\nenabled = true\nindex_dir = \"var/search\"\nworker_count = 1",
+        "[search]\nenabled = true\nindex_dir = \"var/search\"\nworker_count = 0",
+    );
+    let config_path = temp_dir.write("config.toml", &config);
+
+    let error = AppConfig::load(Some(&config_path)).unwrap_err();
+
+    assert!(matches!(error, AppError::Config(message) if message.contains("search.worker_count")));
+}
+
 fn test_config(
     server_body: &str,
     app_base_url: &str,
@@ -274,6 +322,16 @@ attempt_timeout_seconds = 300
 task_stale_timeout_seconds = 900
 worker_poll_interval_seconds = 5
 max_attempts = 1
+
+[search]
+enabled = true
+index_dir = "var/search"
+worker_count = 1
+queue_batch_size = 200
+writer_memory_mb = 128
+commit_interval_seconds = 5
+stale_timeout_seconds = 300
+max_attempts = 8
 
 [observability]
 log_filter = "info"

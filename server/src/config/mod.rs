@@ -66,6 +66,7 @@ pub struct AppConfig {
     pub ingest: IngestSection,
     pub storage: StorageSection,
     pub transfer: TransferSection,
+    pub search: SearchSection,
     pub observability: ObservabilitySection,
 }
 
@@ -97,6 +98,16 @@ impl AppConfig {
             ingest: parsed.ingest,
             storage: parsed.storage,
             transfer: parsed.transfer,
+            search: SearchSection {
+                enabled: parsed.search.enabled,
+                index_dir: resolve_path(base, &parsed.search.index_dir),
+                worker_count: parsed.search.worker_count,
+                queue_batch_size: parsed.search.queue_batch_size,
+                writer_memory_mb: parsed.search.writer_memory_mb,
+                commit_interval_seconds: parsed.search.commit_interval_seconds,
+                stale_timeout_seconds: parsed.search.stale_timeout_seconds,
+                max_attempts: parsed.search.max_attempts,
+            },
             observability: parsed.observability,
         };
         config.validate()?;
@@ -156,6 +167,44 @@ impl AppConfig {
             if self.transfer.max_attempts <= 0 {
                 return Err(AppError::config(
                     "transfer.max_attempts must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+        }
+
+        if self.search.enabled {
+            if self.search.worker_count == 0 {
+                return Err(AppError::config(
+                    "search.worker_count must be greater than 0 when search.enabled = true",
+                ));
+            }
+
+            if self.search.queue_batch_size == 0 {
+                return Err(AppError::config(
+                    "search.queue_batch_size must be greater than 0 when search.enabled = true",
+                ));
+            }
+
+            if self.search.writer_memory_mb == 0 {
+                return Err(AppError::config(
+                    "search.writer_memory_mb must be greater than 0 when search.enabled = true",
+                ));
+            }
+
+            if self.search.commit_interval_seconds == 0 {
+                return Err(AppError::config(
+                    "search.commit_interval_seconds must be greater than 0 when search.enabled = true",
+                ));
+            }
+
+            if self.search.stale_timeout_seconds == 0 {
+                return Err(AppError::config(
+                    "search.stale_timeout_seconds must be greater than 0 when search.enabled = true",
+                ));
+            }
+
+            if self.search.max_attempts <= 0 {
+                return Err(AppError::config(
+                    "search.max_attempts must be greater than 0 when search.enabled = true",
                 ));
             }
         }
@@ -290,6 +339,18 @@ fn default_task_stale_timeout_seconds() -> u64 {
     900
 }
 
+#[derive(Debug, Clone)]
+pub struct SearchSection {
+    pub enabled: bool,
+    pub index_dir: PathBuf,
+    pub worker_count: usize,
+    pub queue_batch_size: usize,
+    pub writer_memory_mb: usize,
+    pub commit_interval_seconds: u64,
+    pub stale_timeout_seconds: u64,
+    pub max_attempts: i32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilitySection {
     pub log_filter: String,
@@ -304,6 +365,8 @@ struct RawConfig {
     ingest: IngestSection,
     storage: StorageSection,
     transfer: TransferSection,
+    #[serde(default)]
+    search: RawSearchSection,
     observability: ObservabilitySection,
 }
 
@@ -320,6 +383,73 @@ struct RawServerSection {
 struct RawServerTlsSection {
     certificate_chain_path: String,
     private_key_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSearchSection {
+    #[serde(default = "default_search_enabled")]
+    enabled: bool,
+    #[serde(default = "default_search_index_dir")]
+    index_dir: String,
+    #[serde(default = "default_search_worker_count")]
+    worker_count: usize,
+    #[serde(default = "default_search_queue_batch_size")]
+    queue_batch_size: usize,
+    #[serde(default = "default_search_writer_memory_mb")]
+    writer_memory_mb: usize,
+    #[serde(default = "default_search_commit_interval_seconds")]
+    commit_interval_seconds: u64,
+    #[serde(default = "default_search_stale_timeout_seconds")]
+    stale_timeout_seconds: u64,
+    #[serde(default = "default_search_max_attempts")]
+    max_attempts: i32,
+}
+
+impl Default for RawSearchSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_search_enabled(),
+            index_dir: default_search_index_dir(),
+            worker_count: default_search_worker_count(),
+            queue_batch_size: default_search_queue_batch_size(),
+            writer_memory_mb: default_search_writer_memory_mb(),
+            commit_interval_seconds: default_search_commit_interval_seconds(),
+            stale_timeout_seconds: default_search_stale_timeout_seconds(),
+            max_attempts: default_search_max_attempts(),
+        }
+    }
+}
+
+fn default_search_enabled() -> bool {
+    true
+}
+
+fn default_search_index_dir() -> String {
+    "var/search".to_owned()
+}
+
+fn default_search_worker_count() -> usize {
+    1
+}
+
+fn default_search_queue_batch_size() -> usize {
+    200
+}
+
+fn default_search_writer_memory_mb() -> usize {
+    128
+}
+
+fn default_search_commit_interval_seconds() -> u64 {
+    5
+}
+
+fn default_search_stale_timeout_seconds() -> u64 {
+    300
+}
+
+fn default_search_max_attempts() -> i32 {
+    8
 }
 
 fn decode_key(name: &str, value: &str) -> AppResult<[u8; 32]> {
