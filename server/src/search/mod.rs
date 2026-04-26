@@ -121,6 +121,14 @@ pub fn build_state(settings: &Settings) -> AppResult<Option<SearchState>> {
 }
 
 impl SearchState {
+    fn user_document_count(&self) -> AppResult<u64> {
+        self.inner.users.document_count()
+    }
+
+    fn tweet_document_count(&self) -> AppResult<u64> {
+        self.inner.tweets.document_count()
+    }
+
     pub async fn search_users(
         &self,
         raw_query: Option<&str>,
@@ -227,6 +235,99 @@ impl<F> SearchIndex<F> {
     fn reload(&self) -> AppResult<()> {
         self.reader.reload().map_err(search_error)
     }
+
+    fn document_count(&self) -> AppResult<u64> {
+        self.reload()?;
+        Ok(self.reader.searcher().num_docs())
+    }
+}
+
+pub async fn enqueue_startup_backfill(
+    db: &PgPool,
+    search: &SearchState,
+    batch_size: usize,
+) -> AppResult<()> {
+    let user_db_count = count_user_facts(db).await?;
+    let user_index_count = search.user_document_count()?;
+    if should_backfill_index(user_index_count, user_db_count) {
+        let queued = enqueue_existing_targets(db, IndexTargetKind::User, batch_size).await?;
+        tracing::info!(
+            db_count = user_db_count,
+            index_count = user_index_count,
+            queued,
+            "queued startup user search backfill"
+        );
+    }
+
+    let tweet_db_count = count_tweet_facts(db).await?;
+    let tweet_index_count = search.tweet_document_count()?;
+    if should_backfill_index(tweet_index_count, tweet_db_count) {
+        let queued = enqueue_existing_targets(db, IndexTargetKind::Tweet, batch_size).await?;
+        tracing::info!(
+            db_count = tweet_db_count,
+            index_count = tweet_index_count,
+            queued,
+            "queued startup tweet search backfill"
+        );
+    }
+
+    Ok(())
+}
+
+async fn count_user_facts(db: &PgPool) -> AppResult<u64> {
+    count_facts(db, "SELECT COUNT(*) FROM tweet.twitter_user").await
+}
+
+async fn count_tweet_facts(db: &PgPool) -> AppResult<u64> {
+    count_facts(db, "SELECT COUNT(*) FROM tweet.tweet").await
+}
+
+async fn count_facts(db: &PgPool, sql: &str) -> AppResult<u64> {
+    let count = sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await?;
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+fn should_backfill_index(index_count: u64, db_count: u64) -> bool {
+    index_count != db_count
+}
+
+async fn enqueue_existing_targets(
+    db: &PgPool,
+    kind: IndexTargetKind,
+    batch_size: usize,
+) -> AppResult<u64> {
+    let sql = match kind {
+        IndexTargetKind::User => {
+            "SELECT id FROM tweet.twitter_user WHERE ($1::BIGINT IS NULL OR id > $1) ORDER BY id LIMIT $2"
+        }
+        IndexTargetKind::Tweet => {
+            "SELECT id FROM tweet.tweet WHERE ($1::BIGINT IS NULL OR id > $1) ORDER BY id LIMIT $2"
+        }
+    };
+    let mut last_id = None;
+    let mut queued = 0u64;
+    let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
+
+    loop {
+        let ids = sqlx::query_scalar::<_, i64>(sql)
+            .bind(last_id)
+            .bind(limit)
+            .fetch_all(db)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+
+        let targets = ids
+            .iter()
+            .map(|id| IndexTarget { kind, id: *id })
+            .collect::<Vec<_>>();
+        queue::enqueue_targets(db, &targets).await?;
+        queued = queued.saturating_add(u64::try_from(targets.len()).unwrap_or(u64::MAX));
+        last_id = ids.last().copied();
+    }
+
+    Ok(queued)
 }
 
 fn open_user_index(config: &SearchSection) -> AppResult<SearchIndex<UserFields>> {
@@ -743,6 +844,38 @@ mod tests {
             reply_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
             vec![2002]
         );
+    }
+
+    #[test]
+    fn startup_backfill_decision_detects_count_mismatch() {
+        assert!(!should_backfill_index(0, 0));
+        assert!(!should_backfill_index(10, 10));
+        assert!(should_backfill_index(0, 10));
+        assert!(should_backfill_index(12, 10));
+    }
+
+    #[test]
+    fn document_count_reports_committed_documents() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.users;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 1001i64,
+                    index.fields.id_prefix => "1001",
+                    index.fields.user_name => "research_cn",
+                    index.fields.user_name_prefix => "research_cn",
+                    index.fields.display_name => "北京大学研究员",
+                    index.fields.updated_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        assert_eq!(state.user_document_count().unwrap(), 1);
+        assert_eq!(state.tweet_document_count().unwrap(), 0);
     }
 
     #[test]

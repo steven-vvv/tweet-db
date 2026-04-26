@@ -20,6 +20,14 @@ pub async fn build_app(settings: Settings) -> AppResult<Router> {
     let search_state = search::build_state(&settings)?;
     let state =
         AppState::new(settings, db, auth_http_client, string_dict).with_search(search_state);
+    if let Some(search) = state.search.as_ref() {
+        search::enqueue_startup_backfill(
+            &state.db,
+            search,
+            state.settings.config.search.queue_batch_size,
+        )
+        .await?;
+    }
     search::start_workers(state.clone())?;
     transfer::start_workers(state.clone())?;
 
