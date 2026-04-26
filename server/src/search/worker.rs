@@ -73,8 +73,14 @@ async fn run_worker_loop(
                     );
 
                     match search.index_task(&db, &task).await {
-                        Ok(()) => {
-                            if let Err(error) = mark_task_completed(&db, task.id).await {
+                        Ok(()) => match mark_task_completed(&db, &task).await {
+                            Ok(true) => {}
+                            Ok(false) => tracing::info!(
+                                worker = %worker_name,
+                                task_id = %task.id,
+                                "search index task claim was refreshed before completion"
+                            ),
+                            Err(error) => {
                                 tracing::warn!(
                                     worker = %worker_name,
                                     task_id = %task.id,
@@ -82,7 +88,7 @@ async fn run_worker_loop(
                                     "failed to mark search index task completed"
                                 );
                             }
-                        }
+                        },
                         Err(error) => {
                             tracing::warn!(
                                 worker = %worker_name,
@@ -92,16 +98,23 @@ async fn run_worker_loop(
                                 error = %error,
                                 "search index task failed"
                             );
-                            if let Err(update_error) =
-                                mark_task_failed(&db, task.id, &error.to_string(), max_attempts)
-                                    .await
+                            match mark_task_failed(&db, &task, &error.to_string(), max_attempts)
+                                .await
                             {
-                                tracing::warn!(
+                                Ok(true) => {}
+                                Ok(false) => tracing::info!(
                                     worker = %worker_name,
                                     task_id = %task.id,
-                                    error = %update_error,
-                                    "failed to update search index task status after error"
-                                );
+                                    "search index task claim was refreshed before failure update"
+                                ),
+                                Err(update_error) => {
+                                    tracing::warn!(
+                                        worker = %worker_name,
+                                        task_id = %task.id,
+                                        error = %update_error,
+                                        "failed to update search index task status after error"
+                                    );
+                                }
                             }
                         }
                     }

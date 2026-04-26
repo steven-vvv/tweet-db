@@ -70,6 +70,8 @@ pub(super) struct ClaimedIndexTask {
     pub(super) target_kind: String,
     pub(super) target_id: i64,
     pub(super) attempt_count: i32,
+    pub(super) claimed_by: String,
+    pub(super) claimed_at: OffsetDateTime,
 }
 
 impl ClaimedIndexTask {
@@ -202,7 +204,9 @@ pub(super) async fn claim_next_tasks(
             task.id,
             task.target_kind::text AS target_kind,
             task.target_id,
-            task.attempt_count
+            task.attempt_count,
+            task.claimed_by,
+            task.claimed_at
         "#,
     )
     .bind(stale_cutoff)
@@ -215,8 +219,8 @@ pub(super) async fn claim_next_tasks(
     Ok(rows)
 }
 
-pub(super) async fn mark_task_completed(db: &PgPool, task_id: Uuid) -> AppResult<()> {
-    sqlx::query(
+pub(super) async fn mark_task_completed(db: &PgPool, task: &ClaimedIndexTask) -> AppResult<bool> {
+    let result = sqlx::query(
         r#"
         UPDATE search.index_queue
         SET status = 'completed',
@@ -226,23 +230,28 @@ pub(super) async fn mark_task_completed(db: &PgPool, task_id: Uuid) -> AppResult
             completed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
+          AND status = 'processing'
+          AND claimed_by = $2
+          AND claimed_at = $3
         "#,
     )
-    .bind(task_id)
+    .bind(task.id)
+    .bind(&task.claimed_by)
+    .bind(task.claimed_at)
     .execute(db)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub(super) async fn mark_task_failed(
     db: &PgPool,
-    task_id: Uuid,
+    task: &ClaimedIndexTask,
     error_message: &str,
     max_attempts: i32,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     let truncated = truncate_error_message(error_message);
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE search.index_queue
         SET status = CASE
@@ -258,15 +267,20 @@ pub(super) async fn mark_task_failed(
             END,
             updated_at = NOW()
         WHERE id = $1
+          AND status = 'processing'
+          AND claimed_by = $4
+          AND claimed_at = $5
         "#,
     )
-    .bind(task_id)
+    .bind(task.id)
     .bind(&truncated)
     .bind(max_attempts)
+    .bind(&task.claimed_by)
+    .bind(task.claimed_at)
     .execute(db)
     .await?;
 
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub(super) async fn expire_stale_tasks(
