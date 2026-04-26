@@ -297,6 +297,117 @@
 
 恢复已禁用用户。
 
+### 管理列表分页约定
+
+以下管理列表统一使用服务端无状态 cursor 分页：
+
+- `limit` 默认 50，上限 100。
+- `cursor` 内包含版本号、筛选条件和排序锚点。
+- cursor 和当前筛选条件不一致时返回 `400`。
+- 每次请求按当前数据库状态查询；数据变化时某一页数量可能浮动。
+
+响应结构：
+
+```json
+{
+  "items": [],
+  "nextCursor": "..."
+}
+```
+
+### `GET /internal/v1/admin/overview`
+
+返回管理台总览，包括账号计数、tweet v2 对象计数、转储队列计数、存储配置摘要、最近帖子和最近失败任务。
+
+### `GET /internal/v1/admin/twitter-users`
+
+查询 X 用户列表。查询参数：
+
+- `q`：用户 ID、handle 或 display name 前缀。
+- `limit`
+- `cursor`
+
+### `GET /internal/v1/admin/twitter-users/:user_id`
+
+查询 X 用户详情，包括基础记录、最新 profile snapshot、最新 stats、最近帖子和相关媒体。
+
+### `GET /internal/v1/admin/tweets`
+
+查询帖子列表。查询参数：
+
+- `q`：tweet ID 或 author ID 前缀。
+- `authorId`
+- `relation=all|original|reply|quote|repost`
+- `limit`
+- `cursor`
+
+### `GET /internal/v1/admin/tweets/:tweet_id`
+
+查询帖子详情，包括原始记录、最新统计、策略、编辑信息、社区笔记、作者和媒体。
+
+### `GET /internal/v1/admin/media`
+
+查询媒体列表。查询参数：
+
+- `q`：media ID、origin tweet ID 或 origin user ID 前缀。
+- `mediaType=all|photo|video|animated_gif`
+- `transferStatus=all|pending|processing|completed|failed|canceled`
+- `limit`
+- `cursor`
+
+### `GET /internal/v1/admin/media/:media_id`
+
+查询媒体详情，包括原始记录、最新 media resource、关联帖子和转储任务。
+
+### `POST /internal/v1/admin/media/:media_id/transfer-tasks`
+
+为媒体最新资源创建转储任务。已有同一 `(media_id, source_recorded_at)` 任务时返回 `created=false`。
+
+### `GET /internal/v1/admin/storage-objects`
+
+查询已转储存储对象。查询参数：
+
+- `q`：object ID 或 object key 前缀。
+- `limit`
+- `cursor`
+
+### `GET /internal/v1/admin/storage-objects/:object_id`
+
+查询存储对象详情和关联转储任务。
+
+### `GET /internal/v1/admin/storage-objects/:object_id/open`
+
+管理员点击访问存储对象时生成短期 S3 presigned URL，并返回 `302` 跳转。
+
+### `GET /internal/v1/admin/transfers/overview`
+
+返回转储 worker 配置和任务状态计数。
+
+### `GET /internal/v1/admin/transfers/tasks`
+
+查询转储任务列表。查询参数：
+
+- `q`：task ID、media ID 或 object key 前缀。
+- `status=all|pending|processing|completed|failed|canceled`
+- `limit`
+- `cursor`
+
+### `GET /internal/v1/admin/transfers/tasks/:task_id`
+
+查询转储任务详情，包括原始任务记录、相关媒体和审计事件。
+
+### `POST /internal/v1/admin/transfers/tasks/:task_id/retry`
+
+将 `failed` 或 `canceled` 任务恢复为 `pending`，清除 claim 和错误信息，并写入审计事件。
+
+### `POST /internal/v1/admin/transfers/tasks/:task_id/cancel`
+
+将 `pending` 任务标记为 `canceled`，写入 `canceled_by_admin` 和审计事件。
+
+### `POST /internal/v1/admin/transfers/tasks/:task_id/release`
+
+将 `processing` 任务释放回 `pending`，清除 worker claim，并写入审计事件。
+
 ## Integrations
 
 集成入口使用 `/integrations/...` 前缀。
@@ -338,8 +449,5 @@ SSO 授权撤销 webhook。服务端收到通知后更新授权状态，并删�
 
 - `/internal/v1/admin/posts/*`
 - `/internal/v1/admin/actors/*`
-- `/internal/v1/admin/media/*`
-- `/internal/v1/admin/storage-objects/*`
-- `/internal/v1/admin/transfers/*`
 
-后续新增接口应继续使用当前 tweet v2 请求和响应形状，不回到旧版 ingest/status 协议。
+当前管理接口基于 tweet v2、media transfer 和 iam schema。

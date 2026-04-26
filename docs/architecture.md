@@ -7,7 +7,7 @@
 项目分成两部分：
 
 - `server/`：Rust Axum 服务，负责认证、API、数据库写入、查询和媒体转储。
-- `webui/`：Vue 前端，当前包含账号页和管理员用户页。
+- `webui/`：Vue 前端，包含账号页和管理员管理台。
 
 服务启动流程：
 
@@ -23,13 +23,24 @@
 服务端模块按领域和执行阶段分层：
 
 - `config/`：配置模型、路径解析、TLS/HTTPS 校验和配置测试。
-- `admin/`：管理员用户接口、cursor 时间兼容、分页和响应格式化。
+- `admin/`：管理员管理接口、cursor 时间兼容、分页、转储动作和响应格式化。
 - `tweet_submit/`：提交 API 合同、handler、批处理状态、结果汇总、转换和写入执行。
 - `tweet_query/`：查询 API 合同、数据库读取类型、查询 fetch、decode 和 JSON build。
 - `tweet_store/`：数据库读写封装，tweet 写入按 places、tweets、edits、policies、stats、community notes 拆分。
 - `transfer/`：媒体转储队列、worker、下载、range 分片、上传和传输测试。
 
 对外入口集中在各领域的 `mod.rs`，路由层继续通过 `admin::*`、`tweet_submit::submit_tweets`、`tweet_query::query_tweets` 和 `transfer::*` 调用。
+
+## 管理台
+
+管理台面向内部排查和常用运维操作：
+
+- Overview 汇总账号、tweet v2 对象、转储队列和近期失败任务。
+- Accounts 管理本地账号启停。
+- X Users、Tweets、Media、Storage Objects 提供列表、详情、关联对象和原始 JSON。
+- Transfers 提供状态筛选、失败重试、排队取消和处理中任务释放。
+
+管理列表使用无状态 cursor 分页。cursor 中包含版本号、筛选条件和排序锚点；服务端每次按当前数据库状态查询。正文检索当前交给外部搜索引擎规划，管理台只做 ID、状态、类型和前缀类筛选。
 
 ## 数据库结构
 
