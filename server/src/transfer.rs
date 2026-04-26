@@ -255,11 +255,14 @@ pub fn start_workers(state: AppState) -> AppResult<()> {
 
 fn build_download_client(settings: &Settings) -> AppResult<HttpClient> {
     let transfer = &settings.config.transfer;
-    HttpClient::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(transfer.connect_timeout_seconds))
-        .read_timeout(Duration::from_secs(transfer.read_timeout_seconds))
-        .timeout(Duration::from_secs(transfer.attempt_timeout_seconds))
+    let mut builder = HttpClient::builder().redirect(reqwest::redirect::Policy::none());
+    if transfer.connect_timeout_seconds > 0 {
+        builder = builder.connect_timeout(Duration::from_secs(transfer.connect_timeout_seconds));
+    }
+    if transfer.read_timeout_seconds > 0 {
+        builder = builder.read_timeout(Duration::from_secs(transfer.read_timeout_seconds));
+    }
+    builder
         .build()
         .map_err(|error| AppError::config(format!("failed to build transfer http client: {error}")))
 }
@@ -272,12 +275,17 @@ async fn run_worker_loop(db: PgPool, runtime: Arc<WorkerRuntime>, worker_name: S
             .transfer
             .worker_poll_interval_seconds,
     );
-    let attempt_timeout =
-        Duration::from_secs(runtime.settings.config.transfer.attempt_timeout_seconds);
+    let task_stale_timeout = Duration::from_secs(
+        runtime
+            .settings
+            .config
+            .transfer
+            .task_stale_timeout_seconds,
+    );
     let max_attempts = runtime.settings.config.transfer.max_attempts;
 
     loop {
-        let stale_cutoff = OffsetDateTime::now_utc() - duration_to_time(attempt_timeout);
+        let stale_cutoff = OffsetDateTime::now_utc() - duration_to_time(task_stale_timeout);
         if let Err(error) = expire_stale_tasks(&db, stale_cutoff, max_attempts).await {
             tracing::warn!(worker = %worker_name, error = %error, "failed to expire stale media transfer tasks");
         }
@@ -579,6 +587,7 @@ mod tests {
             connect_timeout_seconds: 5,
             read_timeout_seconds: 30,
             attempt_timeout_seconds: 300,
+            task_stale_timeout_seconds: 900,
             worker_poll_interval_seconds: 5,
             max_attempts: 8,
         });

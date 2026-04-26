@@ -117,6 +117,50 @@ impl AppConfig {
             ));
         }
 
+        if self.transfer.enabled {
+            if self.transfer.chunk_size_mb < 5 {
+                return Err(AppError::config(
+                    "transfer.chunk_size_mb must be at least 5 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.download_parallelism == 0 {
+                return Err(AppError::config(
+                    "transfer.download_parallelism must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.upload_parallelism == 0 {
+                return Err(AppError::config(
+                    "transfer.upload_parallelism must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.max_in_flight_parts == 0 {
+                return Err(AppError::config(
+                    "transfer.max_in_flight_parts must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.worker_poll_interval_seconds == 0 {
+                return Err(AppError::config(
+                    "transfer.worker_poll_interval_seconds must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.task_stale_timeout_seconds == 0 {
+                return Err(AppError::config(
+                    "transfer.task_stale_timeout_seconds must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+
+            if self.transfer.max_attempts <= 0 {
+                return Err(AppError::config(
+                    "transfer.max_attempts must be greater than 0 when transfer.enabled = true",
+                ));
+            }
+        }
+
         if self.server.mode != ServerMode::Https {
             return Ok(());
         }
@@ -237,8 +281,14 @@ pub struct TransferSection {
     pub connect_timeout_seconds: u64,
     pub read_timeout_seconds: u64,
     pub attempt_timeout_seconds: u64,
+    #[serde(default = "default_task_stale_timeout_seconds")]
+    pub task_stale_timeout_seconds: u64,
     pub worker_poll_interval_seconds: u64,
     pub max_attempts: i32,
+}
+
+fn default_task_stale_timeout_seconds() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -619,6 +669,7 @@ max_in_flight_parts = 1
 connect_timeout_seconds = 5
 read_timeout_seconds = 30
 attempt_timeout_seconds = 300
+task_stale_timeout_seconds = 900
 worker_poll_interval_seconds = 5
 max_attempts = 1
 

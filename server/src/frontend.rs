@@ -144,6 +144,7 @@ mod tests {
                     connect_timeout_seconds: 5,
                     read_timeout_seconds: 30,
                     attempt_timeout_seconds: 300,
+                    task_stale_timeout_seconds: 900,
                     worker_poll_interval_seconds: 5,
                     max_attempts: 1,
                 },
