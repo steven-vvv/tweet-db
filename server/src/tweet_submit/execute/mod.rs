@@ -93,7 +93,13 @@ pub(super) async fn execute_prepared_submit(
         &mut prepared.tweet_results,
     )
     .await;
-    write_user_snapshots_batch(store, &prepared.user_snapshots, &mut prepared.user_results).await;
+    write_user_snapshots_batch(
+        state,
+        store,
+        &prepared.user_snapshots,
+        &mut prepared.user_results,
+    )
+    .await;
     write_user_stats_batch(
         store,
         &prepared.user_stats,
@@ -117,7 +123,7 @@ pub(super) async fn execute_prepared_submit(
     )
     .await;
     write_tweet_places_batch(store, &prepared.tweet_places, &mut prepared.tweet_results).await;
-    write_tweets_batch(store, &prepared.tweets, &mut prepared.tweet_results).await;
+    write_tweets_batch(state, store, &prepared.tweets, &mut prepared.tweet_results).await;
     write_tweet_edits_batch(store, &prepared.tweet_edits, &mut prepared.tweet_results).await;
     write_tweet_policies_batch(store, &prepared.tweet_policies, &mut prepared.tweet_results).await;
     write_tweet_community_notes_batch(
