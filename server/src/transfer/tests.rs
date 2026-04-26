@@ -73,6 +73,22 @@ fn transfer_options_disable_attempt_deadline_when_timeout_is_zero() {
 }
 
 #[test]
+fn enqueue_transfer_task_serializes_timestamp_as_rfc3339() {
+    let task = EnqueueTransferTask {
+        id: uuid::Uuid::nil(),
+        media_id: 1,
+        source_recorded_at: demo_photo_resource().recorded_at,
+        source_url: "https://pbs.twimg.com/media/demo.jpg".to_owned(),
+        source_kind: "media_url".to_owned(),
+        source_content_type: Some("image/jpeg".to_owned()),
+    };
+
+    let value = serde_json::to_value(task).unwrap();
+
+    assert_eq!(value["source_recorded_at"], "2026-04-22T12:34:56Z");
+}
+
+#[test]
 fn range_specs_cover_remaining_bytes_after_first_buffer() {
     let specs: Vec<_> = build_range_specs(10, 35, 10).unwrap().into_iter().collect();
 

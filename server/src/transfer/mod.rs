@@ -37,6 +37,7 @@ pub struct SelectedTransferSource {
 pub struct EnqueueTransferTask {
     pub id: Uuid,
     pub media_id: i64,
+    #[serde(with = "time::serde::rfc3339")]
     pub source_recorded_at: OffsetDateTime,
     pub source_url: String,
     pub source_kind: String,
