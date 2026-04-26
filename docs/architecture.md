@@ -107,10 +107,13 @@
 
 写入流程：
 
-1. 提交接口完成数据库写入。
-2. 用户 snapshot 或 tweet 主体发生变化时写入 `search.index_queue`。
-3. search worker 领取 pending 任务，读取数据库最新态，更新 Tantivy 文档并 commit。
-4. 管理台搜索从 Tantivy 取命中 ID，再按 ID 回表生成列表 JSON。
+1. 提交接口调用数据库写入函数。
+2. 用户主体、用户 snapshot 或 tweet 主体发生变化时，数据库函数在同一事务内刷新 `search.index_queue`。
+3. 服务启动时比较 Tantivy 文档数和数据库事实表数量；存在差异时按批次把现有用户和 tweet 刷新进 `search.index_queue`。
+4. search worker 领取 pending 任务，读取数据库最新态，更新 Tantivy 文档并 commit。
+5. 管理台搜索从 Tantivy 取命中 ID，再按 ID 回表生成列表 JSON。
+
+用户索引文档始终以 `tweet.twitter_user` 为主体；缺少 snapshot 的用户也会写入 ID 字段，后续 snapshot 到达后同一队列目标会刷新为带 handle/display name 的文档。
 
 分词：
 
