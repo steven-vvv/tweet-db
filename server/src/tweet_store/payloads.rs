@@ -481,6 +481,7 @@ pub(super) struct UserProfessionalPayload {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct UserSnapshotPayload {
     user_id: i64,
+    #[serde(with = "time::serde::rfc3339")]
     recorded_at: time::OffsetDateTime,
     display_name: String,
     user_name: String,
@@ -511,6 +512,7 @@ pub(super) struct TweetPlacePayload {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct TweetPayload {
     id: i64,
+    #[serde(with = "time::serde::rfc3339")]
     published_at: time::OffsetDateTime,
     source_id: Option<i16>,
     author_id: i64,
@@ -603,8 +605,90 @@ pub(super) struct MediaVideoPayload {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct MediaResourcePayload {
     media_id: i64,
+    #[serde(with = "time::serde::rfc3339")]
     recorded_at: time::OffsetDateTime,
     media_url: Option<String>,
     availability_id: Option<i16>,
     video: Option<MediaVideoPayload>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timestamp() -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(0).unwrap()
+    }
+
+    fn annotated_text_payload() -> AnnotatedTextPayload {
+        AnnotatedTextPayload {
+            body: "hello".to_owned(),
+            display_range_start: None,
+            display_range_end: None,
+            hashtags: Vec::new(),
+            symbols: Vec::new(),
+            urls: Vec::new(),
+            mentions: Vec::new(),
+            media_refs: Vec::new(),
+            styles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn timestamp_payload_fields_serialize_as_rfc3339_strings() {
+        let user_snapshot = UserSnapshotPayload {
+            user_id: 1,
+            recorded_at: timestamp(),
+            display_name: "User".to_owned(),
+            user_name: "user".to_owned(),
+            avatar_url: None,
+            uses_default_avatar: None,
+            avatar_shape_id: None,
+            banner_url: None,
+            location: None,
+            bio: None,
+            profile_links: Vec::new(),
+            identity: None,
+            features: None,
+            professional: None,
+            pinned_tweet_ids: Vec::new(),
+        };
+        let tweet = TweetPayload {
+            id: 10,
+            published_at: timestamp(),
+            source_id: None,
+            author_id: 1,
+            place_id: None,
+            legacy_text: annotated_text_payload(),
+            note_id: None,
+            note_text: None,
+            language_id: None,
+            conversation_id: 10,
+            reply_to_tweet_id: None,
+            reply_to_user_id: None,
+            quote_tweet_id: None,
+            quote_permalink: None,
+            repost_id: None,
+        };
+        let media_resource = MediaResourcePayload {
+            media_id: 20,
+            recorded_at: timestamp(),
+            media_url: None,
+            availability_id: None,
+            video: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(user_snapshot).unwrap()["recorded_at"],
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            serde_json::to_value(tweet).unwrap()["published_at"],
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            serde_json::to_value(media_resource).unwrap()["recorded_at"],
+            "1970-01-01T00:00:00Z"
+        );
+    }
 }
