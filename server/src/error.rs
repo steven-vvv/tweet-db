@@ -24,6 +24,8 @@ pub enum AppError {
     Upstream(String),
     #[error("{0}")]
     Config(String),
+    #[error("search error: {0}")]
+    Search(String),
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("migration error: {0}")]
@@ -70,6 +72,10 @@ impl AppError {
         Self::Config(message.into())
     }
 
+    pub fn search(message: impl Into<String>) -> Self {
+        Self::Search(message.into())
+    }
+
     fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -78,6 +84,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+            Self::Search(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Sqlx(_)
             | Self::SqlxMigrate(_)
@@ -96,5 +103,11 @@ impl IntoResponse for AppError {
         });
 
         (status, body).into_response()
+    }
+}
+
+impl From<tantivy::TantivyError> for AppError {
+    fn from(error: tantivy::TantivyError) -> Self {
+        Self::search(error.to_string())
     }
 }

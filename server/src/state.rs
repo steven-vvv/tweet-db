@@ -6,6 +6,7 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use crate::{
     config::Settings,
     error::{AppError, AppResult},
+    search::SearchState,
     string_dict::StringDictCache,
 };
 
@@ -15,6 +16,7 @@ pub struct AppState {
     pub db: PgPool,
     pub auth_http_client: Client,
     pub string_dict: StringDictCache,
+    pub search: Option<SearchState>,
 }
 
 impl AppState {
@@ -29,7 +31,13 @@ impl AppState {
             db,
             auth_http_client,
             string_dict,
+            search: None,
         }
+    }
+
+    pub fn with_search(mut self, search: Option<SearchState>) -> Self {
+        self.search = search;
+        self
     }
 }
 

@@ -1,0 +1,618 @@
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
+use tantivy::{
+    Index, IndexReader, IndexWriter, Order, TantivyDocument, Term, doc,
+    query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{
+        Field, IndexRecordOption, NumericOptions, STORED, Schema, TextFieldIndexing, TextOptions,
+        Value,
+    },
+    tokenizer::{LowerCaser, NgramTokenizer, RemoveLongFilter, TextAnalyzer},
+};
+use time::OffsetDateTime;
+
+use crate::{
+    config::{SearchSection, Settings},
+    error::{AppError, AppResult},
+};
+
+mod queue;
+mod worker;
+
+pub use queue::{IndexTarget, IndexTargetKind, enqueue_targets};
+pub use worker::start_workers;
+
+const USER_INDEX_DIR: &str = "users-v1";
+const TWEET_INDEX_DIR: &str = "tweets-v1";
+const JIEBA_TOKENIZER: &str = "jieba";
+const PREFIX_TOKENIZER: &str = "prefix_ngram";
+const MAX_QUERY_CHARS: usize = 256;
+
+#[derive(Clone)]
+pub struct SearchState {
+    inner: Arc<SearchRuntime>,
+}
+
+struct SearchRuntime {
+    users: SearchIndex<UserFields>,
+    tweets: SearchIndex<TweetFields>,
+}
+
+struct SearchIndex<F> {
+    index: Index,
+    reader: IndexReader,
+    writer: Mutex<IndexWriter>,
+    fields: F,
+}
+
+#[derive(Clone, Copy)]
+struct UserFields {
+    id: Field,
+    id_prefix: Field,
+    user_name: Field,
+    user_name_prefix: Field,
+    display_name: Field,
+    updated_at: Field,
+}
+
+#[derive(Clone, Copy)]
+struct TweetFields {
+    id: Field,
+    id_prefix: Field,
+    author_id: Field,
+    author_id_prefix: Field,
+    body: Field,
+    relation: Field,
+    published_at: Field,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    Relevance,
+    Time,
+}
+
+impl SearchSort {
+    pub fn parse(raw: Option<&str>, has_query: bool) -> AppResult<Self> {
+        match raw.unwrap_or(if has_query { "relevance" } else { "time" }) {
+            "relevance" => Ok(Self::Relevance),
+            "time" => Ok(Self::Time),
+            _ => Err(AppError::bad_request("sort must be one of relevance, time")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub id: i64,
+    pub score: Option<f32>,
+    pub sort_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TweetSearchFilters {
+    pub author_id: Option<i64>,
+    pub relation: Option<String>,
+}
+
+pub fn build_state(settings: &Settings) -> AppResult<Option<SearchState>> {
+    if !settings.config.search.enabled {
+        tracing::info!("search subsystem is disabled by config");
+        return Ok(None);
+    }
+
+    let users = open_user_index(&settings.config.search)?;
+    let tweets = open_tweet_index(&settings.config.search)?;
+    tracing::info!(
+        index_dir = %settings.config.search.index_dir.display(),
+        "initialized search indexes"
+    );
+
+    Ok(Some(SearchState {
+        inner: Arc::new(SearchRuntime { users, tweets }),
+    }))
+}
+
+impl SearchState {
+    pub async fn search_users(
+        &self,
+        raw_query: Option<&str>,
+        sort: SearchSort,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<SearchHit>> {
+        let index = &self.inner.users;
+        index.reload()?;
+        let query = build_user_query(index, raw_query)?;
+        collect_hits(
+            index,
+            &*query,
+            sort,
+            index.fields.id,
+            index.fields.updated_at,
+            "updated_at",
+            limit,
+            offset,
+        )
+    }
+
+    pub async fn search_tweets(
+        &self,
+        raw_query: Option<&str>,
+        filters: &TweetSearchFilters,
+        sort: SearchSort,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<SearchHit>> {
+        let index = &self.inner.tweets;
+        index.reload()?;
+        let query = build_tweet_query(index, raw_query, filters)?;
+        collect_hits(
+            index,
+            &*query,
+            sort,
+            index.fields.id,
+            index.fields.published_at,
+            "published_at",
+            limit,
+            offset,
+        )
+    }
+
+    async fn index_task(&self, pool: &PgPool, task: &queue::ClaimedIndexTask) -> AppResult<()> {
+        match task.parsed_kind()? {
+            IndexTargetKind::User => self.index_user(pool, task.target_id).await,
+            IndexTargetKind::Tweet => self.index_tweet(pool, task.target_id).await,
+        }
+    }
+
+    async fn index_user(&self, pool: &PgPool, user_id: i64) -> AppResult<()> {
+        let record = fetch_user_document(pool, user_id).await?;
+        let index = &self.inner.users;
+        let mut writer = index.lock_writer()?;
+        writer.delete_term(Term::from_field_i64(index.fields.id, user_id));
+        if let Some(record) = record {
+            writer.add_document(doc!(
+                index.fields.id => record.id,
+                index.fields.id_prefix => record.id.to_string(),
+                index.fields.user_name => record.user_name.as_deref().unwrap_or_default(),
+                index.fields.user_name_prefix => record.user_name.as_deref().unwrap_or_default(),
+                index.fields.display_name => record.display_name.as_deref().unwrap_or_default(),
+                index.fields.updated_at => record.updated_at.unix_timestamp(),
+            ))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        index.reload()?;
+        Ok(())
+    }
+
+    async fn index_tweet(&self, pool: &PgPool, tweet_id: i64) -> AppResult<()> {
+        let record = fetch_tweet_document(pool, tweet_id).await?;
+        let index = &self.inner.tweets;
+        let mut writer = index.lock_writer()?;
+        writer.delete_term(Term::from_field_i64(index.fields.id, tweet_id));
+        if let Some(record) = record {
+            writer.add_document(doc!(
+                index.fields.id => record.id,
+                index.fields.id_prefix => record.id.to_string(),
+                index.fields.author_id => record.author_id,
+                index.fields.author_id_prefix => record.author_id.to_string(),
+                index.fields.body => record.body,
+                index.fields.relation => record.relation,
+                index.fields.published_at => record.published_at.unix_timestamp(),
+            ))?;
+        }
+        writer.commit()?;
+        drop(writer);
+        index.reload()?;
+        Ok(())
+    }
+}
+
+impl<F> SearchIndex<F> {
+    fn lock_writer(&self) -> AppResult<std::sync::MutexGuard<'_, IndexWriter>> {
+        self.writer
+            .lock()
+            .map_err(|_| AppError::search("index writer lock was poisoned"))
+    }
+
+    fn reload(&self) -> AppResult<()> {
+        self.reader.reload().map_err(search_error)
+    }
+}
+
+fn open_user_index(config: &SearchSection) -> AppResult<SearchIndex<UserFields>> {
+    let mut builder = Schema::builder();
+    let numeric = NumericOptions::default()
+        .set_indexed()
+        .set_fast()
+        .set_stored();
+    let id = builder.add_i64_field("id", numeric.clone());
+    let id_prefix = builder.add_text_field("id_prefix", prefix_text_options());
+    let user_name = builder.add_text_field("user_name", jieba_text_options());
+    let user_name_prefix = builder.add_text_field("user_name_prefix", prefix_text_options());
+    let display_name = builder.add_text_field("display_name", jieba_text_options());
+    let updated_at = builder.add_i64_field("updated_at", numeric);
+    let schema = builder.build();
+    let index = open_index(
+        &config.index_dir.join(USER_INDEX_DIR),
+        schema,
+        config.writer_memory_mb,
+    )?;
+    register_tokenizers(&index)?;
+    let reader = index.reader()?;
+    let writer = index.writer_with_num_threads(1, memory_bytes(config.writer_memory_mb))?;
+
+    Ok(SearchIndex {
+        index,
+        reader,
+        writer: Mutex::new(writer),
+        fields: UserFields {
+            id,
+            id_prefix,
+            user_name,
+            user_name_prefix,
+            display_name,
+            updated_at,
+        },
+    })
+}
+
+fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields>> {
+    let mut builder = Schema::builder();
+    let numeric = NumericOptions::default()
+        .set_indexed()
+        .set_fast()
+        .set_stored();
+    let id = builder.add_i64_field("id", numeric.clone());
+    let id_prefix = builder.add_text_field("id_prefix", prefix_text_options());
+    let author_id = builder.add_i64_field("author_id", numeric.clone());
+    let author_id_prefix = builder.add_text_field("author_id_prefix", prefix_text_options());
+    let body = builder.add_text_field("body", jieba_text_options());
+    let relation = builder.add_text_field("relation", STORED | tantivy::schema::STRING);
+    let published_at = builder.add_i64_field("published_at", numeric);
+    let schema = builder.build();
+    let index = open_index(
+        &config.index_dir.join(TWEET_INDEX_DIR),
+        schema,
+        config.writer_memory_mb,
+    )?;
+    register_tokenizers(&index)?;
+    let reader = index.reader()?;
+    let writer = index.writer_with_num_threads(1, memory_bytes(config.writer_memory_mb))?;
+
+    Ok(SearchIndex {
+        index,
+        reader,
+        writer: Mutex::new(writer),
+        fields: TweetFields {
+            id,
+            id_prefix,
+            author_id,
+            author_id_prefix,
+            body,
+            relation,
+            published_at,
+        },
+    })
+}
+
+fn open_index(path: &Path, schema: Schema, _writer_memory_mb: usize) -> AppResult<Index> {
+    fs::create_dir_all(path)?;
+    if path.join("meta.json").is_file() {
+        Index::open_in_dir(path).map_err(search_error)
+    } else {
+        Index::create_in_dir(path, schema).map_err(search_error)
+    }
+}
+
+fn register_tokenizers(index: &Index) -> AppResult<()> {
+    let jieba = TextAnalyzer::builder(tantivy_jieba::JiebaTokenizer::new())
+        .filter(RemoveLongFilter::limit(80))
+        .filter(LowerCaser)
+        .build();
+    let prefix = TextAnalyzer::builder(NgramTokenizer::new(1, 32, true).map_err(search_error)?)
+        .filter(RemoveLongFilter::limit(80))
+        .filter(LowerCaser)
+        .build();
+    index.tokenizers().register(JIEBA_TOKENIZER, jieba);
+    index.tokenizers().register(PREFIX_TOKENIZER, prefix);
+    Ok(())
+}
+
+fn jieba_text_options() -> TextOptions {
+    TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(JIEBA_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_stored()
+}
+
+fn prefix_text_options() -> TextOptions {
+    TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer(PREFIX_TOKENIZER)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+        )
+        .set_stored()
+}
+
+fn build_user_query(
+    index: &SearchIndex<UserFields>,
+    raw_query: Option<&str>,
+) -> AppResult<Box<dyn Query>> {
+    let Some(query_text) = normalized_query(raw_query) else {
+        return Ok(Box::new(AllQuery));
+    };
+
+    let mut parser = QueryParser::for_index(
+        &index.index,
+        vec![
+            index.fields.user_name,
+            index.fields.user_name_prefix,
+            index.fields.display_name,
+            index.fields.id_prefix,
+        ],
+    );
+    parser.set_conjunction_by_default();
+    parser.set_field_boost(index.fields.user_name, 2.0);
+    parser.set_field_boost(index.fields.user_name_prefix, 2.0);
+    parser.parse_query(&query_text).map_err(search_error)
+}
+
+fn build_tweet_query(
+    index: &SearchIndex<TweetFields>,
+    raw_query: Option<&str>,
+    filters: &TweetSearchFilters,
+) -> AppResult<Box<dyn Query>> {
+    let mut parts = Vec::<(Occur, Box<dyn Query>)>::new();
+    if let Some(query_text) = normalized_query(raw_query) {
+        let mut parser = QueryParser::for_index(
+            &index.index,
+            vec![
+                index.fields.body,
+                index.fields.id_prefix,
+                index.fields.author_id_prefix,
+            ],
+        );
+        parser.set_conjunction_by_default();
+        parser.set_field_boost(index.fields.body, 2.0);
+        parts.push((
+            Occur::Must,
+            parser.parse_query(&query_text).map_err(search_error)?,
+        ));
+    }
+
+    if let Some(author_id) = filters.author_id {
+        parts.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_i64(index.fields.author_id, author_id),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+
+    if let Some(relation) = filters.relation.as_deref().filter(|value| *value != "all") {
+        parts.push((
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(index.fields.relation, relation),
+                IndexRecordOption::Basic,
+            )),
+        ));
+    }
+
+    if parts.is_empty() {
+        Ok(Box::new(AllQuery))
+    } else if parts.len() == 1 {
+        Ok(parts.remove(0).1)
+    } else {
+        Ok(Box::new(BooleanQuery::new(parts)))
+    }
+}
+
+fn collect_hits<F>(
+    index: &SearchIndex<F>,
+    query: &dyn Query,
+    sort: SearchSort,
+    id_field: Field,
+    time_field: Field,
+    time_field_name: &'static str,
+    limit: usize,
+    offset: usize,
+) -> AppResult<Vec<SearchHit>> {
+    let searcher = index.reader.searcher();
+    match sort {
+        SearchSort::Relevance => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_score(),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(score, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, id_field)?,
+                        score: Some(score),
+                        sort_time: stored_i64_opt(&doc, time_field),
+                    })
+                })
+                .collect()
+        }
+        SearchSort::Time => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<i64>(time_field_name, Order::Desc),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(sort_time, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, id_field)?,
+                        score: None,
+                        sort_time: sort_time.or_else(|| stored_i64_opt(&doc, time_field)),
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+fn normalized_query(raw_query: Option<&str>) -> Option<String> {
+    let raw = raw_query?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut value = raw.chars().take(MAX_QUERY_CHARS).collect::<String>();
+    if value.chars().filter(|ch| *ch == '"').count() % 2 == 1 {
+        value = value.replace('"', " ");
+    }
+
+    let mut normalized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '"'
+            || ch == '_'
+            || ch == '@'
+            || ch == '#'
+            || ch.is_alphanumeric()
+            || ch.is_whitespace()
+            || !ch.is_ascii()
+        {
+            normalized.push(ch);
+        } else {
+            normalized.push(' ');
+        }
+    }
+
+    let normalized = normalized
+        .split_whitespace()
+        .map(|token| match token {
+            "AND" => "and",
+            "OR" => "or",
+            "NOT" => "not",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn stored_i64(doc: &TantivyDocument, field: Field) -> AppResult<i64> {
+    stored_i64_opt(doc, field).ok_or_else(|| AppError::search("indexed document is missing id"))
+}
+
+fn stored_i64_opt(doc: &TantivyDocument, field: Field) -> Option<i64> {
+    doc.get_first(field)
+        .and_then(|value| value.as_value().as_i64())
+}
+
+fn memory_bytes(memory_mb: usize) -> usize {
+    memory_mb.saturating_mul(1024).saturating_mul(1024)
+}
+
+fn search_error(error: impl std::fmt::Display) -> AppError {
+    AppError::search(error.to_string())
+}
+
+#[derive(Debug)]
+struct UserIndexDocument {
+    id: i64,
+    user_name: Option<String>,
+    display_name: Option<String>,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(Debug)]
+struct TweetIndexDocument {
+    id: i64,
+    author_id: i64,
+    body: String,
+    relation: String,
+    published_at: OffsetDateTime,
+}
+
+async fn fetch_user_document(pool: &PgPool, user_id: i64) -> AppResult<Option<UserIndexDocument>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            u.id,
+            snapshot.user_name,
+            snapshot.display_name,
+            GREATEST(u.updated_at, COALESCE(snapshot.recorded_at, u.updated_at)) AS updated_at
+        FROM tweet.twitter_user AS u
+        LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
+          ON snapshot.user_id = u.id
+        WHERE u.id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| UserIndexDocument {
+        id: row.get("id"),
+        user_name: row.get("user_name"),
+        display_name: row.get("display_name"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+async fn fetch_tweet_document(
+    pool: &PgPool,
+    tweet_id: i64,
+) -> AppResult<Option<TweetIndexDocument>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            t.id,
+            t.author_id,
+            COALESCE((t.note_text).body, (t.legacy_text).body) AS body,
+            CASE
+                WHEN t.repost_id IS NOT NULL THEN 'repost'
+                WHEN t.quote_tweet_id IS NOT NULL THEN 'quote'
+                WHEN t.reply_to_tweet_id IS NOT NULL THEN 'reply'
+                ELSE 'original'
+            END AS relation,
+            t.published_at
+        FROM tweet.tweet AS t
+        WHERE t.id = $1
+        "#,
+    )
+    .bind(tweet_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| TweetIndexDocument {
+        id: row.get("id"),
+        author_id: row.get("author_id"),
+        body: row.get("body"),
+        relation: row.get("relation"),
+        published_at: row.get("published_at"),
+    }))
+}

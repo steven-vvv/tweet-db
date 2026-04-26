@@ -6,6 +6,7 @@ pub mod db;
 pub mod error;
 pub mod frontend;
 pub mod routes;
+pub mod search;
 pub mod security;
 pub mod state;
 pub mod storage;
