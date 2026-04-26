@@ -1,12 +1,27 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    future::Future,
+    sync::Arc,
+    time::Duration,
+};
 
 use aws_sdk_s3::Client as S3Client;
-use bytes::Bytes;
-use reqwest::{Client as HttpClient, header::CONTENT_TYPE};
+use bytes::{Bytes, BytesMut};
+use futures_util::{
+    StreamExt,
+    future::{BoxFuture, FutureExt},
+    stream::FuturesUnordered,
+};
+use reqwest::{
+    Client as HttpClient, Response, StatusCode,
+    header::{ACCEPT_RANGES, CONTENT_TYPE, RANGE},
+};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use tokio::time::sleep;
+use tokio::{sync::Semaphore, time::Instant};
 use uuid::Uuid;
 
 use crate::{
@@ -275,13 +290,8 @@ async fn run_worker_loop(db: PgPool, runtime: Arc<WorkerRuntime>, worker_name: S
             .transfer
             .worker_poll_interval_seconds,
     );
-    let task_stale_timeout = Duration::from_secs(
-        runtime
-            .settings
-            .config
-            .transfer
-            .task_stale_timeout_seconds,
-    );
+    let task_stale_timeout =
+        Duration::from_secs(runtime.settings.config.transfer.task_stale_timeout_seconds);
     let max_attempts = runtime.settings.config.transfer.max_attempts;
 
     loop {
@@ -337,26 +347,102 @@ async fn process_task(
     runtime: &WorkerRuntime,
     task: &ClaimedTransferTask,
 ) -> AppResult<()> {
-    let downloaded = download_source(&runtime.download_client, &task.source_url).await?;
-    let explicit_content_type = task
-        .source_content_type
-        .as_deref()
-        .or(downloaded.content_type.as_deref());
-    let uploaded = storage::upload_bytes(
+    let uploaded = transfer_source_to_storage(
         &runtime.settings,
+        &runtime.download_client,
         &runtime.storage_client,
         task.media_id,
         task.id,
         &task.source_url,
-        explicit_content_type,
-        downloaded.bytes,
+        task.source_content_type.as_deref(),
     )
     .await?;
     persist_completed_task(db, task.id, uploaded).await
 }
 
-async fn download_source(client: &HttpClient, source_url: &str) -> AppResult<DownloadedSource> {
-    let response = client.get(source_url).send().await?;
+async fn transfer_source_to_storage(
+    settings: &Settings,
+    download_client: &HttpClient,
+    storage_client: &S3Client,
+    media_id: i64,
+    task_id: Uuid,
+    source_url: &str,
+    source_content_type: Option<&str>,
+) -> AppResult<StoredObjectMetadata> {
+    let options = TransferOptions::from_section(&settings.config.transfer)?;
+    let initial = open_initial_download(download_client, source_url, options.deadline).await?;
+    let explicit_content_type = source_content_type.or(initial.content_type.as_deref());
+    let object = storage::prepare_upload(
+        settings,
+        media_id,
+        task_id,
+        source_url,
+        explicit_content_type,
+    );
+    let mut reader = ResponseByteReader::new(initial.response);
+
+    let Some(first_buffer) =
+        read_next_buffer(&mut reader, options.chunk_size_bytes, options.deadline).await?
+    else {
+        return put_single_object(storage_client, object, Bytes::new(), options.deadline).await;
+    };
+
+    if initial
+        .content_length
+        .is_some_and(|content_length| content_length <= first_buffer.len() as u64)
+        || first_buffer.len() < options.chunk_size_bytes
+    {
+        return put_single_object(storage_client, object, first_buffer, options.deadline).await;
+    }
+
+    if initial.supports_ranges
+        && options.download_parallelism > 1
+        && let Some(content_length) = initial.content_length
+    {
+        drop(reader);
+        return upload_multipart_range(
+            download_client,
+            storage_client,
+            object,
+            source_url,
+            first_buffer,
+            content_length,
+            options,
+        )
+        .await;
+    }
+
+    let mut preloaded_buffers = Vec::new();
+    if initial.content_length.is_none() {
+        match read_next_buffer(&mut reader, options.chunk_size_bytes, options.deadline).await? {
+            Some(second_buffer) => preloaded_buffers.push(second_buffer),
+            None => {
+                return put_single_object(storage_client, object, first_buffer, options.deadline)
+                    .await;
+            }
+        }
+    }
+
+    upload_multipart_sequential(
+        storage_client,
+        object,
+        first_buffer,
+        preloaded_buffers,
+        reader,
+        options,
+    )
+    .await
+}
+
+async fn open_initial_download(
+    client: &HttpClient,
+    source_url: &str,
+    deadline: Option<Instant>,
+) -> AppResult<InitialDownload> {
+    let response = with_deadline(deadline, "download request", async {
+        client.get(source_url).send().await.map_err(AppError::from)
+    })
+    .await?;
     if !response.status().is_success() {
         return Err(AppError::upstream(format!(
             "download returned status {} for {}",
@@ -365,17 +451,750 @@ async fn download_source(client: &HttpClient, source_url: &str) -> AppResult<Dow
         )));
     }
 
+    let content_length = response.content_length();
+    let supports_ranges = response_supports_ranges(&response);
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let bytes = response.bytes().await?;
 
-    Ok(DownloadedSource {
-        bytes,
+    Ok(InitialDownload {
+        response,
         content_type,
+        content_length,
+        supports_ranges,
     })
+}
+
+async fn put_single_object(
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    body: Bytes,
+    deadline: Option<Instant>,
+) -> AppResult<StoredObjectMetadata> {
+    let sha256_hex = format!("{:x}", Sha256::digest(&body));
+    with_deadline(
+        deadline,
+        "single object upload",
+        storage::put_object(storage_client, object, body, sha256_hex),
+    )
+    .await
+}
+
+async fn upload_multipart_sequential(
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    first_buffer: Bytes,
+    preloaded_buffers: Vec<Bytes>,
+    mut reader: ResponseByteReader,
+    options: TransferOptions,
+) -> AppResult<StoredObjectMetadata> {
+    let upload = with_deadline(
+        options.deadline,
+        "multipart upload creation",
+        storage::create_multipart_upload(storage_client, &object),
+    )
+    .await?;
+    let result = upload_multipart_sequential_inner(
+        storage_client,
+        object.clone(),
+        upload.clone(),
+        first_buffer,
+        preloaded_buffers,
+        &mut reader,
+        options,
+    )
+    .await;
+
+    finish_or_abort_multipart(storage_client, &object, &upload, result, options.deadline).await
+}
+
+async fn upload_multipart_sequential_inner(
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    upload: storage::MultipartUpload,
+    first_buffer: Bytes,
+    preloaded_buffers: Vec<Bytes>,
+    reader: &mut ResponseByteReader,
+    options: TransferOptions,
+) -> AppResult<StoredObjectMetadata> {
+    let upload_semaphore = Semaphore::new(options.upload_parallelism);
+    let mut uploads: FuturesUnordered<UploadFuture<'_>> = FuturesUnordered::new();
+    let mut completed_parts = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut content_length = 0_u64;
+    let mut next_part_number = 1_i32;
+
+    enqueue_sequential_part(
+        storage_client,
+        &object,
+        &upload,
+        &upload_semaphore,
+        options,
+        &mut uploads,
+        &mut hasher,
+        &mut content_length,
+        &mut next_part_number,
+        first_buffer,
+    )?;
+
+    for buffer in preloaded_buffers {
+        wait_for_sequential_capacity(&mut uploads, options, &mut completed_parts).await?;
+        enqueue_sequential_part(
+            storage_client,
+            &object,
+            &upload,
+            &upload_semaphore,
+            options,
+            &mut uploads,
+            &mut hasher,
+            &mut content_length,
+            &mut next_part_number,
+            buffer,
+        )?;
+    }
+
+    while let Some(buffer) =
+        read_next_buffer(reader, options.chunk_size_bytes, options.deadline).await?
+    {
+        wait_for_sequential_capacity(&mut uploads, options, &mut completed_parts).await?;
+        enqueue_sequential_part(
+            storage_client,
+            &object,
+            &upload,
+            &upload_semaphore,
+            options,
+            &mut uploads,
+            &mut hasher,
+            &mut content_length,
+            &mut next_part_number,
+            buffer,
+        )?;
+    }
+
+    while let Some(uploaded) = uploads.next().await {
+        completed_parts.push(uploaded?);
+    }
+    drop(uploads);
+    drop(upload_semaphore);
+
+    complete_multipart_with_hash(
+        storage_client,
+        object,
+        upload,
+        completed_parts,
+        content_length,
+        hasher,
+        options.deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_sequential_part<'a>(
+    storage_client: &'a S3Client,
+    object: &'a storage::PreparedStorageObject,
+    upload: &'a storage::MultipartUpload,
+    upload_semaphore: &'a Semaphore,
+    options: TransferOptions,
+    uploads: &mut FuturesUnordered<UploadFuture<'a>>,
+    hasher: &mut Sha256,
+    content_length: &mut u64,
+    next_part_number: &mut i32,
+    buffer: Bytes,
+) -> AppResult<()> {
+    ensure_valid_part_number(*next_part_number)?;
+    hasher.update(buffer.as_ref());
+    add_content_length(content_length, buffer.len())?;
+    uploads.push(
+        upload_part_with_limit(
+            storage_client,
+            object,
+            upload,
+            upload_semaphore,
+            options.deadline,
+            *next_part_number,
+            buffer,
+        )
+        .boxed(),
+    );
+    *next_part_number += 1;
+    Ok(())
+}
+
+async fn wait_for_sequential_capacity<'a>(
+    uploads: &mut FuturesUnordered<UploadFuture<'a>>,
+    options: TransferOptions,
+    completed_parts: &mut Vec<storage::UploadedPart>,
+) -> AppResult<()> {
+    while uploads.len() >= options.max_in_flight_parts {
+        let Some(uploaded) = uploads.next().await else {
+            break;
+        };
+        completed_parts.push(uploaded?);
+    }
+    Ok(())
+}
+
+async fn upload_multipart_range(
+    download_client: &HttpClient,
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    source_url: &str,
+    first_buffer: Bytes,
+    content_length: u64,
+    options: TransferOptions,
+) -> AppResult<StoredObjectMetadata> {
+    let upload = with_deadline(
+        options.deadline,
+        "multipart upload creation",
+        storage::create_multipart_upload(storage_client, &object),
+    )
+    .await?;
+    let result = upload_multipart_range_inner(
+        download_client,
+        storage_client,
+        object.clone(),
+        upload.clone(),
+        source_url,
+        first_buffer,
+        content_length,
+        options,
+    )
+    .await;
+
+    finish_or_abort_multipart(storage_client, &object, &upload, result, options.deadline).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_multipart_range_inner(
+    download_client: &HttpClient,
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    upload: storage::MultipartUpload,
+    source_url: &str,
+    first_buffer: Bytes,
+    content_length: u64,
+    options: TransferOptions,
+) -> AppResult<StoredObjectMetadata> {
+    let upload_semaphore = Semaphore::new(options.upload_parallelism);
+    let mut downloads: FuturesUnordered<DownloadFuture<'_>> = FuturesUnordered::new();
+    let mut uploads: FuturesUnordered<UploadFuture<'_>> = FuturesUnordered::new();
+    let mut pending_ranges = build_range_specs(
+        first_buffer.len() as u64,
+        content_length,
+        options.chunk_size_bytes,
+    )?;
+    let mut part_states = BTreeMap::<i32, ActivePartState>::new();
+    let mut completed_parts = Vec::new();
+    let mut hasher = Sha256::new();
+    let mut hashed_content_length = 0_u64;
+    let mut next_hash_part = 1_i32;
+
+    part_states.insert(1, ActivePartState::uploading_hashed());
+    uploads.push(
+        upload_part_with_limit(
+            storage_client,
+            &object,
+            &upload,
+            &upload_semaphore,
+            options.deadline,
+            1,
+            first_buffer.clone(),
+        )
+        .boxed(),
+    );
+    part_states
+        .get_mut(&1)
+        .expect("first part state exists")
+        .bytes = Some(first_buffer);
+    hash_ready_range_parts(
+        &mut part_states,
+        &mut hasher,
+        &mut hashed_content_length,
+        &mut next_hash_part,
+    )?;
+
+    loop {
+        while downloads.len() < options.download_parallelism
+            && active_range_part_count(&downloads, &part_states) < options.max_in_flight_parts
+            && let Some(spec) = pending_ranges.pop_front()
+        {
+            downloads.push(
+                download_range_part(download_client, source_url, spec, options.deadline).boxed(),
+            );
+        }
+
+        if pending_ranges.is_empty()
+            && downloads.is_empty()
+            && uploads.is_empty()
+            && part_states.is_empty()
+        {
+            break;
+        }
+
+        tokio::select! {
+            downloaded = downloads.next(), if !downloads.is_empty() => {
+                let downloaded = downloaded
+                    .expect("download future existed")?;
+                part_states.insert(downloaded.part_number, ActivePartState::pending_hash(downloaded.bytes.clone()));
+                uploads.push(upload_part_with_limit(
+                    storage_client,
+                    &object,
+                    &upload,
+                    &upload_semaphore,
+                    options.deadline,
+                    downloaded.part_number,
+                    downloaded.bytes,
+                ).boxed());
+                hash_ready_range_parts(
+                    &mut part_states,
+                    &mut hasher,
+                    &mut hashed_content_length,
+                    &mut next_hash_part,
+                )?;
+            }
+            uploaded = uploads.next(), if !uploads.is_empty() => {
+                let uploaded = uploaded
+                    .expect("upload future existed")?;
+                mark_range_part_uploaded(&mut part_states, uploaded.part_number);
+                completed_parts.push(uploaded);
+            }
+        }
+    }
+
+    if hashed_content_length != content_length {
+        return Err(AppError::upstream(format!(
+            "downloaded content length {} did not match expected content length {}",
+            hashed_content_length, content_length
+        )));
+    }
+    drop(downloads);
+    drop(uploads);
+    drop(upload_semaphore);
+
+    complete_multipart_with_hash(
+        storage_client,
+        object,
+        upload,
+        completed_parts,
+        hashed_content_length,
+        hasher,
+        options.deadline,
+    )
+    .await
+}
+
+async fn finish_or_abort_multipart(
+    storage_client: &S3Client,
+    object: &storage::PreparedStorageObject,
+    upload: &storage::MultipartUpload,
+    result: AppResult<StoredObjectMetadata>,
+    deadline: Option<Instant>,
+) -> AppResult<StoredObjectMetadata> {
+    match result {
+        Ok(uploaded) => Ok(uploaded),
+        Err(error) => {
+            if let Err(abort_error) = with_deadline(
+                deadline,
+                "multipart upload abort",
+                storage::abort_multipart_upload(storage_client, object, upload),
+            )
+            .await
+            {
+                tracing::warn!(error = %abort_error, "failed to abort multipart upload after transfer error");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn complete_multipart_with_hash(
+    storage_client: &S3Client,
+    object: storage::PreparedStorageObject,
+    upload: storage::MultipartUpload,
+    completed_parts: Vec<storage::UploadedPart>,
+    content_length: u64,
+    hasher: Sha256,
+    deadline: Option<Instant>,
+) -> AppResult<StoredObjectMetadata> {
+    let content_length = i64::try_from(content_length)
+        .map_err(|_| AppError::upstream("object body exceeded i64 length limit"))?;
+    let sha256_hex = format!("{:x}", hasher.finalize());
+
+    with_deadline(
+        deadline,
+        "multipart upload completion",
+        storage::complete_multipart_upload(
+            storage_client,
+            object,
+            upload,
+            completed_parts,
+            content_length,
+            sha256_hex,
+        ),
+    )
+    .await
+}
+
+async fn upload_part_with_limit(
+    storage_client: &S3Client,
+    object: &storage::PreparedStorageObject,
+    upload: &storage::MultipartUpload,
+    upload_semaphore: &Semaphore,
+    deadline: Option<Instant>,
+    part_number: i32,
+    buffer: Bytes,
+) -> AppResult<storage::UploadedPart> {
+    let _permit = upload_semaphore
+        .acquire()
+        .await
+        .map_err(|_| AppError::upstream("multipart upload semaphore was closed"))?;
+    with_deadline(
+        deadline,
+        "multipart part upload",
+        storage::upload_multipart_part(storage_client, object, upload, part_number, buffer),
+    )
+    .await
+}
+
+async fn download_range_part(
+    client: &HttpClient,
+    source_url: &str,
+    spec: RangeSpec,
+    deadline: Option<Instant>,
+) -> AppResult<DownloadedPart> {
+    let header_value = format!("bytes={}-{}", spec.start, spec.end_inclusive);
+    let response = with_deadline(deadline, "range download request", async {
+        client
+            .get(source_url)
+            .header(RANGE, header_value.clone())
+            .send()
+            .await
+            .map_err(AppError::from)
+    })
+    .await?;
+
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(AppError::upstream(format!(
+            "range download returned status {} for {}",
+            response.status(),
+            source_url
+        )));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length != spec.len())
+    {
+        return Err(AppError::upstream(format!(
+            "range download returned length {} for expected length {}",
+            response.content_length().unwrap_or_default(),
+            spec.len()
+        )));
+    }
+
+    let expected_len = usize::try_from(spec.len())
+        .map_err(|_| AppError::upstream("range part exceeded usize length limit"))?;
+    let mut reader = ResponseByteReader::new(response);
+    let mut buffer = BytesMut::with_capacity(expected_len);
+    while buffer.len() < expected_len {
+        let Some(bytes) = reader
+            .read_some(expected_len - buffer.len(), deadline)
+            .await?
+        else {
+            return Err(AppError::upstream(format!(
+                "range download ended early for {}",
+                source_url
+            )));
+        };
+        buffer.extend_from_slice(&bytes);
+    }
+
+    Ok(DownloadedPart {
+        part_number: spec.part_number,
+        bytes: buffer.freeze(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransferOptions {
+    chunk_size_bytes: usize,
+    download_parallelism: usize,
+    upload_parallelism: usize,
+    max_in_flight_parts: usize,
+    deadline: Option<Instant>,
+}
+
+impl TransferOptions {
+    fn from_section(section: &TransferSection) -> AppResult<Self> {
+        let chunk_size_bytes = section
+            .chunk_size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| AppError::config("transfer.chunk_size_mb is too large"))?;
+        let deadline = if section.attempt_timeout_seconds == 0 {
+            None
+        } else {
+            Some(
+                Instant::now()
+                    .checked_add(Duration::from_secs(section.attempt_timeout_seconds))
+                    .ok_or_else(|| {
+                        AppError::config("transfer.attempt_timeout_seconds is too large")
+                    })?,
+            )
+        };
+
+        Ok(Self {
+            chunk_size_bytes,
+            download_parallelism: section.download_parallelism.max(1),
+            upload_parallelism: section.upload_parallelism.max(1),
+            max_in_flight_parts: section.max_in_flight_parts.max(1),
+            deadline,
+        })
+    }
+}
+
+type UploadFuture<'a> = BoxFuture<'a, AppResult<storage::UploadedPart>>;
+type DownloadFuture<'a> = BoxFuture<'a, AppResult<DownloadedPart>>;
+
+struct InitialDownload {
+    response: Response,
+    content_type: Option<String>,
+    content_length: Option<u64>,
+    supports_ranges: bool,
+}
+
+struct ResponseByteReader {
+    response: Response,
+    pending: Option<Bytes>,
+    pending_offset: usize,
+}
+
+impl ResponseByteReader {
+    fn new(response: Response) -> Self {
+        Self {
+            response,
+            pending: None,
+            pending_offset: 0,
+        }
+    }
+
+    async fn read_some(
+        &mut self,
+        max_len: usize,
+        deadline: Option<Instant>,
+    ) -> AppResult<Option<Bytes>> {
+        loop {
+            if let Some(pending) = self.pending.as_ref() {
+                if self.pending_offset < pending.len() {
+                    let end = (self.pending_offset + max_len).min(pending.len());
+                    let bytes = pending.slice(self.pending_offset..end);
+                    self.pending_offset = end;
+                    if self.pending_offset == pending.len() {
+                        self.pending = None;
+                        self.pending_offset = 0;
+                    }
+                    return Ok(Some(bytes));
+                }
+                self.pending = None;
+                self.pending_offset = 0;
+            }
+
+            let next = with_deadline(deadline, "download body read", async {
+                self.response.chunk().await.map_err(AppError::from)
+            })
+            .await?;
+            match next {
+                Some(bytes) if bytes.is_empty() => {}
+                Some(bytes) => {
+                    self.pending = Some(bytes);
+                    self.pending_offset = 0;
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+async fn read_next_buffer(
+    reader: &mut ResponseByteReader,
+    chunk_size_bytes: usize,
+    deadline: Option<Instant>,
+) -> AppResult<Option<Bytes>> {
+    let mut buffer = BytesMut::with_capacity(chunk_size_bytes);
+    while buffer.len() < chunk_size_bytes {
+        let Some(bytes) = reader
+            .read_some(chunk_size_bytes - buffer.len(), deadline)
+            .await?
+        else {
+            break;
+        };
+        buffer.extend_from_slice(&bytes);
+    }
+
+    if buffer.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(buffer.freeze()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeSpec {
+    part_number: i32,
+    start: u64,
+    end_inclusive: u64,
+}
+
+impl RangeSpec {
+    fn len(self) -> u64 {
+        self.end_inclusive - self.start + 1
+    }
+}
+
+#[derive(Debug)]
+struct DownloadedPart {
+    part_number: i32,
+    bytes: Bytes,
+}
+
+#[derive(Debug)]
+struct ActivePartState {
+    bytes: Option<Bytes>,
+    upload_done: bool,
+}
+
+impl ActivePartState {
+    fn uploading_hashed() -> Self {
+        Self {
+            bytes: None,
+            upload_done: false,
+        }
+    }
+
+    fn pending_hash(bytes: Bytes) -> Self {
+        Self {
+            bytes: Some(bytes),
+            upload_done: false,
+        }
+    }
+}
+
+fn build_range_specs(
+    start_offset: u64,
+    content_length: u64,
+    chunk_size_bytes: usize,
+) -> AppResult<VecDeque<RangeSpec>> {
+    let chunk_size = u64::try_from(chunk_size_bytes)
+        .map_err(|_| AppError::upstream("transfer chunk size exceeded u64 length limit"))?;
+    let mut specs = VecDeque::new();
+    let mut cursor = start_offset;
+    let mut part_number = 2_i32;
+
+    while cursor < content_length {
+        ensure_valid_part_number(part_number)?;
+        let next_cursor = cursor.saturating_add(chunk_size).min(content_length);
+        specs.push_back(RangeSpec {
+            part_number,
+            start: cursor,
+            end_inclusive: next_cursor - 1,
+        });
+        cursor = next_cursor;
+        part_number += 1;
+    }
+
+    Ok(specs)
+}
+
+fn hash_ready_range_parts(
+    part_states: &mut BTreeMap<i32, ActivePartState>,
+    hasher: &mut Sha256,
+    content_length: &mut u64,
+    next_hash_part: &mut i32,
+) -> AppResult<()> {
+    loop {
+        let part_number = *next_hash_part;
+        let Some(state) = part_states.get_mut(&part_number) else {
+            break;
+        };
+        let Some(bytes) = state.bytes.take() else {
+            break;
+        };
+        hasher.update(bytes.as_ref());
+        add_content_length(content_length, bytes.len())?;
+        let remove_state = state.upload_done;
+        *next_hash_part += 1;
+        if remove_state {
+            part_states.remove(&part_number);
+        }
+    }
+
+    Ok(())
+}
+
+fn mark_range_part_uploaded(part_states: &mut BTreeMap<i32, ActivePartState>, part_number: i32) {
+    let remove_state = if let Some(state) = part_states.get_mut(&part_number) {
+        state.upload_done = true;
+        state.bytes.is_none()
+    } else {
+        false
+    };
+
+    if remove_state {
+        part_states.remove(&part_number);
+    }
+}
+
+fn active_range_part_count<T>(
+    downloads: &FuturesUnordered<T>,
+    part_states: &BTreeMap<i32, ActivePartState>,
+) -> usize {
+    downloads.len() + part_states.len()
+}
+
+fn response_supports_ranges(response: &Response) -> bool {
+    response
+        .headers()
+        .get(ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("bytes"))
+        })
+}
+
+fn ensure_valid_part_number(part_number: i32) -> AppResult<()> {
+    if (1..=10_000).contains(&part_number) {
+        Ok(())
+    } else {
+        Err(AppError::upstream(
+            "multipart upload exceeded the S3 10000 part limit",
+        ))
+    }
+}
+
+fn add_content_length(total: &mut u64, len: usize) -> AppResult<()> {
+    let len =
+        u64::try_from(len).map_err(|_| AppError::upstream("buffer exceeded u64 length limit"))?;
+    *total = total
+        .checked_add(len)
+        .ok_or_else(|| AppError::upstream("object body exceeded u64 length limit"))?;
+    Ok(())
+}
+
+async fn with_deadline<T, F>(deadline: Option<Instant>, context: &str, future: F) -> AppResult<T>
+where
+    F: Future<Output = AppResult<T>>,
+{
+    if let Some(deadline) = deadline {
+        tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_| AppError::upstream(format!("{context} timed out")))?
+    } else {
+        future.await
+    }
 }
 
 async fn persist_completed_task(
@@ -550,11 +1369,6 @@ fn duration_to_time(duration: Duration) -> time::Duration {
 
 fn truncate_error_message(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
-}
-
-struct DownloadedSource {
-    bytes: Bytes,
-    content_type: Option<String>,
 }
 
 #[cfg(test)]

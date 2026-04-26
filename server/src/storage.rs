@@ -3,7 +3,9 @@ use std::path::Path;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    Client as S3Client, config::Region, primitives::ByteStream,
+    Client as S3Client,
+    config::Region,
+    primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
 use bytes::Bytes;
@@ -246,7 +248,9 @@ pub async fn upload_multipart_part(
         .send()
         .await
         .map_err(|error| {
-            AppError::upstream(format!("failed to upload multipart part to storage: {error}"))
+            AppError::upstream(format!(
+                "failed to upload multipart part to storage: {error}"
+            ))
         })?;
 
     let etag = response
@@ -276,7 +280,9 @@ pub async fn complete_multipart_upload(
         .send()
         .await
         .map_err(|error| {
-            AppError::upstream(format!("failed to complete multipart upload in storage: {error}"))
+            AppError::upstream(format!(
+                "failed to complete multipart upload in storage: {error}"
+            ))
         })?;
 
     Ok(StoredObjectMetadata {
@@ -304,7 +310,9 @@ pub async fn abort_multipart_upload(
         .send()
         .await
         .map_err(|error| {
-            AppError::upstream(format!("failed to abort multipart upload in storage: {error}"))
+            AppError::upstream(format!(
+                "failed to abort multipart upload in storage: {error}"
+            ))
         })?;
 
     Ok(())
