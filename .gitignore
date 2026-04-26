@@ -12,3 +12,4 @@ docs/claude*.sql
 docs/tweet-v2-schema-draft.sql
 *.log
 .DS_Store
+var/
