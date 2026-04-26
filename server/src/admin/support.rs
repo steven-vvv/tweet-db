@@ -33,12 +33,50 @@ pub(super) fn like_pattern(value: Option<&str>) -> Option<String> {
     value.map(|value| format!("%{value}%"))
 }
 
+pub(super) fn prefix_pattern(value: Option<&str>) -> Option<String> {
+    value.map(|value| format!("{value}%"))
+}
+
+pub(super) fn lowercase_prefix_pattern(value: Option<&str>) -> Option<String> {
+    value.map(|value| format!("{}%", value.to_ascii_lowercase()))
+}
+
 pub(super) fn normalize_user_status(raw: Option<&str>) -> AppResult<String> {
     let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
     match value.as_str() {
         "all" | "active" | "disabled" => Ok(value),
         _ => Err(AppError::bad_request(
             "status must be one of all, active, disabled",
+        )),
+    }
+}
+
+pub(super) fn normalize_transfer_status(raw: Option<&str>) -> AppResult<String> {
+    let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "all" | "pending" | "processing" | "completed" | "failed" | "canceled" => Ok(value),
+        _ => Err(AppError::bad_request(
+            "status must be one of all, pending, processing, completed, failed, canceled",
+        )),
+    }
+}
+
+pub(super) fn normalize_media_type(raw: Option<&str>) -> AppResult<String> {
+    let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "all" | "photo" | "video" | "animated_gif" => Ok(value),
+        _ => Err(AppError::bad_request(
+            "mediaType must be one of all, photo, video, animated_gif",
+        )),
+    }
+}
+
+pub(super) fn normalize_tweet_relation(raw: Option<&str>) -> AppResult<String> {
+    let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "all" | "original" | "reply" | "quote" | "repost" => Ok(value),
+        _ => Err(AppError::bad_request(
+            "relation must be one of all, original, reply, quote, repost",
         )),
     }
 }

@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
     Client as S3Client,
     config::Region,
+    presigning::PresigningConfig,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
@@ -146,6 +147,25 @@ pub fn prepare_upload(
         object_key,
         content_type,
     }
+}
+
+pub async fn presign_get_object(
+    client: &S3Client,
+    bucket: &str,
+    object_key: &str,
+    expires_in: Duration,
+) -> AppResult<String> {
+    let config = PresigningConfig::expires_in(expires_in)
+        .map_err(|error| AppError::config(format!("invalid storage signing config: {error}")))?;
+    let request = client
+        .get_object()
+        .bucket(bucket)
+        .key(object_key)
+        .presigned(config)
+        .await
+        .map_err(|error| AppError::upstream(format!("failed to sign storage object: {error}")))?;
+
+    Ok(request.uri().to_string())
 }
 
 pub async fn upload_bytes(

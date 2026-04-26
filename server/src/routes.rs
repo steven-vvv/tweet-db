@@ -48,6 +48,7 @@ fn internal_api_routes() -> Router<AppState> {
 
 fn admin_api_routes() -> Router<AppState> {
     Router::new()
+        .route("/internal/v1/admin/overview", get(admin::overview))
         .route("/internal/v1/admin/users", get(admin::list_users))
         .route("/internal/v1/admin/users/{user_id}", get(admin::get_user))
         .route(
@@ -57,6 +58,61 @@ fn admin_api_routes() -> Router<AppState> {
         .route(
             "/internal/v1/admin/users/{user_id}/enable",
             post(admin::enable_user),
+        )
+        .route(
+            "/internal/v1/admin/twitter-users",
+            get(admin::list_twitter_users),
+        )
+        .route(
+            "/internal/v1/admin/twitter-users/{user_id}",
+            get(admin::get_twitter_user),
+        )
+        .route("/internal/v1/admin/tweets", get(admin::list_tweets))
+        .route(
+            "/internal/v1/admin/tweets/{tweet_id}",
+            get(admin::get_tweet),
+        )
+        .route("/internal/v1/admin/media", get(admin::list_media))
+        .route("/internal/v1/admin/media/{media_id}", get(admin::get_media))
+        .route(
+            "/internal/v1/admin/media/{media_id}/transfer-tasks",
+            post(admin::create_media_transfer_task),
+        )
+        .route(
+            "/internal/v1/admin/storage-objects",
+            get(admin::list_storage_objects),
+        )
+        .route(
+            "/internal/v1/admin/storage-objects/{object_id}",
+            get(admin::get_storage_object),
+        )
+        .route(
+            "/internal/v1/admin/storage-objects/{object_id}/open",
+            get(admin::open_storage_object),
+        )
+        .route(
+            "/internal/v1/admin/transfers/overview",
+            get(admin::transfer_overview),
+        )
+        .route(
+            "/internal/v1/admin/transfers/tasks",
+            get(admin::list_transfer_tasks),
+        )
+        .route(
+            "/internal/v1/admin/transfers/tasks/{task_id}",
+            get(admin::get_transfer_task),
+        )
+        .route(
+            "/internal/v1/admin/transfers/tasks/{task_id}/retry",
+            post(admin::retry_transfer_task),
+        )
+        .route(
+            "/internal/v1/admin/transfers/tasks/{task_id}/cancel",
+            post(admin::cancel_transfer_task),
+        )
+        .route(
+            "/internal/v1/admin/transfers/tasks/{task_id}/release",
+            post(admin::release_transfer_task),
         )
 }
 
