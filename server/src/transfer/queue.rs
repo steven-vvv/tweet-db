@@ -50,12 +50,39 @@ pub async fn enqueue_tasks(
             )
             ORDER BY item.media_id, item.source_recorded_at
         ),
-        existing_source AS (
-            SELECT input.media_id, input.source_recorded_at
+        resolved_source AS (
+            SELECT
+                input.media_id,
+                input.source_recorded_at AS requested_source_recorded_at,
+                source.source_recorded_at
             FROM input
-            JOIN tweet.media_resource AS resource
-              ON resource.media_id = input.media_id
-             AND resource.recorded_at = input.source_recorded_at
+            LEFT JOIN LATERAL (
+                SELECT resource.recorded_at AS source_recorded_at
+                FROM tweet.media_resource AS resource
+                LEFT JOIN LATERAL (
+                    SELECT
+                        (item).url AS url,
+                        dict.value AS content_type,
+                        (item).bitrate AS bitrate
+                    FROM unnest(COALESCE((resource.video).variants, ARRAY[]::tweet.video_variant[])) AS item
+                    LEFT JOIN tweet.string_dict AS dict
+                      ON dict.id = (item).content_type_id
+                    ORDER BY
+                        CASE WHEN dict.value = 'video/mp4' THEN 0 ELSE 1 END,
+                        (item).bitrate DESC NULLS LAST
+                    LIMIT 1
+                ) AS variant ON true
+                WHERE resource.media_id = input.media_id
+                  AND resource.recorded_at <= input.source_recorded_at
+                  AND (
+                      resource.recorded_at = input.source_recorded_at
+                   OR COALESCE(variant.url, resource.media_url) IS NOT DISTINCT FROM input.source_url
+                  )
+                ORDER BY
+                    CASE WHEN resource.recorded_at = input.source_recorded_at THEN 0 ELSE 1 END,
+                    resource.recorded_at DESC
+                LIMIT 1
+            ) AS source ON true
         ),
         inserted AS (
             INSERT INTO media.transfer_task (
@@ -70,15 +97,16 @@ pub async fn enqueue_tasks(
             SELECT
                 input.id,
                 input.media_id,
-                input.source_recorded_at,
+                resolved_source.source_recorded_at,
                 input.source_url,
                 input.source_kind,
                 input.source_content_type,
                 'pending'::media.transfer_status
             FROM input
-            JOIN existing_source
-              ON existing_source.media_id = input.media_id
-             AND existing_source.source_recorded_at = input.source_recorded_at
+            JOIN resolved_source
+              ON resolved_source.media_id = input.media_id
+             AND resolved_source.requested_source_recorded_at = input.source_recorded_at
+            WHERE resolved_source.source_recorded_at IS NOT NULL
             ON CONFLICT (media_id, source_recorded_at) DO NOTHING
             RETURNING media_id, source_recorded_at
         )
@@ -86,17 +114,17 @@ pub async fn enqueue_tasks(
             input.media_id,
             input.source_recorded_at,
             CASE
-                WHEN existing_source.media_id IS NULL THEN 'missing_source'
+                WHEN resolved_source.source_recorded_at IS NULL THEN 'missing_source'
                 WHEN inserted.media_id IS NOT NULL THEN 'enqueued'
                 ELSE 'duplicate'
             END AS status
         FROM input
-        LEFT JOIN existing_source
-          ON existing_source.media_id = input.media_id
-         AND existing_source.source_recorded_at = input.source_recorded_at
+        LEFT JOIN resolved_source
+          ON resolved_source.media_id = input.media_id
+         AND resolved_source.requested_source_recorded_at = input.source_recorded_at
         LEFT JOIN inserted
           ON inserted.media_id = input.media_id
-         AND inserted.source_recorded_at = input.source_recorded_at
+         AND inserted.source_recorded_at = resolved_source.source_recorded_at
         "#,
     )
     .bind(serde_json::to_value(tasks)?)
