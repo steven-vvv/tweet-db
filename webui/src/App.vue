@@ -1,9 +1,12 @@
 <template>
-  <main class="shell" :class="{ wide: isWide }">
-    <section class="card" :class="{ wide: isWide }">
+  <main v-if="isWide" class="admin-root">
+    <RouterView />
+  </main>
+  <main v-else class="shell">
+    <section class="card">
       <header class="hero">
         <p class="eyebrow">tweet-db</p>
-        <h1>{{ isWide ? 'Internal account console' : 'Account access and session status' }}</h1>
+        <h1>Account access and session status</h1>
       </header>
       <RouterView />
     </section>
@@ -40,10 +43,6 @@ const isWide = computed(() => Boolean(route.meta.wide))
   padding: 32px 16px;
 }
 
-.shell.wide {
-  place-items: start center;
-}
-
 .card {
   width: min(760px, 100%);
   background: rgba(255, 255, 255, 0.96);
@@ -54,8 +53,9 @@ const isWide = computed(() => Boolean(route.meta.wide))
   backdrop-filter: blur(16px);
 }
 
-.card.wide {
-  width: min(1280px, 100%);
+.admin-root {
+  min-height: 100vh;
+  background: #f6f8fb;
 }
 
 .hero {

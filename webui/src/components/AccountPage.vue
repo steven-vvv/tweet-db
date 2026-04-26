@@ -64,12 +64,12 @@
       </div>
       <div v-if="session.is_admin" class="row">
         <span>Admin console</span>
-        <RouterLink class="inline-link" to="/admin/users">Open</RouterLink>
+        <RouterLink class="inline-link" to="/admin/overview">Open</RouterLink>
       </div>
     </div>
     <RouterLink
       v-if="session?.authenticated && session.is_admin"
-      to="/admin/users"
+      to="/admin/overview"
       class="secondary"
     >
       Open admin console

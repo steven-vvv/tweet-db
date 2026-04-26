@@ -1,10 +1,8 @@
 <template>
-  <section class="panel">
-    <header v-if="title" class="panel-head">
-      <h3>{{ title }}</h3>
-    </header>
+  <details class="json-panel" :open="open">
+    <summary>{{ title }}</summary>
     <pre>{{ serialized }}</pre>
-  </section>
+  </details>
 </template>
 
 <script setup lang="ts">
@@ -12,34 +10,41 @@ import { computed } from 'vue'
 
 import { toJson } from '../../admin-helpers'
 
-const props = defineProps<{
-  title?: string
-  value: unknown
-}>()
+const props = withDefaults(
+  defineProps<{
+    title: string
+    value: unknown
+    open?: boolean
+  }>(),
+  {
+    open: false,
+  },
+)
 
 const serialized = computed(() => toJson(props.value))
 </script>
 
 <style scoped>
-.panel {
-  display: grid;
-  gap: 12px;
-  padding: 18px;
-  border: 1px solid #d3ddeb;
-  border-radius: 18px;
-  background: #fbfcfe;
+.json-panel {
+  border: 1px solid #d9e0ea;
+  border-radius: 8px;
+  background: #fff;
 }
 
-.panel-head h3 {
-  margin: 0;
-  font-size: 0.95rem;
+summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 650;
 }
 
 pre {
   margin: 0;
+  max-height: 520px;
+  overflow: auto;
+  padding: 12px;
+  border-top: 1px solid #edf1f6;
   white-space: pre-wrap;
   word-break: break-word;
-  font: 0.82rem/1.6 "IBM Plex Mono", monospace;
-  color: #17304f;
+  font: 0.82rem/1.55 "IBM Plex Mono", ui-monospace, monospace;
 }
 </style>

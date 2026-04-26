@@ -124,3 +124,140 @@ export function enableAdminUser(userId: string) {
     method: 'POST',
   })
 }
+
+export function fetchAdminOverview() {
+  return request<JsonRecord>('/internal/v1/admin/overview', {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminTwitterUsers(params?: {
+  q?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<CursorListResponse>(withQuery('/internal/v1/admin/twitter-users', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminTwitterUser(userId: string) {
+  return request<DetailResponse>(`/internal/v1/admin/twitter-users/${userId}`, {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminTweets(params?: {
+  q?: string
+  authorId?: string
+  relation?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<CursorListResponse>(withQuery('/internal/v1/admin/tweets', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminTweet(tweetId: string) {
+  return request<DetailResponse>(`/internal/v1/admin/tweets/${tweetId}`, {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminMediaList(params?: {
+  q?: string
+  mediaType?: string
+  transferStatus?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<CursorListResponse>(withQuery('/internal/v1/admin/media', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminMedia(mediaId: string) {
+  return request<DetailResponse>(`/internal/v1/admin/media/${mediaId}`, {
+    method: 'GET',
+  })
+}
+
+export function createAdminMediaTransferTask(mediaId: string) {
+  return request<{ ok: boolean; created: boolean; taskId: string }>(
+    `/internal/v1/admin/media/${mediaId}/transfer-tasks`,
+    {
+      method: 'POST',
+    },
+  )
+}
+
+export function fetchAdminStorageObjects(params?: {
+  q?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<CursorListResponse>(withQuery('/internal/v1/admin/storage-objects', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchAdminStorageObject(objectId: string) {
+  return request<DetailResponse>(`/internal/v1/admin/storage-objects/${objectId}`, {
+    method: 'GET',
+  })
+}
+
+export function adminStorageObjectOpenUrl(objectId: string) {
+  return `/internal/v1/admin/storage-objects/${encodeURIComponent(objectId)}/open`
+}
+
+export function fetchTransferOverview() {
+  return request<JsonRecord>('/internal/v1/admin/transfers/overview', {
+    method: 'GET',
+  })
+}
+
+export function fetchTransferTasks(params?: {
+  q?: string
+  status?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<CursorListResponse>(withQuery('/internal/v1/admin/transfers/tasks', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchTransferTask(taskId: string) {
+  return request<DetailResponse>(`/internal/v1/admin/transfers/tasks/${taskId}`, {
+    method: 'GET',
+  })
+}
+
+export function retryTransferTask(taskId: string) {
+  return request<{ ok: boolean; task: JsonRecord }>(
+    `/internal/v1/admin/transfers/tasks/${taskId}/retry`,
+    {
+      method: 'POST',
+    },
+  )
+}
+
+export function cancelTransferTask(taskId: string) {
+  return request<{ ok: boolean; task: JsonRecord }>(
+    `/internal/v1/admin/transfers/tasks/${taskId}/cancel`,
+    {
+      method: 'POST',
+    },
+  )
+}
+
+export function releaseTransferTask(taskId: string) {
+  return request<{ ok: boolean; task: JsonRecord }>(
+    `/internal/v1/admin/transfers/tasks/${taskId}/release`,
+    {
+      method: 'POST',
+    },
+  )
+}

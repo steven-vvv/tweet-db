@@ -1,58 +1,61 @@
 <template>
-  <section class="stack">
-    <header class="page-head">
+  <section class="admin-page">
+    <header class="admin-head">
       <div>
-        <p class="eyebrow">User Detail</p>
-        <h2>{{ summary.username ?? route.params.userId }}</h2>
+        <h1>{{ summary.username ?? route.params.userId }}</h1>
+        <p>Account detail and recent IAM activity.</p>
       </div>
-      <div class="actions">
-        <button
-          v-if="summary.id"
-          type="button"
-          class="primary"
-          :disabled="submitting"
-          @click="toggleState"
-        >
-          {{ summary.disabled ? 'Enable account' : 'Disable account' }}
-        </button>
-      </div>
+      <button
+        v-if="summary.id"
+        type="button"
+        class="primary"
+        :disabled="submitting"
+        @click="toggleState"
+      >
+        {{ summary.disabled ? 'Enable account' : 'Disable account' }}
+      </button>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
 
-    <section class="summary-card">
-      <div class="summary-row">
+    <section class="panel panel-pad kv">
+      <div>
         <span>User ID</span>
-        <strong>{{ summary.id ?? '-' }}</strong>
+        <strong class="mono">{{ summary.id ?? '-' }}</strong>
       </div>
-      <div class="summary-row">
+      <div>
         <span>Status</span>
-        <strong>{{ summary.disabled ? 'Disabled' : 'Active' }}</strong>
+        <strong class="badge" :class="statusTone(summary.disabled ? 'disabled' : 'active')">
+          {{ summary.disabled ? 'Disabled' : 'Active' }}
+        </strong>
       </div>
-      <div class="summary-row">
+      <div>
         <span>Role</span>
         <strong>{{ summary.isAdmin ? 'Admin' : 'User' }}</strong>
       </div>
-      <div class="summary-row">
+      <div>
         <span>Created</span>
         <strong>{{ summary.createdAt ?? '-' }}</strong>
       </div>
     </section>
 
-    <section class="mini-grid">
-      <section class="panel">
-        <h3>Sessions</h3>
-        <ul>
-          <li v-for="item in sessions" :key="item.selector">{{ item.selector }}</li>
-        </ul>
+    <section class="split">
+      <section class="panel panel-pad">
+        <h2>Sessions</h2>
+        <div v-for="item in sessions" :key="item.selector" class="mini-row">
+          <strong class="mono">{{ item.selector }}</strong>
+          <span>{{ item.registration_state }} · {{ item.expires_at }}</span>
+        </div>
+        <p v-if="sessions.length === 0" class="empty">No sessions.</p>
       </section>
-      <section class="panel">
-        <h3>Authorizations</h3>
-        <ul>
-          <li v-for="item in authorizations" :key="item.authorization_id">
-            {{ item.authorization_id }} · {{ item.status }}
-          </li>
-        </ul>
+
+      <section class="panel panel-pad">
+        <h2>Authorizations</h2>
+        <div v-for="item in authorizations" :key="item.authorization_id" class="mini-row">
+          <strong class="mono">{{ item.authorization_id }}</strong>
+          <span>{{ item.status }} · {{ item.updated_at }}</span>
+        </div>
+        <p v-if="authorizations.length === 0" class="empty">No authorizations.</p>
       </section>
     </section>
 
@@ -65,7 +68,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
-import { asArray, asRecord } from '../../admin-helpers'
+import { asArray, asRecord, statusTone } from '../../admin-helpers'
 import { disableAdminUser, enableAdminUser, fetchAdminUser, type DetailResponse } from '../../api'
 import JsonPanel from './JsonPanel.vue'
 
@@ -79,16 +82,14 @@ const related = computed(() => asRecord(detail.value.related))
 const sessions = computed(() => asArray(related.value.sessions))
 const authorizations = computed(() => asArray(related.value.authorizations))
 
-onMounted(() => {
-  void load()
-})
+onMounted(load)
 
 async function load() {
   error.value = ''
   try {
     detail.value = await fetchAdminUser(String(route.params.userId))
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Failed to load user detail'
+    error.value = err instanceof Error ? err.message : 'Failed to load account'
   }
 }
 
@@ -96,10 +97,8 @@ async function toggleState() {
   if (!summary.value.id) {
     return
   }
-
   error.value = ''
   submitting.value = true
-
   try {
     if (summary.value.disabled) {
       await enableAdminUser(String(summary.value.id))
@@ -108,7 +107,7 @@ async function toggleState() {
     }
     await load()
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Failed to update user state'
+    error.value = err instanceof Error ? err.message : 'Failed to update account'
   } finally {
     submitting.value = false
   }
@@ -116,79 +115,36 @@ async function toggleState() {
 </script>
 
 <style scoped>
-.stack {
+h2 {
+  margin: 0 0 10px;
+  font-size: 1rem;
+}
+
+.split {
   display: grid;
-  gap: 18px;
-}
-
-.page-head {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  align-items: end;
-}
-
-.page-head h2,
-.panel h3 {
-  margin: 0;
-}
-
-.eyebrow {
-  margin: 0;
-  font-size: 0.74rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: #5e7698;
-}
-
-.error {
-  margin: 0;
-  color: #a12231;
-}
-
-.summary-card,
-.panel {
-  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  padding: 18px;
-  border: 1px solid #d3ddeb;
-  border-radius: 18px;
-  background: white;
 }
 
-.summary-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-}
-
-.mini-grid {
+.mini-row {
   display: grid;
-  gap: 16px;
+  gap: 3px;
+  padding: 8px 0;
+  border-top: 1px solid #edf1f6;
 }
 
-.panel ul {
-  margin: 0;
-  padding-left: 18px;
-  display: grid;
-  gap: 8px;
-  font-family: "IBM Plex Mono", monospace;
+.mini-row:first-of-type {
+  border-top: 0;
+}
+
+.mini-row span {
+  color: #66748a;
   font-size: 0.82rem;
 }
 
-.primary {
-  width: fit-content;
-  border: 0;
-  border-radius: 999px;
-  padding: 11px 18px;
-  background: #10203a;
-  color: white;
-  font: inherit;
-}
-
-@media (min-width: 860px) {
-  .mini-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: 1fr;
   }
 }
 </style>

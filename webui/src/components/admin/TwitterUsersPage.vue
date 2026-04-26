@@ -2,18 +2,13 @@
   <section class="admin-page">
     <header class="admin-head">
       <div>
-        <h1>Accounts</h1>
-        <p>Local users, roles, and account availability.</p>
+        <h1>X Users</h1>
+        <p>Saved X user profiles and activity counters.</p>
       </div>
     </header>
 
     <form class="toolbar" @submit.prevent="reload">
-      <input v-model="q" type="search" placeholder="Username or user ID prefix" />
-      <select v-model="status">
-        <option value="all">All statuses</option>
-        <option value="active">Active</option>
-        <option value="disabled">Disabled</option>
-      </select>
+      <input v-model="q" type="search" placeholder="User ID, handle, or name prefix" />
       <button type="submit" class="primary" :disabled="loading">Search</button>
     </form>
 
@@ -21,25 +16,28 @@
 
     <section class="table">
       <div class="table-head cols">
-        <span>Username</span>
-        <span>Status</span>
-        <span>Role</span>
-        <span>Created</span>
+        <span>User</span>
+        <span>Followers</span>
+        <span>Saved tweets</span>
+        <span>Media</span>
+        <span>Updated</span>
       </div>
       <RouterLink
         v-for="item in items"
         :key="item.id"
-        :to="`/admin/users/${item.id}`"
+        :to="`/admin/twitter-users/${item.id}`"
         class="table-row cols"
       >
-        <strong>{{ item.username }}</strong>
-        <span class="badge" :class="statusTone(item.disabled ? 'disabled' : 'active')">
-          {{ item.disabled ? 'Disabled' : 'Active' }}
-        </span>
-        <span>{{ item.isAdmin ? 'Admin' : 'User' }}</span>
-        <span class="muted">{{ item.createdAt }}</span>
+        <div>
+          <strong>{{ item.displayName ?? item.userName ?? item.id }}</strong>
+          <div class="muted">@{{ item.userName ?? item.id }}</div>
+        </div>
+        <span>{{ countValue(item.followers) }}</span>
+        <span>{{ countValue(item.savedTweets) }}</span>
+        <span>{{ countValue(item.savedMedia) }}</span>
+        <span class="muted">{{ item.updatedAt }}</span>
       </RouterLink>
-      <p v-if="!loading && items.length === 0" class="empty">No accounts matched.</p>
+      <p v-if="!loading && items.length === 0" class="empty">No X users matched.</p>
     </section>
 
     <button v-if="nextCursor" type="button" :disabled="loading" @click="loadMore">
@@ -52,13 +50,12 @@
 import { onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
-import { statusTone } from '../../admin-helpers'
-import { fetchAdminUsers, type JsonRecord } from '../../api'
+import { countValue } from '../../admin-helpers'
+import { fetchAdminTwitterUsers, type JsonRecord } from '../../api'
 
 const items = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
 const q = ref('')
-const status = ref('all')
 const loading = ref(false)
 const error = ref('')
 
@@ -76,15 +73,14 @@ async function load(reset: boolean) {
   loading.value = true
   error.value = ''
   try {
-    const response = await fetchAdminUsers({
+    const response = await fetchAdminTwitterUsers({
       q: q.value.trim() || undefined,
-      status: status.value,
       cursor: reset ? undefined : nextCursor.value,
     })
     items.value = reset ? response.items : [...items.value, ...response.items]
     nextCursor.value = response.nextCursor
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Failed to load accounts'
+    error.value = err instanceof Error ? err.message : 'Failed to load X users'
   } finally {
     loading.value = false
   }
@@ -93,10 +89,10 @@ async function load(reset: boolean) {
 
 <style scoped>
 .cols {
-  grid-template-columns: minmax(180px, 1.5fr) 110px 90px 220px;
+  grid-template-columns: minmax(220px, 1.6fr) 110px 120px 90px 220px;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .cols {
     grid-template-columns: 1fr;
   }
