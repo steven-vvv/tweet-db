@@ -45,7 +45,6 @@ pub(super) async fn write_tweet_places_batch(
 }
 
 pub(super) async fn write_tweets_batch(
-    state: &AppState,
     store: &TweetStore<'_>,
     items: &[Indexed<Tweet>],
     results: &mut [ObjectResultBuilder],
@@ -60,49 +59,17 @@ pub(super) async fn write_tweets_batch(
         .collect::<Vec<_>>();
     match store.insert_tweets_changed(&values).await {
         Ok(changed) => {
-            let mut index_targets = Vec::new();
             for item in items {
                 if changed.contains(&item.value.id) {
                     results[item.index].accepted("tweet", "inserted_or_filled");
-                    index_targets
-                        .push((item.index, crate::search::IndexTarget::tweet(item.value.id)));
                 } else {
                     results[item.index].skipped("tweet", "unchanged_or_existing");
                 }
             }
-            enqueue_search_targets(state, &index_targets, results, "search_tweet_index").await;
         }
         Err(error) => {
             for item in items {
                 results[item.index].failed("tweet", error.to_string());
-            }
-        }
-    }
-}
-
-async fn enqueue_search_targets(
-    state: &AppState,
-    targets: &[(usize, crate::search::IndexTarget)],
-    results: &mut [ObjectResultBuilder],
-    operation_name: &'static str,
-) {
-    if state.search.is_none() || targets.is_empty() {
-        return;
-    }
-
-    let values = targets
-        .iter()
-        .map(|(_, target)| *target)
-        .collect::<Vec<_>>();
-    match crate::search::enqueue_targets(&state.db, &values).await {
-        Ok(_) => {
-            for (index, _) in targets {
-                results[*index].accepted(operation_name, "queued");
-            }
-        }
-        Err(error) => {
-            for (index, _) in targets {
-                results[*index].failed(operation_name, error.to_string());
             }
         }
     }

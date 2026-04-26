@@ -59,7 +59,6 @@ impl IndexTarget {
 
 #[derive(Debug, Serialize)]
 struct EnqueuePayload {
-    id: Uuid,
     target_kind: &'static str,
     target_id: i64,
 }
@@ -97,7 +96,6 @@ pub async fn enqueue_targets(
     let payloads = targets
         .iter()
         .map(|target| EnqueuePayload {
-            id: Uuid::now_v7(),
             target_kind: target.kind.as_db_str(),
             target_id: target.id,
         })
@@ -105,46 +103,8 @@ pub async fn enqueue_targets(
 
     let rows = sqlx::query(
         r#"
-        WITH input AS (
-            SELECT DISTINCT ON (item.target_kind, item.target_id)
-                item.id,
-                item.target_kind::search.index_target_kind AS target_kind,
-                item.target_id
-            FROM jsonb_to_recordset($1::jsonb) AS item(
-                id UUID,
-                target_kind TEXT,
-                target_id BIGINT
-            )
-            ORDER BY item.target_kind, item.target_id
-        ),
-        upserted AS (
-            INSERT INTO search.index_queue (
-                id,
-                target_kind,
-                target_id,
-                status
-            )
-            SELECT
-                input.id,
-                input.target_kind,
-                input.target_id,
-                'pending'::search.index_task_status
-            FROM input
-            ON CONFLICT (target_kind, target_id) DO UPDATE
-            SET status = 'pending',
-                attempt_count = 0,
-                last_error = NULL,
-                claimed_by = NULL,
-                claimed_at = NULL,
-                completed_at = NULL,
-                updated_at = NOW()
-            RETURNING
-                target_kind::text AS target_kind,
-                target_id,
-                (xmax = 0) AS inserted
-        )
-        SELECT target_kind, target_id, inserted
-        FROM upserted
+        SELECT target_kind::text AS target_kind, target_id, status
+        FROM search.enqueue_targets($1::jsonb, TRUE)
         "#,
     )
     .bind(serde_json::to_value(payloads)?)
@@ -157,10 +117,14 @@ pub async fn enqueue_targets(
                 kind: IndexTargetKind::from_db_str(row.get::<String, _>("target_kind").as_str())?,
                 id: row.get("target_id"),
             };
-            let status = if row.get::<bool, _>("inserted") {
-                EnqueueStatus::Enqueued
-            } else {
-                EnqueueStatus::Refreshed
+            let status = match row.get::<String, _>("status").as_str() {
+                "enqueued" => EnqueueStatus::Enqueued,
+                "refreshed" => EnqueueStatus::Refreshed,
+                other => {
+                    return Err(AppError::upstream(format!(
+                        "unexpected search enqueue status: {other}"
+                    )));
+                }
             };
             Ok((target, status))
         })

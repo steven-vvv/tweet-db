@@ -84,7 +84,6 @@ pub(super) async fn write_combined_user_batch(
 }
 
 pub(super) async fn write_user_snapshots_batch(
-    state: &AppState,
     store: &TweetStore<'_>,
     items: &[Indexed<UserSnapshot>],
     results: &mut [ObjectResultBuilder],
@@ -99,56 +98,20 @@ pub(super) async fn write_user_snapshots_batch(
         .collect::<Vec<_>>();
     match store.append_user_snapshots_if_changed_many(&values).await {
         Ok(statuses) => {
-            let mut index_targets = Vec::new();
             for item in items {
                 let key = (item.value.user_id, item.value.recorded_at);
                 match statuses.get(&key).copied() {
                     Some(write) => {
                         record_conditional_write(&mut results[item.index], "user_snapshot", write);
-                        if write == ConditionalWrite::Inserted {
-                            index_targets.push((
-                                item.index,
-                                crate::search::IndexTarget::user(item.value.user_id),
-                            ));
-                        }
                     }
                     None => results[item.index]
                         .failed("user_snapshot", "missing batch write status".to_owned()),
                 }
             }
-            enqueue_search_targets(state, &index_targets, results, "search_user_index").await;
         }
         Err(error) => {
             for item in items {
                 results[item.index].failed("user_snapshot", error.to_string());
-            }
-        }
-    }
-}
-
-async fn enqueue_search_targets(
-    state: &AppState,
-    targets: &[(usize, crate::search::IndexTarget)],
-    results: &mut [ObjectResultBuilder],
-    operation_name: &'static str,
-) {
-    if state.search.is_none() || targets.is_empty() {
-        return;
-    }
-
-    let values = targets
-        .iter()
-        .map(|(_, target)| *target)
-        .collect::<Vec<_>>();
-    match crate::search::enqueue_targets(&state.db, &values).await {
-        Ok(_) => {
-            for (index, _) in targets {
-                results[*index].accepted(operation_name, "queued");
-            }
-        }
-        Err(error) => {
-            for (index, _) in targets {
-                results[*index].failed(operation_name, error.to_string());
             }
         }
     }
