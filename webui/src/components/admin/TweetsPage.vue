@@ -17,6 +17,10 @@
         <option value="quote">Quote</option>
         <option value="repost">Repost</option>
       </select>
+      <select v-model="sort">
+        <option value="relevance">Relevance</option>
+        <option value="time">Published time</option>
+      </select>
       <button type="submit" class="primary" :disabled="loading">Search</button>
     </form>
 
@@ -66,6 +70,7 @@ const nextCursor = ref<string | null>(null)
 const q = ref('')
 const authorId = ref('')
 const relation = ref('all')
+const sort = ref('relevance')
 const loading = ref(false)
 const error = ref('')
 
@@ -87,6 +92,7 @@ async function load(reset: boolean) {
       q: q.value.trim() || undefined,
       authorId: authorId.value.trim() || undefined,
       relation: relation.value,
+      sort: q.value.trim() ? sort.value : undefined,
       cursor: reset ? undefined : nextCursor.value,
     })
     items.value = reset ? response.items : [...items.value, ...response.items]

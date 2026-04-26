@@ -9,6 +9,10 @@
 
     <form class="toolbar" @submit.prevent="reload">
       <input v-model="q" type="search" placeholder="User ID, handle, or name prefix" />
+      <select v-model="sort">
+        <option value="relevance">Relevance</option>
+        <option value="time">Updated time</option>
+      </select>
       <button type="submit" class="primary" :disabled="loading">Search</button>
     </form>
 
@@ -56,6 +60,7 @@ import { fetchAdminTwitterUsers, type JsonRecord } from '../../api'
 const items = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
 const q = ref('')
+const sort = ref('relevance')
 const loading = ref(false)
 const error = ref('')
 
@@ -75,6 +80,7 @@ async function load(reset: boolean) {
   try {
     const response = await fetchAdminTwitterUsers({
       q: q.value.trim() || undefined,
+      sort: q.value.trim() ? sort.value : undefined,
       cursor: reset ? undefined : nextCursor.value,
     })
     items.value = reset ? response.items : [...items.value, ...response.items]

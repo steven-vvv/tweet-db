@@ -133,6 +133,7 @@ export function fetchAdminOverview() {
 
 export function fetchAdminTwitterUsers(params?: {
   q?: string
+  sort?: string
   cursor?: string | null
   limit?: number
 }) {
@@ -151,6 +152,7 @@ export function fetchAdminTweets(params?: {
   q?: string
   authorId?: string
   relation?: string
+  sort?: string
   cursor?: string | null
   limit?: number
 }) {

@@ -7,7 +7,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ use crate::{
     auth::{self, ActiveSession},
     db,
     error::{AppError, AppResult},
+    search::{SearchHit, SearchSort, SearchState, TweetSearchFilters},
     state::AppState,
     storage,
 };
@@ -44,6 +45,7 @@ pub struct UserListQuery {
 pub struct TwitterUserListQuery {
     #[serde(flatten)]
     pub list: ListQuery,
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -53,6 +55,7 @@ pub struct TweetListQuery {
     pub list: ListQuery,
     pub author_id: Option<String>,
     pub relation: Option<String>,
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -99,6 +102,14 @@ struct TwitterUserCursor {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct TwitterUserSearchCursor {
+    v: u8,
+    q: String,
+    sort: SearchSort,
+    offset: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct TweetCursor {
     v: u8,
     q: Option<String>,
@@ -107,6 +118,16 @@ struct TweetCursor {
     #[serde(with = "cursor_datetime")]
     published_at: OffsetDateTime,
     id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TweetSearchCursor {
+    v: u8,
+    q: String,
+    sort: SearchSort,
+    author_id: Option<i64>,
+    relation: String,
+    offset: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -552,6 +573,20 @@ pub async fn list_twitter_users(
     let _session = auth::require_admin_session(session)?;
     let limit = resolve_limit(query.list.limit);
     let q = normalize_query(query.list.q.as_deref());
+    let sort = SearchSort::parse(query.sort.as_deref(), q.is_some())?;
+    if let (Some(search), Some(search_query)) = (state.search.as_ref(), q.as_deref()) {
+        let value = list_twitter_users_search(
+            &state.db,
+            search,
+            search_query,
+            sort,
+            limit,
+            query.list.cursor.as_deref(),
+        )
+        .await?;
+        return Ok(Json(value));
+    }
+
     let cursor = decode_cursor::<TwitterUserCursor>(query.list.cursor.as_deref())?;
 
     if let Some(cursor) = cursor.as_ref() {
@@ -648,6 +683,131 @@ pub async fn list_twitter_users(
     Ok(Json(list_response(items, next_cursor)))
 }
 
+async fn list_twitter_users_search(
+    pool: &PgPool,
+    search: &SearchState,
+    q: &str,
+    sort: SearchSort,
+    limit: usize,
+    raw_cursor: Option<&str>,
+) -> AppResult<Value> {
+    let cursor = decode_cursor::<TwitterUserSearchCursor>(raw_cursor)?;
+    if let Some(cursor) = cursor.as_ref() {
+        ensure_cursor_version(cursor.v)?;
+        ensure_filter_match(
+            Some(cursor.q.as_str()),
+            Some(q),
+            "cursor does not match query",
+        )?;
+        if cursor.sort != sort {
+            return Err(AppError::bad_request("cursor does not match sort"));
+        }
+    }
+
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let mut hits = search
+        .search_users(Some(q), sort, limit.saturating_add(1), offset)
+        .await?;
+    let has_more = hits.len() > limit;
+    if has_more {
+        hits.truncate(limit);
+    }
+
+    let items = fetch_twitter_user_search_items(pool, &hits).await?;
+    let next_cursor = if has_more {
+        Some(encode_cursor(&TwitterUserSearchCursor {
+            v: CURSOR_VERSION,
+            q: q.to_owned(),
+            sort,
+            offset: offset.saturating_add(limit),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(list_response(items, next_cursor))
+}
+
+async fn fetch_twitter_user_search_items(
+    pool: &PgPool,
+    hits: &[SearchHit],
+) -> AppResult<Vec<Value>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            u.id,
+            u.registered_at,
+            u.updated_at,
+            snapshot.display_name,
+            snapshot.user_name,
+            snapshot.avatar_url,
+            stats.followers,
+            stats.following,
+            stats.tweets,
+            COALESCE(tweet_counts.tweet_count, 0) AS tweet_count,
+            COALESCE(media_counts.media_count, 0) AS media_count
+        FROM tweet.twitter_user AS u
+        LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
+          ON snapshot.user_id = u.id
+        LEFT JOIN tweet.v_latest_user_stats AS stats
+          ON stats.user_id = u.id
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::bigint AS tweet_count
+            FROM tweet.tweet AS tweet
+            WHERE tweet.author_id = u.id
+        ) AS tweet_counts ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::bigint AS media_count
+            FROM tweet.media AS media
+            WHERE media.origin_user_id = u.id
+        ) AS media_counts ON TRUE
+        WHERE u.id = ANY($1::BIGINT[])
+        "#,
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_id = HashMap::<i64, Value>::new();
+    for row in rows {
+        let id: i64 = row.get("id");
+        by_id.insert(
+            id,
+            json!({
+                "id": id.to_string(),
+                "displayName": row.get::<Option<String>, _>("display_name"),
+                "userName": row.get::<Option<String>, _>("user_name"),
+                "avatarUrl": row.get::<Option<String>, _>("avatar_url"),
+                "followers": row.get::<Option<i64>, _>("followers"),
+                "following": row.get::<Option<i64>, _>("following"),
+                "tweets": row.get::<Option<i64>, _>("tweets"),
+                "savedTweets": row.get::<i64, _>("tweet_count"),
+                "savedMedia": row.get::<i64, _>("media_count"),
+                "registeredAt": format_time_opt(row.get("registered_at")),
+                "updatedAt": format_time(row.get("updated_at")),
+            }),
+        );
+    }
+
+    Ok(hits
+        .iter()
+        .filter_map(|hit| {
+            by_id.remove(&hit.id).map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("searchScore".to_owned(), json!(hit.score));
+                    object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
+                }
+                item
+            })
+        })
+        .collect())
+}
+
 pub async fn get_twitter_user(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -723,6 +883,22 @@ pub async fn list_tweets(
     let q = normalize_query(query.list.q.as_deref());
     let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
     let relation = normalize_tweet_relation(query.relation.as_deref())?;
+    let sort = SearchSort::parse(query.sort.as_deref(), q.is_some())?;
+    if let (Some(search), Some(search_query)) = (state.search.as_ref(), q.as_deref()) {
+        let value = list_tweets_search(
+            &state.db,
+            search,
+            search_query,
+            sort,
+            author_id,
+            &relation,
+            limit,
+            query.list.cursor.as_deref(),
+        )
+        .await?;
+        return Ok(Json(value));
+    }
+
     let cursor = decode_cursor::<TweetCursor>(query.list.cursor.as_deref())?;
 
     if let Some(cursor) = cursor.as_ref() {
@@ -749,7 +925,7 @@ pub async fn list_tweets(
             t.reply_to_tweet_id,
             t.quote_tweet_id,
             t.repost_id,
-            (t.legacy_text).body AS text_body,
+            COALESCE((t.note_text).body, (t.legacy_text).body) AS text_body,
             author_snapshot.user_name AS author_user_name,
             author_snapshot.display_name AS author_display_name,
             stats.views,
@@ -834,6 +1010,143 @@ pub async fn list_tweets(
     })?;
 
     Ok(Json(list_response(items, next_cursor)))
+}
+
+async fn list_tweets_search(
+    pool: &PgPool,
+    search: &SearchState,
+    q: &str,
+    sort: SearchSort,
+    author_id: Option<i64>,
+    relation: &str,
+    limit: usize,
+    raw_cursor: Option<&str>,
+) -> AppResult<Value> {
+    let cursor = decode_cursor::<TweetSearchCursor>(raw_cursor)?;
+    if let Some(cursor) = cursor.as_ref() {
+        ensure_cursor_version(cursor.v)?;
+        ensure_filter_match(
+            Some(cursor.q.as_str()),
+            Some(q),
+            "cursor does not match query",
+        )?;
+        if cursor.sort != sort || cursor.author_id != author_id || cursor.relation != relation {
+            return Err(AppError::bad_request("cursor does not match filters"));
+        }
+    }
+
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let filters = TweetSearchFilters {
+        author_id,
+        relation: Some(relation.to_owned()),
+    };
+    let mut hits = search
+        .search_tweets(Some(q), &filters, sort, limit.saturating_add(1), offset)
+        .await?;
+    let has_more = hits.len() > limit;
+    if has_more {
+        hits.truncate(limit);
+    }
+
+    let items = fetch_tweet_search_items(pool, &hits).await?;
+    let next_cursor = if has_more {
+        Some(encode_cursor(&TweetSearchCursor {
+            v: CURSOR_VERSION,
+            q: q.to_owned(),
+            sort,
+            author_id,
+            relation: relation.to_owned(),
+            offset: offset.saturating_add(limit),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(list_response(items, next_cursor))
+}
+
+async fn fetch_tweet_search_items(pool: &PgPool, hits: &[SearchHit]) -> AppResult<Vec<Value>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            t.id,
+            t.published_at,
+            t.author_id,
+            t.conversation_id,
+            t.reply_to_tweet_id,
+            t.quote_tweet_id,
+            t.repost_id,
+            COALESCE((t.note_text).body, (t.legacy_text).body) AS text_body,
+            author_snapshot.user_name AS author_user_name,
+            author_snapshot.display_name AS author_display_name,
+            stats.views,
+            stats.replies,
+            stats.reposts,
+            stats.quotes,
+            stats.likes,
+            COALESCE(media_counts.media_count, 0) AS media_count
+        FROM tweet.tweet AS t
+        LEFT JOIN tweet.v_latest_user_snapshot AS author_snapshot
+          ON author_snapshot.user_id = t.author_id
+        LEFT JOIN tweet.v_latest_tweet_stats AS stats
+          ON stats.tweet_id = t.id
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*)::bigint AS media_count
+            FROM tweet.tweet_media_ref AS ref
+            WHERE ref.tweet_id = t.id
+        ) AS media_counts ON TRUE
+        WHERE t.id = ANY($1::BIGINT[])
+        "#,
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_id = HashMap::<i64, Value>::new();
+    for row in rows {
+        let id: i64 = row.get("id");
+        let published_at: OffsetDateTime = row.get("published_at");
+        let text_body: String = row.get("text_body");
+        by_id.insert(
+            id,
+            json!({
+                "id": id.to_string(),
+                "publishedAt": format_time(published_at),
+                "authorId": row.get::<i64, _>("author_id").to_string(),
+                "authorUserName": row.get::<Option<String>, _>("author_user_name"),
+                "authorDisplayName": row.get::<Option<String>, _>("author_display_name"),
+                "text": truncate_text(&text_body, 180),
+                "conversationId": row.get::<i64, _>("conversation_id").to_string(),
+                "replyToTweetId": row.get::<Option<i64>, _>("reply_to_tweet_id").map(|value| value.to_string()),
+                "quoteTweetId": row.get::<Option<i64>, _>("quote_tweet_id").map(|value| value.to_string()),
+                "repostId": row.get::<Option<i64>, _>("repost_id").map(|value| value.to_string()),
+                "views": row.get::<Option<i64>, _>("views").map(|value| value.to_string()),
+                "replies": row.get::<Option<i64>, _>("replies"),
+                "reposts": row.get::<Option<i64>, _>("reposts"),
+                "quotes": row.get::<Option<i64>, _>("quotes"),
+                "likes": row.get::<Option<i64>, _>("likes"),
+                "mediaCount": row.get::<i64, _>("media_count"),
+            }),
+        );
+    }
+
+    Ok(hits
+        .iter()
+        .filter_map(|hit| {
+            by_id.remove(&hit.id).map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("searchScore".to_owned(), json!(hit.score));
+                    object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
+                }
+                item
+            })
+        })
+        .collect())
 }
 
 pub async fn get_tweet(
