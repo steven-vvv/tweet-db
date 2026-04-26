@@ -2,7 +2,10 @@ use std::path::Path;
 
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::{Client as S3Client, config::Region, primitives::ByteStream};
+use aws_sdk_s3::{
+    Client as S3Client, config::Region, primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart},
+};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -30,6 +33,26 @@ pub struct StoredObjectMetadata {
     pub content_length: i64,
     pub etag: Option<String>,
     pub sha256_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedStorageObject {
+    pub id: Uuid,
+    pub provider: String,
+    pub bucket: String,
+    pub object_key: String,
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUpload {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedPart {
+    pub part_number: i32,
+    pub etag: String,
 }
 
 pub fn status(section: &StorageSection) -> StorageSubsystemStatus {
@@ -98,6 +121,31 @@ pub fn resolve_upload_extension(content_type: &str, source_url: &str) -> String 
         .unwrap_or_else(|| "bin".to_owned())
 }
 
+pub fn prepare_upload(
+    settings: &Settings,
+    media_id: i64,
+    task_id: Uuid,
+    source_url: &str,
+    explicit_content_type: Option<&str>,
+) -> PreparedStorageObject {
+    let content_type = resolve_upload_content_type(explicit_content_type, source_url);
+    let extension = resolve_upload_extension(&content_type, source_url);
+    let object_key = build_object_key(
+        &settings.config.storage.object_key_prefix,
+        media_id,
+        task_id,
+        &extension,
+    );
+
+    PreparedStorageObject {
+        id: Uuid::now_v7(),
+        provider: settings.config.storage.provider.clone(),
+        bucket: settings.config.storage.bucket.clone(),
+        object_key,
+        content_type,
+    }
+}
+
 pub async fn upload_bytes(
     settings: &Settings,
     client: &S3Client,
@@ -107,24 +155,32 @@ pub async fn upload_bytes(
     explicit_content_type: Option<&str>,
     body: Bytes,
 ) -> AppResult<StoredObjectMetadata> {
-    let content_type = resolve_upload_content_type(explicit_content_type, source_url);
-    let extension = resolve_upload_extension(&content_type, source_url);
-    let object_key = build_object_key(
-        &settings.config.storage.object_key_prefix,
+    let object = prepare_upload(
+        settings,
         media_id,
         task_id,
-        &extension,
+        source_url,
+        explicit_content_type,
     );
+    let sha256_hex = format!("{:x}", Sha256::digest(&body));
+    put_object(client, object, body, sha256_hex).await
+}
+
+pub async fn put_object(
+    client: &S3Client,
+    object: PreparedStorageObject,
+    body: Bytes,
+    sha256_hex: String,
+) -> AppResult<StoredObjectMetadata> {
     let content_length = i64::try_from(body.len())
         .map_err(|_| AppError::upstream("object body exceeded i64 length limit"))?;
-    let sha256_hex = format!("{:x}", Sha256::digest(&body));
 
     let response = client
         .put_object()
-        .bucket(&settings.config.storage.bucket)
-        .key(&object_key)
+        .bucket(&object.bucket)
+        .key(&object.object_key)
         .body(ByteStream::from(body))
-        .content_type(content_type.clone())
+        .content_type(object.content_type.clone())
         .content_length(content_length)
         .send()
         .await
@@ -133,18 +189,146 @@ pub async fn upload_bytes(
         })?;
 
     Ok(StoredObjectMetadata {
-        id: Uuid::now_v7(),
-        provider: settings.config.storage.provider.clone(),
-        bucket: settings.config.storage.bucket.clone(),
-        object_key,
-        content_type,
+        id: object.id,
+        provider: object.provider,
+        bucket: object.bucket,
+        object_key: object.object_key,
+        content_type: object.content_type,
         content_length,
         etag: response.e_tag().map(sanitize_etag),
         sha256_hex,
     })
 }
 
-fn sanitize_etag(value: &str) -> String {
+pub async fn create_multipart_upload(
+    client: &S3Client,
+    object: &PreparedStorageObject,
+) -> AppResult<MultipartUpload> {
+    let response = client
+        .create_multipart_upload()
+        .bucket(&object.bucket)
+        .key(&object.object_key)
+        .content_type(object.content_type.clone())
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::upstream(format!(
+                "failed to create multipart upload in storage: {error}"
+            ))
+        })?;
+
+    let upload_id = response
+        .upload_id()
+        .ok_or_else(|| AppError::upstream("storage did not return multipart upload id"))?
+        .to_owned();
+
+    Ok(MultipartUpload { upload_id })
+}
+
+pub async fn upload_multipart_part(
+    client: &S3Client,
+    object: &PreparedStorageObject,
+    upload: &MultipartUpload,
+    part_number: i32,
+    body: Bytes,
+) -> AppResult<UploadedPart> {
+    let content_length = i64::try_from(body.len())
+        .map_err(|_| AppError::upstream("multipart part exceeded i64 length limit"))?;
+
+    let response = client
+        .upload_part()
+        .bucket(&object.bucket)
+        .key(&object.object_key)
+        .upload_id(&upload.upload_id)
+        .part_number(part_number)
+        .content_length(content_length)
+        .body(ByteStream::from(body))
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::upstream(format!("failed to upload multipart part to storage: {error}"))
+        })?;
+
+    let etag = response
+        .e_tag()
+        .ok_or_else(|| AppError::upstream("storage did not return multipart part etag"))?
+        .to_owned();
+
+    Ok(UploadedPart { part_number, etag })
+}
+
+pub async fn complete_multipart_upload(
+    client: &S3Client,
+    object: PreparedStorageObject,
+    upload: MultipartUpload,
+    parts: Vec<UploadedPart>,
+    content_length: i64,
+    sha256_hex: String,
+) -> AppResult<StoredObjectMetadata> {
+    let completed_upload = completed_multipart_upload(parts);
+
+    let response = client
+        .complete_multipart_upload()
+        .bucket(&object.bucket)
+        .key(&object.object_key)
+        .upload_id(upload.upload_id)
+        .multipart_upload(completed_upload)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::upstream(format!("failed to complete multipart upload in storage: {error}"))
+        })?;
+
+    Ok(StoredObjectMetadata {
+        id: object.id,
+        provider: object.provider,
+        bucket: object.bucket,
+        object_key: object.object_key,
+        content_type: object.content_type,
+        content_length,
+        etag: response.e_tag().map(sanitize_etag),
+        sha256_hex,
+    })
+}
+
+pub async fn abort_multipart_upload(
+    client: &S3Client,
+    object: &PreparedStorageObject,
+    upload: &MultipartUpload,
+) -> AppResult<()> {
+    client
+        .abort_multipart_upload()
+        .bucket(&object.bucket)
+        .key(&object.object_key)
+        .upload_id(&upload.upload_id)
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::upstream(format!("failed to abort multipart upload in storage: {error}"))
+        })?;
+
+    Ok(())
+}
+
+fn completed_multipart_upload(mut parts: Vec<UploadedPart>) -> CompletedMultipartUpload {
+    parts.sort_by_key(|part| part.part_number);
+
+    CompletedMultipartUpload::builder()
+        .set_parts(Some(
+            parts
+                .into_iter()
+                .map(|part| {
+                    CompletedPart::builder()
+                        .part_number(part.part_number)
+                        .e_tag(part.etag)
+                        .build()
+                })
+                .collect(),
+        ))
+        .build()
+}
+
+pub fn sanitize_etag(value: &str) -> String {
     value.trim_matches('"').to_owned()
 }
 
@@ -268,5 +452,32 @@ mod tests {
             ),
             "jpeg"
         );
+    }
+
+    #[test]
+    fn completed_multipart_upload_sorts_parts_by_part_number() {
+        let completed = completed_multipart_upload(vec![
+            UploadedPart {
+                part_number: 3,
+                etag: "\"third\"".to_owned(),
+            },
+            UploadedPart {
+                part_number: 1,
+                etag: "\"first\"".to_owned(),
+            },
+            UploadedPart {
+                part_number: 2,
+                etag: "\"second\"".to_owned(),
+            },
+        ]);
+
+        let parts = completed.parts();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].part_number, Some(1));
+        assert_eq!(parts[0].e_tag.as_deref(), Some("\"first\""));
+        assert_eq!(parts[1].part_number, Some(2));
+        assert_eq!(parts[1].e_tag.as_deref(), Some("\"second\""));
+        assert_eq!(parts[2].part_number, Some(3));
+        assert_eq!(parts[2].e_tag.as_deref(), Some("\"third\""));
     }
 }
