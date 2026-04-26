@@ -617,6 +617,28 @@ webui_dist_dir = "../../webui/dist"
         );
     }
 
+    #[test]
+    fn rejects_too_small_transfer_chunk_when_transfer_is_enabled() {
+        let temp_dir = TempDir::new();
+        let config = test_config(
+            r#"
+listen_addr = "127.0.0.1:3001"
+webui_dist_dir = "../../webui/dist"
+"#,
+            "http://127.0.0.1:3001",
+            false,
+            "http://127.0.0.1:3001/integrations/sso/callback",
+        )
+        .replace("enabled = false", "enabled = true");
+        let config_path = temp_dir.write("config.toml", &config);
+
+        let error = AppConfig::load(Some(&config_path)).unwrap_err();
+
+        assert!(
+            matches!(error, AppError::Config(message) if message.contains("transfer.chunk_size_mb"))
+        );
+    }
+
     fn test_config(
         server_body: &str,
         app_base_url: &str,

@@ -106,11 +106,19 @@
 - `media.storage_object` 保存对象 key、content type、长度、ETag 和 SHA-256。
 - 对象 key 格式为 `{object_key_prefix}/{media_id}/{transfer_task_id}.{ext}`。
 
+传输实现：
+
+- 每个 worker 同时只处理一个源 URL；`worker_count` 控制 URL 级并发。
+- worker 先填充首个 `chunk_size_mb` 缓冲区；如果首块内下载结束，直接 `PutObject` 上传。
+- 大文件使用 S3 multipart upload。下载完成一个块后立即排队上传，`upload_parallelism` 控制并发上传数。
+- `max_in_flight_parts` 控制单个 worker 可同时持有的块数量；内存上限约为 `worker_count * chunk_size_mb * max_in_flight_parts`。
+- 源响应带 `Content-Length` 且 `Accept-Ranges: bytes` 时，首块之后可按 `download_parallelism` 并发 range 下载；否则继续顺序读取原响应。
+- `connect_timeout_seconds`、`read_timeout_seconds` 和 `attempt_timeout_seconds` 为 0 时关闭对应超时；`task_stale_timeout_seconds` 单独控制卡在 `processing` 的任务回收。
+
 当前限制：
 
 - 只转储 tweet media。
 - 用户头像、横幅和卡片资源还没接入。
-- 上传实现现在是整文件内存缓冲；multipart 配置还没有真正使用。
 
 ## 本地检查
 

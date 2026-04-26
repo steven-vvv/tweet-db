@@ -1411,6 +1411,107 @@ mod tests {
     }
 
     #[test]
+    fn transfer_options_disable_attempt_deadline_when_timeout_is_zero() {
+        let options = TransferOptions::from_section(&TransferSection {
+            enabled: true,
+            worker_count: 2,
+            chunk_size_mb: 10,
+            download_parallelism: 4,
+            upload_parallelism: 4,
+            max_in_flight_parts: 8,
+            connect_timeout_seconds: 5,
+            read_timeout_seconds: 30,
+            attempt_timeout_seconds: 0,
+            task_stale_timeout_seconds: 900,
+            worker_poll_interval_seconds: 5,
+            max_attempts: 8,
+        })
+        .unwrap();
+
+        assert_eq!(options.chunk_size_bytes, 10 * 1024 * 1024);
+        assert_eq!(options.download_parallelism, 4);
+        assert_eq!(options.upload_parallelism, 4);
+        assert_eq!(options.max_in_flight_parts, 8);
+        assert!(options.deadline.is_none());
+    }
+
+    #[test]
+    fn range_specs_cover_remaining_bytes_after_first_buffer() {
+        let specs: Vec<_> = build_range_specs(10, 35, 10).unwrap().into_iter().collect();
+
+        assert_eq!(
+            specs,
+            vec![
+                RangeSpec {
+                    part_number: 2,
+                    start: 10,
+                    end_inclusive: 19
+                },
+                RangeSpec {
+                    part_number: 3,
+                    start: 20,
+                    end_inclusive: 29
+                },
+                RangeSpec {
+                    part_number: 4,
+                    start: 30,
+                    end_inclusive: 34
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn range_hashing_waits_for_contiguous_parts_and_cleans_uploaded_states() {
+        let mut part_states = BTreeMap::new();
+        let mut hasher = Sha256::new();
+        let mut content_length = 0;
+        let mut next_hash_part = 1;
+
+        part_states.insert(
+            2,
+            ActivePartState {
+                bytes: Some(Bytes::from_static(b"bb")),
+                upload_done: true,
+            },
+        );
+        hash_ready_range_parts(
+            &mut part_states,
+            &mut hasher,
+            &mut content_length,
+            &mut next_hash_part,
+        )
+        .unwrap();
+
+        assert_eq!(content_length, 0);
+        assert_eq!(next_hash_part, 1);
+        assert!(part_states.contains_key(&2));
+
+        part_states.insert(
+            1,
+            ActivePartState {
+                bytes: Some(Bytes::from_static(b"aa")),
+                upload_done: true,
+            },
+        );
+        hash_ready_range_parts(
+            &mut part_states,
+            &mut hasher,
+            &mut content_length,
+            &mut next_hash_part,
+        )
+        .unwrap();
+
+        assert_eq!(content_length, 4);
+        assert_eq!(next_hash_part, 3);
+        assert!(part_states.is_empty());
+        assert_eq!(
+            format!("{:x}", hasher.finalize()),
+            format!("{:x}", Sha256::digest(b"aabb"))
+        );
+    }
+
+    #[test]
     fn photo_transfer_uses_media_url() {
         let source = select_source(
             &Media {
