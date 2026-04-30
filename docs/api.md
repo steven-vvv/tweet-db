@@ -354,6 +354,7 @@ tweet 列表参数：
 - `q`
 - `authorId`
 - `relation=all|original|reply|quote|repost`
+- `include=author,stats,media,media-resources`
 - `limit`
 - `cursor`
 
@@ -365,7 +366,14 @@ tweet 列表参数：
 - `limit`
 - `cursor`
 
-tweet 详情支持 `include=stats,edit,policy,community-note,media`。媒体详情支持 `include=latest-resource,transfer-tasks,tweets`。
+tweet 详情支持 `include=author,stats,edit,policy,community-note,media,media-resources`。媒体详情支持 `include=latest-resource,transfer-tasks,tweets`。
+
+tweet 列表使用浏览视图友好的 hydrate 字段：
+
+- `author`：作者基础记录、最新 profile snapshot 和最新 stats。
+- `latestStats`：帖子最新统计。
+- `media`：帖子媒体列表；传入 `media-resources` 时包含 `latestResource`。
+- `legacyText`、`noteText`：正文结构包含 `text`、`displayRange`、`entities` 和 `styles`。
 
 ### Storage And Transfer
 

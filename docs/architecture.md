@@ -7,7 +7,7 @@
 项目分成两部分：
 
 - `server/`：Rust Axum 服务，负责认证、API、数据库写入、查询和媒体转储。
-- `webui/`：Vue 前端，包含账号页和管理员管理台。
+- `webui/`：Vue MPA 前端，包含浏览视图、账号页和管理员管理台。
 
 服务启动流程：
 
@@ -33,6 +33,16 @@
 
 对外入口集中在各领域的 `mod.rs`。路由层通过 `admin::v1` 保持现有 WebUI 接口，通过 `internal_api::v2` 暴露新的资源 API，通过 `tweet_submit::submit_tweets` 和 `tweet_query::query_tweets` 提供公开 tweet 同步能力。
 
+## WebUI
+
+当前 WebUI 使用 Vite 多入口构建：
+
+- `/browse`：桌面优先的帖子浏览视图，使用 `/internal/v2/*` 资源 API。
+- `/account`：登录、首次注册和会话状态入口。
+- `/admin`：管理员管理台，继续承载现有管理工作流。
+
+后端静态路由会按入口返回对应 HTML，根路径 `/` 重定向到 `/browse`。浏览视图当前遵循 v2 capability 规则，使用管理员会话访问。
+
 ## 管理台
 
 当前 Vue 管理台继续使用 `/internal/v1/admin/*`。这组接口面向已有页面，返回 `items/nextCursor`、`summary/record/related` 等页面友好结构：
@@ -56,6 +66,8 @@
 - `audit/events`、`system/summary`：审计记录和系统计数摘要。
 
 v2 响应统一使用 `data`、`pagination`、`included`、`result`。资源详情只返回资源事实；关联数据通过 `include` 或子资源列表读取。初版 capability 全部映射到管理员会话，handler 已按 `IdentityRead`、`TweetRead`、`MediaTransferWrite` 等能力调用鉴权函数，后续可以逐步开放只读或局部写权限。
+
+浏览视图使用 tweet v2 include 拉取时间线所需数据。`GET /internal/v2/tweets` 支持把作者、最新统计、媒体预览和最新媒体 resource hydrate 到列表项，避免时间线逐条请求关联资源。`legacyText` 和 `noteText` 输出前端友好的实体结构，保留 URL、mention、hashtag、symbol、media ref 和 style range。
 
 ## 数据库结构
 

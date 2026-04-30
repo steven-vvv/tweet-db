@@ -1,13 +1,13 @@
 # tweet-db
 
-`tweet-db` 是一个保存 X 帖子、查询同步状态、转储媒体文件的服务。后端使用 Axum 和 PostgreSQL，前端使用 Vue。
+`tweet-db` 是一个保存 X 帖子、查询同步状态、转储媒体文件的服务。后端使用 Axum 和 PostgreSQL，前端使用 Vue MPA。
 
 主要调用方是浏览器脚本，例如使用 `GM_*` 网络能力的 Tampermonkey 脚本。外部调用方可以检查会话、批量提交 tweet v2 数据、批量查询已保存数据。查询需要已注册会话，提交需要管理员会话。登录和首次绑定账号通过内置 `/account` 页面完成。
 
 ## 目录
 
 - `server/`：Rust 后端、数据库迁移、媒体转储 worker。
-- `webui/`：Vue 前端，包含 `/account` 和 `/admin` 页面。
+- `webui/`：Vue 前端，包含 `/browse`、`/account` 和 `/admin` 三个入口。
 - `docs/`：当前项目文档。
 
 ## 文档
