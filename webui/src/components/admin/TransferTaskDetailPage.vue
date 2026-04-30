@@ -97,14 +97,14 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
-import { asRecord, countValue, statusTone } from '../../admin-helpers'
+import { asRecord, countValue, statusTone } from '../../shared/admin-helpers'
 import {
   cancelTransferTask,
   fetchTransferTask,
   releaseTransferTask,
   retryTransferTask,
   type DetailResponse,
-} from '../../api'
+} from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
 const route = useRoute()

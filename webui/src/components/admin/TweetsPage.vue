@@ -62,8 +62,8 @@
 import { onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
-import { countValue, relationLabel } from '../../admin-helpers'
-import { fetchAdminTweets, type JsonRecord } from '../../api'
+import { countValue, relationLabel } from '../../shared/admin-helpers'
+import { fetchAdminTweets, type JsonRecord } from '../../shared/api'
 
 const items = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)

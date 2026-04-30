@@ -64,8 +64,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
-import { asArray, asRecord } from '../../admin-helpers'
-import { fetchAdminTweet, type DetailResponse } from '../../api'
+import { asArray, asRecord } from '../../shared/admin-helpers'
+import { fetchAdminTweet, type DetailResponse } from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
 const route = useRoute()

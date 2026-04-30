@@ -67,12 +67,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
-import { asArray, asRecord, countValue } from '../../admin-helpers'
+import { asArray, asRecord, countValue } from '../../shared/admin-helpers'
 import {
   adminStorageObjectOpenUrl,
   fetchAdminStorageObject,
   type DetailResponse,
-} from '../../api'
+} from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
 const route = useRoute()

@@ -8,7 +8,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-import { toJson } from '../../admin-helpers'
+import { toJson } from '../../shared/admin-helpers'
 
 const props = withDefaults(
   defineProps<{

@@ -17,30 +17,45 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         .route("/", get(root_redirect))
         .route("/login", get(account_redirect))
         .route("/register", get(account_redirect))
-        .route("/account", get(spa_index))
-        .route("/account/{*path}", get(spa_index))
-        .route("/admin", get(spa_index))
-        .route("/admin/{*path}", get(spa_index))
+        .route("/forbidden", get(account_index))
+        .route("/account", get(account_index))
+        .route("/account/{*path}", get(account_index))
+        .route("/browse", get(browse_index))
+        .route("/browse/{*path}", get(browse_index))
+        .route("/admin", get(admin_index))
+        .route("/admin/{*path}", get(admin_index))
         .nest_service("/assets", ServeDir::new(dist_dir.join("assets")))
         .route_service("/favicon.svg", ServeFile::new(dist_dir.join("favicon.svg")))
 }
 
 async fn root_redirect() -> Redirect {
-    Redirect::temporary("/account")
+    Redirect::temporary("/browse")
 }
 
 async fn account_redirect() -> Redirect {
     Redirect::temporary("/account")
 }
 
-async fn spa_index(State(state): State<AppState>) -> Response {
-    if dist_exists(&state) {
+async fn account_index(State(state): State<AppState>) -> Response {
+    entry_index(&state, "account/index.html").await
+}
+
+async fn browse_index(State(state): State<AppState>) -> Response {
+    entry_index(&state, "browse/index.html").await
+}
+
+async fn admin_index(State(state): State<AppState>) -> Response {
+    entry_index(&state, "admin/index.html").await
+}
+
+async fn entry_index(state: &AppState, entry_path: &str) -> Response {
+    if dist_exists(state) {
         let index_path = state
             .settings
             .config
             .server
             .webui_dist_dir
-            .join("index.html");
+            .join(entry_path);
         match tokio::fs::read_to_string(index_path).await {
             Ok(contents) => Html(contents).into_response(),
             Err(_) => placeholder_index().into_response(),
@@ -61,7 +76,7 @@ fn placeholder_index() -> Html<&'static str> {
   </head>
   <body>
     <div id="app"></div>
-    <p>Web UI is not built yet. Run the Vite build in webui/ to serve the SPA.</p>
+    <p>Web UI is not built yet. Run the Vite build in webui/ to serve the MPA.</p>
   </body>
 </html>"#,
     )
@@ -189,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_entrypoints_redirect_to_account() {
-        for path in ["/", "/login", "/register"] {
+        for path in ["/login", "/register"] {
             let response = test_router()
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await
@@ -200,11 +215,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn root_redirects_to_browse() {
+        let response = test_router()
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.headers().get("location").unwrap(), "/browse");
+    }
+
+    #[tokio::test]
     async fn admin_entrypoint_returns_placeholder_when_dist_is_missing() {
         let response = test_router()
             .oneshot(Request::get("/admin/users").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mpa_entrypoints_return_placeholder_when_dist_is_missing() {
+        for path in ["/account", "/forbidden", "/browse", "/browse/tweets/1"] {
+            let response = test_router()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 }

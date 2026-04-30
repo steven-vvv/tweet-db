@@ -81,12 +81,12 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 
-import { asArray, asRecord, statusTone } from '../../admin-helpers'
+import { asArray, asRecord, statusTone } from '../../shared/admin-helpers'
 import {
   createAdminMediaTransferTask,
   fetchAdminMedia,
   type DetailResponse,
-} from '../../api'
+} from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
 const route = useRoute()

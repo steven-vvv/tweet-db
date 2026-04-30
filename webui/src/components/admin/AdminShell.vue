@@ -26,11 +26,10 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { RouterLink, RouterView, useRouter } from 'vue-router'
+import { RouterLink, RouterView } from 'vue-router'
 
-import { fetchInternalSession, type InternalSessionResponse } from '../../api'
+import { fetchInternalSession, type InternalSessionResponse } from '../../shared/api'
 
-const router = useRouter()
 const session = ref<InternalSessionResponse | null>(null)
 
 const navItems = [
@@ -52,7 +51,7 @@ onMounted(async () => {
 })
 
 function goAccount() {
-  router.push('/account')
+  window.location.href = '/account'
 }
 </script>
 

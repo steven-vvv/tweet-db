@@ -1,8 +1,5 @@
 <template>
-  <main v-if="isWide" class="admin-root">
-    <RouterView />
-  </main>
-  <main v-else class="shell">
+  <main class="shell">
     <section class="card">
       <header class="hero">
         <p class="eyebrow">tweet-db</p>
@@ -14,11 +11,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { RouterView, useRoute } from 'vue-router'
-
-const route = useRoute()
-const isWide = computed(() => Boolean(route.meta.wide))
+import { RouterView } from 'vue-router'
 </script>
 
 <style scoped>
@@ -51,11 +44,6 @@ const isWide = computed(() => Boolean(route.meta.wide))
   padding: 32px;
   box-shadow: 0 24px 80px rgba(13, 22, 39, 0.16);
   backdrop-filter: blur(16px);
-}
-
-.admin-root {
-  min-height: 100vh;
-  background: #f6f8fb;
 }
 
 .hero {

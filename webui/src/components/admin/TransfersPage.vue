@@ -68,8 +68,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
-import { asRecord, countValue, statusTone } from '../../admin-helpers'
-import { fetchTransferOverview, fetchTransferTasks, type JsonRecord } from '../../api'
+import { asRecord, countValue, statusTone } from '../../shared/admin-helpers'
+import { fetchTransferOverview, fetchTransferTasks, type JsonRecord } from '../../shared/api'
 
 const overview = ref<JsonRecord>({})
 const tasks = ref<JsonRecord[]>([])

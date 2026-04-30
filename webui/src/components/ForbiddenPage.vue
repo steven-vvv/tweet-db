@@ -6,13 +6,9 @@
       The current session is authenticated but does not hold administrator privileges for the
       internal management console.
     </p>
-    <RouterLink to="/account" class="primary">Return to account</RouterLink>
+    <a href="/account" class="primary">Return to account</a>
   </section>
 </template>
-
-<script setup lang="ts">
-import { RouterLink } from 'vue-router'
-</script>
 
 <style scoped>
 .stack {

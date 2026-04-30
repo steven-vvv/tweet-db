@@ -68,8 +68,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
-import { asArray, asRecord, statusTone } from '../../admin-helpers'
-import { disableAdminUser, enableAdminUser, fetchAdminUser, type DetailResponse } from '../../api'
+import { asArray, asRecord, statusTone } from '../../shared/admin-helpers'
+import { disableAdminUser, enableAdminUser, fetchAdminUser, type DetailResponse } from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
 const route = useRoute()

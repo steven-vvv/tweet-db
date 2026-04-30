@@ -63,8 +63,8 @@
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
-import { asArray, asRecord, countValue } from '../../admin-helpers'
-import { fetchAdminOverview, type JsonRecord } from '../../api'
+import { asArray, asRecord, countValue } from '../../shared/admin-helpers'
+import { fetchAdminOverview, type JsonRecord } from '../../shared/api'
 
 const overview = ref<JsonRecord>({})
 const loading = ref(false)

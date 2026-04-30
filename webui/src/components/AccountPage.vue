@@ -64,16 +64,16 @@
       </div>
       <div v-if="session.is_admin" class="row">
         <span>Admin console</span>
-        <RouterLink class="inline-link" to="/admin/overview">Open</RouterLink>
+        <a class="inline-link" href="/admin/overview">Open</a>
       </div>
     </div>
-    <RouterLink
+    <a
       v-if="session?.authenticated && session.is_admin"
-      to="/admin/overview"
+      href="/admin/overview"
       class="secondary"
     >
       Open admin console
-    </RouterLink>
+    </a>
     <button
       v-if="session?.authenticated"
       type="button"
@@ -88,14 +88,13 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { RouterLink } from 'vue-router'
 
 import {
   completeRegistration,
   fetchInternalSession,
   logout,
   type InternalSessionResponse,
-} from '../api'
+} from '../shared/api'
 
 const loading = ref(true)
 const submitting = ref(false)
