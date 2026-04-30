@@ -187,6 +187,7 @@ export function fetchV2Tweets(params?: {
   q?: string
   authorId?: string
   relation?: string
+  sort?: string
   include?: string
   cursor?: string | null
   limit?: number

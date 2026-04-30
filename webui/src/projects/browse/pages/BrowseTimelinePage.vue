@@ -21,7 +21,7 @@
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="tweet-list">
-        <TweetCard v-for="item in items" :key="item.id" :tweet="item" />
+        <TweetCard v-for="item in items" :key="item.id" :tweet="item" :time-field="sort" />
         <p v-if="!loading && items.length === 0" class="empty">No posts matched.</p>
       </section>
 
@@ -36,6 +36,11 @@
         <p>Latest saved posts</p>
         <input v-model="q" type="search" placeholder="Tweet ID or author ID prefix" />
         <input v-model="authorId" type="text" placeholder="Author ID" />
+        <select v-model="sort" @change="reload">
+          <option value="publishedAt">Posted</option>
+          <option value="createdAt">Saved</option>
+          <option value="updatedAt">Updated</option>
+        </select>
         <select v-model="relation">
           <option value="all">All relations</option>
           <option value="original">Original</option>
@@ -56,6 +61,10 @@
             <dt>Loaded</dt>
             <dd>{{ countValue(items.length) }}</dd>
           </div>
+          <div>
+            <dt>Sort</dt>
+            <dd>{{ sortLabel }}</dd>
+          </div>
         </dl>
       </section>
     </aside>
@@ -63,11 +72,13 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { fetchV2Tweets, type JsonRecord } from '../../../shared/api'
 import { countValue } from '../browse-helpers'
 import TweetCard from '../components/TweetCard.vue'
+
+type TweetSort = 'publishedAt' | 'createdAt' | 'updatedAt'
 
 const include = 'author,stats,media,media-resources'
 const items = ref<JsonRecord[]>([])
@@ -75,8 +86,16 @@ const nextCursor = ref<string | null>(null)
 const q = ref('')
 const authorId = ref('')
 const relation = ref('all')
+const sort = ref<TweetSort>('publishedAt')
 const loading = ref(false)
 const error = ref('')
+
+const sortLabels: Record<TweetSort, string> = {
+  publishedAt: 'Posted',
+  createdAt: 'Saved',
+  updatedAt: 'Updated',
+}
+const sortLabel = computed(() => sortLabels[sort.value])
 
 onMounted(reload)
 
@@ -96,6 +115,7 @@ async function load(reset: boolean) {
       q: q.value.trim() || undefined,
       authorId: authorId.value.trim() || undefined,
       relation: relation.value,
+      sort: sort.value,
       include,
       cursor: reset ? undefined : nextCursor.value,
       limit: 30,

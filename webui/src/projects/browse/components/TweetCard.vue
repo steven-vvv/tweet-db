@@ -14,7 +14,7 @@
           <span>{{ authorUserName(tweet) }}</span>
           <span>·</span>
           <RouterLink class="time" :to="`/browse/tweets/${tweet.id}`">
-            {{ timeLabel(tweet.publishedAt) }}
+            {{ timeLabel(displayTime) }}
           </RouterLink>
         </div>
       </header>
@@ -61,11 +61,13 @@ import TweetText from './TweetText.vue'
 
 const props = defineProps<{
   tweet: JsonRecord
+  timeField?: 'publishedAt' | 'createdAt' | 'updatedAt'
 }>()
 
 const avatar = computed(() => authorAvatar(props.tweet))
 const media = computed(() => mediaItems(props.tweet))
 const stats = computed(() => latestStats(props.tweet))
+const displayTime = computed(() => props.tweet[props.timeField ?? 'publishedAt'])
 const authorInitial = computed(() => authorDisplayName(props.tweet).slice(0, 1).toUpperCase())
 const hasLongText = computed(() => hasNoteText(props.tweet))
 </script>
