@@ -213,7 +213,10 @@
 
 ## Internal API
 
-内部接口统一使用 `/internal/v1/...` 前缀，只给本站 Vue 前端和内部功能使用。
+内部接口分为两层：
+
+- `/internal/v1/...`：当前 Vue WebUI 使用的 legacy 接口。
+- `/internal/v2/...`：无头内部资源 API，按功能和数据模型设计，供后续 UIUX 独立接入。
 
 ### `GET /internal/v1/session`
 
@@ -254,6 +257,202 @@
   "ok": true
 }
 ```
+
+## Internal API v2
+
+v2 内部接口统一使用 `/internal/v2/...` 前缀。当前实现仍要求管理员会话；服务端按 capability 调用鉴权函数，后续可把部分 capability 映射给普通已注册用户或只读角色。
+
+通用响应：
+
+```json
+{
+  "data": [],
+  "pagination": {
+    "limit": 50,
+    "nextCursor": null
+  }
+}
+```
+
+详情响应：
+
+```json
+{
+  "data": {},
+  "included": {}
+}
+```
+
+动作响应：
+
+```json
+{
+  "data": {},
+  "result": {
+    "ok": true
+  }
+}
+```
+
+通用约定：
+
+- JSON 字段使用 `camelCase`。
+- `BIGINT` ID 返回字符串，UUID 返回字符串，时间返回 RFC3339。
+- 列表使用 `limit` 和 `cursor`，默认 50，上限 100。
+- `include` 使用逗号分隔，例如 `include=latest-resource,transfer-tasks`。
+- cursor 包含版本号、筛选条件和排序锚点；筛选条件变化时返回 `400`。
+
+### Session
+
+- `GET /internal/v2/me`
+
+返回当前内部会话资源。可选 `include=capabilities`。
+
+### Identity
+
+- `GET /internal/v2/identity/users`
+- `GET /internal/v2/identity/users/{user_id}`
+- `PATCH /internal/v2/identity/users/{user_id}`
+- `GET /internal/v2/identity/users/{user_id}/sessions`
+- `GET /internal/v2/identity/users/{user_id}/sso-authorizations`
+
+用户列表参数：
+
+- `q`
+- `status=all|active|disabled`
+- `limit`
+- `cursor`
+
+用户详情支持 `include=sessions,sso-authorizations,audit-events`。
+
+`PATCH` 请求体：
+
+```json
+{
+  "disabled": true
+}
+```
+
+### Tweet Domain
+
+- `GET /internal/v2/twitter-users`
+- `GET /internal/v2/twitter-users/{user_id}`
+- `GET /internal/v2/twitter-users/{user_id}/snapshots`
+- `GET /internal/v2/twitter-users/{user_id}/stats`
+- `GET /internal/v2/tweets`
+- `GET /internal/v2/tweets/{tweet_id}`
+- `GET /internal/v2/tweets/{tweet_id}/media`
+- `GET /internal/v2/media`
+- `GET /internal/v2/media/{media_id}`
+- `GET /internal/v2/media/{media_id}/resources`
+- `GET /internal/v2/media/{media_id}/tweets`
+- `GET /internal/v2/media/{media_id}/transfer-tasks`
+- `POST /internal/v2/media/{media_id}/transfer-tasks`
+
+tweet 列表参数：
+
+- `q`
+- `authorId`
+- `relation=all|original|reply|quote|repost`
+- `limit`
+- `cursor`
+
+媒体列表参数：
+
+- `q`
+- `mediaType=all|photo|video|animated_gif`
+- `transferStatus=all|pending|processing|completed|failed|canceled`
+- `limit`
+- `cursor`
+
+tweet 详情支持 `include=stats,edit,policy,community-note,media`。媒体详情支持 `include=latest-resource,transfer-tasks,tweets`。
+
+### Storage And Transfer
+
+- `GET /internal/v2/storage/objects`
+- `GET /internal/v2/storage/objects/{object_id}`
+- `GET /internal/v2/storage/objects/{object_id}/transfer-tasks`
+- `POST /internal/v2/storage/objects/{object_id}/presigned-url`
+- `GET /internal/v2/transfer/tasks`
+- `GET /internal/v2/transfer/tasks/{task_id}`
+- `POST /internal/v2/transfer/tasks/{task_id}/transitions`
+
+存储对象列表参数：
+
+- `q`
+- `limit`
+- `cursor`
+
+转储任务列表参数：
+
+- `q`
+- `status=all|pending|processing|completed|failed|canceled`
+- `limit`
+- `cursor`
+
+创建 presigned URL 返回 JSON：
+
+```json
+{
+  "data": {
+    "id": "0195f1df-0d69-7f7d-8c24-0c1af2d75001",
+    "url": "https://...",
+    "expiresAt": "2026-04-01T08:05:00Z"
+  },
+  "result": {
+    "ok": true
+  }
+}
+```
+
+转储任务状态变更请求体：
+
+```json
+{
+  "type": "retry"
+}
+```
+
+`type` 可选 `retry`、`cancel`、`release`。
+
+### Search, Audit, System
+
+- `GET /internal/v2/search/index-tasks`
+- `GET /internal/v2/search/index-tasks/{task_id}`
+- `POST /internal/v2/search/index-tasks`
+- `GET /internal/v2/audit/events`
+- `GET /internal/v2/audit/events/{event_id}`
+- `GET /internal/v2/system/summary`
+
+搜索索引任务列表参数：
+
+- `q`
+- `status=all|pending|processing|completed|failed`
+- `targetKind=all|user|tweet`
+- `limit`
+- `cursor`
+
+重新入队索引任务请求体：
+
+```json
+{
+  "targets": [
+    {
+      "targetKind": "tweet",
+      "targetId": "1912345678901234567"
+    }
+  ]
+}
+```
+
+审计列表参数：
+
+- `actorUserId`
+- `resourceType`
+- `resourceId`
+- `eventType`
+- `limit`
+- `cursor`
 
 ### `GET /internal/v1/admin/users`
 

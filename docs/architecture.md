@@ -23,18 +23,19 @@
 服务端模块按领域和执行阶段分层：
 
 - `config/`：配置模型、路径解析、TLS/HTTPS 校验和配置测试。
-- `admin/`：管理员管理接口、cursor 时间兼容、分页、转储动作和响应格式化。
+- `admin/`：legacy WebUI 管理接口，保留 `/internal/v1/admin/*` 的页面导向响应。
+- `internal_api/v2/`：无头内部资源 API，按 identity、tweet、media、storage、transfer、search、audit、system 拆分。
 - `tweet_submit/`：提交 API 合同、handler、批处理状态、结果汇总、转换和写入执行。
 - `tweet_query/`：查询 API 合同、数据库读取类型、查询 fetch、decode 和 JSON build。
 - `tweet_store/`：数据库读写封装，tweet 写入按 places、tweets、edits、policies、stats、community notes 拆分。
 - `transfer/`：媒体转储队列、worker、下载、range 分片、上传和传输测试。
 - `search/`：Tantivy 全文索引、分词器、索引队列、worker 和管理台搜索辅助。
 
-对外入口集中在各领域的 `mod.rs`，路由层继续通过 `admin::*`、`tweet_submit::submit_tweets`、`tweet_query::query_tweets` 和 `transfer::*` 调用。
+对外入口集中在各领域的 `mod.rs`。路由层通过 `admin::v1` 保持现有 WebUI 接口，通过 `internal_api::v2` 暴露新的资源 API，通过 `tweet_submit::submit_tweets` 和 `tweet_query::query_tweets` 提供公开 tweet 同步能力。
 
 ## 管理台
 
-管理台面向内部排查和常用运维操作：
+当前 Vue 管理台继续使用 `/internal/v1/admin/*`。这组接口面向已有页面，返回 `items/nextCursor`、`summary/record/related` 等页面友好结构：
 
 - Overview 汇总账号、tweet v2 对象、转储队列和近期失败任务。
 - Accounts 管理本地账号启停。
@@ -43,6 +44,18 @@
 - Transfers 提供状态筛选、失败重试、排队取消和处理中任务释放。
 
 管理列表使用无状态 cursor 分页。cursor 中包含版本号、筛选条件和排序锚点；服务端每次按当前数据库状态查询。Tantivy 搜索路径使用 offset cursor，命中 ID 再回表读取管理台展示字段。
+
+## 内部资源 API
+
+`/internal/v2/*` 是无头内部 API，目标是把服务端能力和 WebUI 设计解耦。接口按数据模型和 CRUD 组织：
+
+- `identity/*`：本地用户、会话、SSO 授权和账号启停。
+- `twitter-users`、`tweets`、`media`：tweet schema 中的事实资源和子资源。
+- `storage/objects`、`transfer/tasks`：对象存储记录、媒体转储任务和状态变更。
+- `search/index-tasks`：Tantivy 索引队列查询和重新入队。
+- `audit/events`、`system/summary`：审计记录和系统计数摘要。
+
+v2 响应统一使用 `data`、`pagination`、`included`、`result`。资源详情只返回资源事实；关联数据通过 `include` 或子资源列表读取。初版 capability 全部映射到管理员会话，handler 已按 `IdentityRead`、`TweetRead`、`MediaTransferWrite` 等能力调用鉴权函数，后续可以逐步开放只读或局部写权限。
 
 ## 数据库结构
 
