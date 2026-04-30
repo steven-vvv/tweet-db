@@ -106,6 +106,11 @@ export function mediaPreviewUrl(media: JsonRecord): string {
 }
 
 export function mediaOpenUrl(media: JsonRecord): string {
+  const mediaId = optionalText(media.id)
+  if (mediaId) {
+    return `/internal/v2/media/${encodeURIComponent(mediaId)}/open`
+  }
+
   const transfer = asRecord(media.latestTransfer)
   const objectId = optionalText(
     media.storageObjectId ??

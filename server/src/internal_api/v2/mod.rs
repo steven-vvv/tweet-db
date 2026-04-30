@@ -63,6 +63,10 @@ pub fn routes() -> Router<AppState> {
         .route("/internal/v2/media", get(media::list_media))
         .route("/internal/v2/media/{media_id}", get(media::get_media))
         .route(
+            "/internal/v2/media/{media_id}/open",
+            get(media::open_media_storage_object),
+        )
+        .route(
             "/internal/v2/media/{media_id}/resources",
             get(media::list_media_resources),
         )

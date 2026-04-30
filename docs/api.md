@@ -344,6 +344,7 @@ v2 内部接口统一使用 `/internal/v2/...` 前缀。当前实现仍要求管
 - `GET /internal/v2/tweets/{tweet_id}/media`
 - `GET /internal/v2/media`
 - `GET /internal/v2/media/{media_id}`
+- `GET /internal/v2/media/{media_id}/open`
 - `GET /internal/v2/media/{media_id}/resources`
 - `GET /internal/v2/media/{media_id}/tweets`
 - `GET /internal/v2/media/{media_id}/transfer-tasks`
@@ -366,7 +367,7 @@ tweet 列表参数：
 - `limit`
 - `cursor`
 
-tweet 详情支持 `include=author,stats,edit,policy,community-note,media,media-resources`。媒体详情支持 `include=latest-resource,transfer-tasks,tweets`。
+tweet 详情支持 `include=author,stats,edit,policy,community-note,media,media-resources`。媒体详情支持 `include=latest-resource,transfer-tasks,tweets`。媒体 open 路由会选择该媒体最近 completed 的转储对象并返回 `302` 到短期 OSS URL。
 
 tweet 列表使用浏览视图友好的 hydrate 字段：
 

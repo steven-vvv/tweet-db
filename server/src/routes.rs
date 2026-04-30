@@ -303,6 +303,12 @@ mod tests {
                 StatusCode::UNAUTHORIZED,
             ),
             (
+                Request::get("/internal/v2/media/1/open")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
                 Request::post("/api/v1/tweet/submit")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"users":[],"tweets":[],"media":[]}"#))

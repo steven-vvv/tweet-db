@@ -1,10 +1,12 @@
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
+    response::Redirect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::Row;
+use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -13,6 +15,7 @@ use crate::{
     db,
     error::{AppError, AppResult},
     state::AppState,
+    storage,
 };
 
 use super::{common::*, rows::*};
@@ -194,6 +197,42 @@ pub async fn get_media(
     }
 
     Ok(Json(detail_response(media_json_from_row(&row), included)))
+}
+
+pub async fn open_media_storage_object(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Path(media_id): Path<i64>,
+) -> AppResult<Redirect> {
+    let _session = require_capability(session, Capability::StorageRead)?;
+    let row = sqlx::query(
+        r#"
+        SELECT object.bucket, object.object_key
+        FROM media.transfer_task AS task
+        INNER JOIN media.storage_object AS object
+          ON object.id = task.storage_object_id
+        WHERE task.media_id = $1
+          AND task.status = 'completed'
+          AND task.storage_object_id IS NOT NULL
+        ORDER BY task.completed_at DESC NULLS LAST, task.updated_at DESC, task.id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(media_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("media storage object not found"))?;
+
+    let client = storage::build_client(&state.settings)?;
+    let url = storage::presign_get_object(
+        &client,
+        &row.get::<String, _>("bucket"),
+        &row.get::<String, _>("object_key"),
+        Duration::from_secs(300),
+    )
+    .await?;
+
+    Ok(Redirect::temporary(&url))
 }
 
 pub async fn list_media_resources(
