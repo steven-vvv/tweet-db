@@ -1,7 +1,12 @@
-use super::*;
-use serde::de::{self, SeqAccess, Visitor};
+use serde::{
+    Deserializer, Serializer,
+    de::{self, SeqAccess, Visitor},
+};
 use std::fmt;
-use time::{Date, PrimitiveDateTime, Time, UtcOffset};
+use time::{
+    Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset,
+    format_description::well_known::Rfc3339,
+};
 
 pub fn serialize<S>(value: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
 where
