@@ -3,7 +3,10 @@ use axum::{
     extract::{Extension, Query},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as DeError},
+};
 use serde_json::{Map, Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -35,6 +38,7 @@ pub(super) enum Capability {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ListQuery {
     pub cursor: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub limit: Option<usize>,
     pub q: Option<String>,
     pub include: Option<String>,
@@ -133,6 +137,35 @@ pub(super) fn action_response(data: Value, result: Value) -> ActionResponse {
 
 pub(super) fn resolve_limit(value: Option<usize>) -> usize {
     value.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+fn deserialize_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum LimitValue {
+        Number(usize),
+        Text(String),
+    }
+
+    let value = Option::<LimitValue>::deserialize(deserializer)?;
+    match value {
+        Some(LimitValue::Number(value)) => Ok(Some(value)),
+        Some(LimitValue::Text(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                value
+                    .parse::<usize>()
+                    .map(Some)
+                    .map_err(|_| D::Error::custom("limit must be a positive integer"))
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 pub(super) fn limit_plus_one(limit: usize) -> i64 {

@@ -343,4 +343,18 @@ mod tests {
             assert_eq!(response.status(), expected_status);
         }
     }
+
+    #[tokio::test]
+    async fn v2_flattened_limit_query_accepts_url_strings() {
+        let response = test_router()
+            .oneshot(
+                Request::get("/internal/v2/tweets?relation=all&include=author%2Cstats&limit=30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
