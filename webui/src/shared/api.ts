@@ -197,6 +197,20 @@ export function fetchV2Tweets(params?: {
   })
 }
 
+export function fetchV2TweetSearch(params?: {
+  q?: string
+  authorId?: string
+  relation?: string
+  sort?: string
+  include?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<V2ListResponse>(withQuery('/internal/v2/search/tweets', params), {
+    method: 'GET',
+  })
+}
+
 export function fetchV2Tweet(tweetId: string, params?: { include?: string }) {
   return request<V2DetailResponse>(
     withQuery(`/internal/v2/tweets/${encodeURIComponent(tweetId)}`, params),

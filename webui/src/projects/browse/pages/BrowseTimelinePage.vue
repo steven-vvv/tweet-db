@@ -12,8 +12,8 @@
     <section class="feed">
       <header class="feed-head">
         <div>
-          <h1>Timeline</h1>
-          <p>Latest saved posts</p>
+          <h1>{{ modeLabel }}</h1>
+          <p>{{ modeDescription }}</p>
         </div>
         <button type="button" :disabled="loading" @click="reload">Refresh</button>
       </header>
@@ -21,7 +21,7 @@
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="tweet-list">
-        <TweetCard v-for="item in items" :key="item.id" :tweet="item" :time-field="sort" />
+        <TweetCard v-for="item in items" :key="item.id" :tweet="item" :time-field="cardTimeField" />
         <p v-if="!loading && items.length === 0" class="empty">No posts matched.</p>
       </section>
 
@@ -34,9 +34,15 @@
       <form class="search-panel" @submit.prevent="reload">
         <h1>Timeline</h1>
         <p>Latest saved posts</p>
-        <input v-model="q" type="search" placeholder="Tweet ID or author ID prefix" />
+        <input
+          v-model="q"
+          type="search"
+          placeholder="Text, Tweet ID, or author ID"
+          @input="handleQueryInput"
+        />
         <input v-model="authorId" type="text" placeholder="Author ID" />
         <select v-model="sort" @change="reload">
+          <option value="relevance" :disabled="!hasQuery">Relevance</option>
           <option value="publishedAt">Posted</option>
           <option value="createdAt">Saved</option>
           <option value="updatedAt">Updated</option>
@@ -58,6 +64,10 @@
         <h2>Status</h2>
         <dl>
           <div>
+            <dt>Mode</dt>
+            <dd>{{ modeLabel }}</dd>
+          </div>
+          <div>
             <dt>Loaded</dt>
             <dd>{{ countValue(items.length) }}</dd>
           </div>
@@ -74,11 +84,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
-import { fetchV2Tweets, type JsonRecord } from '../../../shared/api'
+import { fetchV2TweetSearch, fetchV2Tweets, type JsonRecord } from '../../../shared/api'
 import { countValue } from '../browse-helpers'
 import TweetCard from '../components/TweetCard.vue'
 
-type TweetSort = 'publishedAt' | 'createdAt' | 'updatedAt'
+type TweetSort = 'relevance' | 'publishedAt' | 'createdAt' | 'updatedAt'
+type TweetTimeField = 'publishedAt' | 'createdAt' | 'updatedAt'
 
 const include = 'author,stats,media,media-resources'
 const items = ref<JsonRecord[]>([])
@@ -87,15 +98,31 @@ const q = ref('')
 const authorId = ref('')
 const relation = ref('all')
 const sort = ref<TweetSort>('publishedAt')
+const queryWasActive = ref(false)
 const loading = ref(false)
 const error = ref('')
 
 const sortLabels: Record<TweetSort, string> = {
+  relevance: 'Relevance',
   publishedAt: 'Posted',
   createdAt: 'Saved',
   updatedAt: 'Updated',
 }
+const hasQuery = computed(() => q.value.trim() !== '')
 const sortLabel = computed(() => sortLabels[sort.value])
+const modeLabel = computed(() => (hasQuery.value ? 'Search' : 'Timeline'))
+const modeDescription = computed(() =>
+  hasQuery.value ? 'Full-text saved post search' : 'Latest saved posts',
+)
+const requestSort = computed<TweetSort>(() => {
+  if (!hasQuery.value && sort.value === 'relevance') {
+    return 'publishedAt'
+  }
+  return sort.value
+})
+const cardTimeField = computed<TweetTimeField>(() =>
+  requestSort.value === 'relevance' ? 'publishedAt' : requestSort.value,
+)
 
 onMounted(reload)
 
@@ -111,15 +138,21 @@ async function load(reset: boolean) {
   loading.value = true
   error.value = ''
   try {
-    const response = await fetchV2Tweets({
-      q: q.value.trim() || undefined,
+    const query = q.value.trim()
+    const params = {
       authorId: authorId.value.trim() || undefined,
       relation: relation.value,
-      sort: sort.value,
+      sort: requestSort.value,
       include,
       cursor: reset ? undefined : nextCursor.value,
       limit: 30,
-    })
+    }
+    const response = query
+      ? await fetchV2TweetSearch({
+          ...params,
+          q: query,
+        })
+      : await fetchV2Tweets(params)
     items.value = reset ? response.data : [...items.value, ...response.data]
     nextCursor.value = response.pagination.nextCursor
   } catch (err) {
@@ -127,6 +160,17 @@ async function load(reset: boolean) {
   } finally {
     loading.value = false
   }
+}
+
+function handleQueryInput() {
+  const nextActive = q.value.trim() !== ''
+  if (nextActive && !queryWasActive.value) {
+    sort.value = 'relevance'
+  }
+  if (!nextActive && queryWasActive.value) {
+    sort.value = 'publishedAt'
+  }
+  queryWasActive.value = nextActive
 }
 </script>
 
