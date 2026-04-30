@@ -34,6 +34,22 @@ export type DetailResponse<
   related: TRelated
 }
 
+export type V2ListResponse<T extends JsonRecord = JsonRecord> = {
+  data: T[]
+  pagination: {
+    limit: number
+    nextCursor: string | null
+  }
+}
+
+export type V2DetailResponse<
+  TData extends JsonRecord = JsonRecord,
+  TIncluded extends JsonRecord = JsonRecord,
+> = {
+  data: TData
+  included?: TIncluded
+}
+
 type QueryValue = string | number | boolean | null | undefined
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -79,6 +95,12 @@ export function fetchPublicSession(): Promise<PublicSessionResponse> {
 
 export function fetchInternalSession(): Promise<InternalSessionResponse> {
   return request<InternalSessionResponse>('/internal/v1/session', {
+    method: 'GET',
+  })
+}
+
+export function fetchV2Me(params?: { include?: string }) {
+  return request<V2DetailResponse>(withQuery('/internal/v2/me', params), {
     method: 'GET',
   })
 }
@@ -159,6 +181,37 @@ export function fetchAdminTweets(params?: {
   return request<CursorListResponse>(withQuery('/internal/v1/admin/tweets', params), {
     method: 'GET',
   })
+}
+
+export function fetchV2Tweets(params?: {
+  q?: string
+  authorId?: string
+  relation?: string
+  include?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<V2ListResponse>(withQuery('/internal/v2/tweets', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchV2Tweet(tweetId: string, params?: { include?: string }) {
+  return request<V2DetailResponse>(
+    withQuery(`/internal/v2/tweets/${encodeURIComponent(tweetId)}`, params),
+    {
+      method: 'GET',
+    },
+  )
+}
+
+export function fetchV2TwitterUser(userId: string, params?: { include?: string }) {
+  return request<V2DetailResponse>(
+    withQuery(`/internal/v2/twitter-users/${encodeURIComponent(userId)}`, params),
+    {
+      method: 'GET',
+    },
+  )
 }
 
 export function fetchAdminTweet(tweetId: string) {

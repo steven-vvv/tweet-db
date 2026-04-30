@@ -1,7 +1,7 @@
 import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 
-import { fetchInternalSession } from '../../shared/api'
+import { fetchV2Me } from '../../shared/api'
 import BrowseApp from './BrowseApp.vue'
 import { browseRoutes } from './routes'
 
@@ -12,12 +12,8 @@ const router = createRouter({
 
 router.beforeEach(async () => {
   try {
-    const session = await fetchInternalSession()
-    if (!session.authenticated || session.disabled) {
-      window.location.href = '/account'
-      return false
-    }
-    if (!session.is_admin) {
+    const response = await fetchV2Me({ include: 'capabilities' })
+    if (!response.data.isAdmin) {
       window.location.href = '/forbidden'
       return false
     }
