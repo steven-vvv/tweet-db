@@ -14,7 +14,6 @@
         v-if="mediaPreviewUrl(item) && !failed[textValue(item.id)]"
         :src="mediaPreviewUrl(item)"
         :alt="mediaAlt(item)"
-        loading="lazy"
         @error="failed[textValue(item.id)] = true"
       />
       <span v-else class="media-fallback">

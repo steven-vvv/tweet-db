@@ -233,11 +233,16 @@ pub async fn list_tweet_media(
             media.origin_tweet_id,
             media.origin_user_id,
             to_jsonb(media.details) AS details,
+            transfer.status::text AS transfer_status,
+            transfer.storage_object_id,
+            transfer.object_key AS storage_object_key,
             media.created_at,
             media.updated_at
         FROM tweet.tweet_media_ref AS ref
         INNER JOIN tweet.media AS media
           ON media.id = ref.media_id
+        LEFT JOIN media.v_latest_transfer_overview AS transfer
+          ON transfer.media_id = media.id
         WHERE ref.tweet_id = $1
           AND (
                 NOT $2
@@ -261,6 +266,7 @@ pub async fn list_tweet_media(
         let mut item = media_json_from_row(&row);
         if let Some(object) = item.as_object_mut() {
             object.insert("displayOrder".to_owned(), json!(display_order));
+            insert_media_transfer_fields(object, &row);
         }
         (
             item,

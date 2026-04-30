@@ -10,6 +10,14 @@
     </aside>
 
     <section class="feed">
+      <header class="feed-head">
+        <div>
+          <h1>Timeline</h1>
+          <p>Latest saved posts</p>
+        </div>
+        <button type="button" :disabled="loading" @click="reload">Refresh</button>
+      </header>
+
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="tweet-list">
@@ -152,7 +160,19 @@ nav a.active {
   border-right: 1px solid #dfe5ee;
   border-left: 1px solid #dfe5ee;
   background: #fff;
-  padding-top: 4px;
+}
+
+.feed-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #dfe5ee;
+  background: rgba(255, 255, 255, 0.96);
 }
 
 h1,
@@ -169,6 +189,7 @@ h2 {
   font-size: 0.95rem;
 }
 
+.feed-head p,
 .search-panel p {
   color: #647084;
   font-size: 0.82rem;

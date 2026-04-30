@@ -1,7 +1,7 @@
 <template>
   <main class="detail-layout">
     <section class="detail">
-      <header class="detail-nav">
+      <header class="detail-head">
         <a href="/browse" class="back">Back</a>
         <div>
           <h1>{{ tweet.id ?? route.params.tweetId }}</h1>
@@ -158,7 +158,10 @@ async function load() {
   background: #fff;
 }
 
-.detail-nav {
+.detail-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -186,7 +189,7 @@ h1 {
   font-size: 1.12rem;
 }
 
-.detail-nav p,
+.detail-head p,
 .author-line p {
   color: #647084;
   font-size: 0.84rem;

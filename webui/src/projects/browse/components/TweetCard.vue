@@ -1,12 +1,12 @@
 <template>
   <article class="tweet-card">
     <RouterLink class="avatar-link" :to="`/browse/users/${tweet.authorId}`">
-      <img v-if="avatar" :src="avatar" alt="" loading="lazy" />
+      <img v-if="avatar" :src="avatar" alt="" />
       <span v-else>{{ authorInitial }}</span>
     </RouterLink>
 
     <section class="tweet-main">
-      <header class="tweet-meta">
+      <header class="tweet-head">
         <div class="author">
           <RouterLink class="name" :to="`/browse/users/${tweet.authorId}`">
             {{ authorDisplayName(tweet) }}
@@ -109,7 +109,7 @@ const hasLongText = computed(() => hasNoteText(props.tweet))
   gap: 9px;
 }
 
-.tweet-meta {
+.tweet-head {
   min-width: 0;
   display: block;
 }
