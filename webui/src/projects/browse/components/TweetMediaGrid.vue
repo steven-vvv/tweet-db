@@ -67,6 +67,7 @@ function handleClick(event: MouseEvent, item: JsonRecord) {
 .media-grid {
   display: grid;
   gap: 2px;
+  height: 312px;
   overflow: hidden;
   border: 1px solid #d7dde5;
   border-radius: 8px;
@@ -84,13 +85,13 @@ function handleClick(event: MouseEvent, item: JsonRecord) {
 
 .count-3 {
   grid-template-columns: 1.1fr 0.9fr;
-  grid-template-rows: repeat(2, minmax(118px, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
 }
 
 .media-tile {
   position: relative;
-  min-height: 132px;
-  aspect-ratio: 16 / 10;
+  min-height: 0;
+  height: 100%;
   display: block;
   overflow: hidden;
   background: #edf1f5;
@@ -100,7 +101,6 @@ function handleClick(event: MouseEvent, item: JsonRecord) {
 
 .media-tile.lead {
   grid-row: span 2;
-  aspect-ratio: auto;
 }
 
 .media-tile img {
@@ -112,7 +112,6 @@ function handleClick(event: MouseEvent, item: JsonRecord) {
 
 .media-fallback {
   height: 100%;
-  min-height: inherit;
   display: grid;
   place-items: center;
   gap: 4px;
@@ -152,5 +151,11 @@ function handleClick(event: MouseEvent, item: JsonRecord) {
 .extra {
   top: 8px;
   bottom: auto;
+}
+
+@media (max-width: 640px) {
+  .media-grid {
+    height: 248px;
+  }
 }
 </style>

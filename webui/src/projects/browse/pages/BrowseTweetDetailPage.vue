@@ -1,7 +1,7 @@
 <template>
   <main class="detail-layout">
     <section class="detail">
-      <header class="detail-head">
+      <header class="detail-nav">
         <a href="/browse" class="back">Back</a>
         <div>
           <h1>{{ tweet.id ?? route.params.tweetId }}</h1>
@@ -25,7 +25,11 @@
           </div>
         </header>
 
-        <TweetText class="detail-text" :text="tweetText(tweet, true)" />
+        <TweetText
+          class="detail-text"
+          :text="tweetText(tweet, true)"
+          :hide-media-entities="media.length > 0"
+        />
         <TweetMediaGrid v-if="media.length > 0" :media="media" />
 
         <dl class="metrics">
@@ -66,10 +70,6 @@
             <dd class="mono">{{ textValue(tweet.authorId) }}</dd>
           </div>
           <div>
-            <dt>Relation</dt>
-            <dd>{{ relationLabel(tweet) }}</dd>
-          </div>
-          <div>
             <dt>Media</dt>
             <dd>{{ countValue(media.length) }}</dd>
           </div>
@@ -103,7 +103,6 @@ import {
   countValue,
   latestStats,
   mediaItems,
-  relationLabel,
   textValue,
   timeLabel,
   tweetText,
@@ -159,10 +158,7 @@ async function load() {
   background: #fff;
 }
 
-.detail-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+.detail-nav {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -190,7 +186,7 @@ h1 {
   font-size: 1.12rem;
 }
 
-.detail-head p,
+.detail-nav p,
 .author-line p {
   color: #647084;
   font-size: 0.84rem;

@@ -10,27 +10,6 @@
     </aside>
 
     <section class="feed">
-      <header class="feed-head">
-        <div>
-          <h1>Timeline</h1>
-          <p>Latest saved posts</p>
-        </div>
-        <button type="button" :disabled="loading" @click="reload">Refresh</button>
-      </header>
-
-      <form class="toolbar" @submit.prevent="reload">
-        <input v-model="q" type="search" placeholder="Tweet ID or author ID prefix" />
-        <input v-model="authorId" type="text" placeholder="Author ID" />
-        <select v-model="relation">
-          <option value="all">All</option>
-          <option value="original">Original</option>
-          <option value="reply">Reply</option>
-          <option value="quote">Quote</option>
-          <option value="repost">Repost</option>
-        </select>
-        <button type="submit" :disabled="loading">Search</button>
-      </form>
-
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="tweet-list">
@@ -44,13 +23,27 @@
     </section>
 
     <aside class="side-panel">
-      <section>
-        <h2>Filters</h2>
+      <form class="search-panel" @submit.prevent="reload">
+        <h1>Timeline</h1>
+        <p>Latest saved posts</p>
+        <input v-model="q" type="search" placeholder="Tweet ID or author ID prefix" />
+        <input v-model="authorId" type="text" placeholder="Author ID" />
+        <select v-model="relation">
+          <option value="all">All relations</option>
+          <option value="original">Original</option>
+          <option value="reply">Reply</option>
+          <option value="quote">Quote</option>
+          <option value="repost">Repost</option>
+        </select>
+        <div class="panel-actions">
+          <button type="submit" :disabled="loading">Search</button>
+          <button type="button" :disabled="loading" @click="reload">Refresh</button>
+        </div>
+      </form>
+
+      <section class="summary-panel">
+        <h2>Status</h2>
         <dl>
-          <div>
-            <dt>Relation</dt>
-            <dd>{{ relation }}</dd>
-          </div>
           <div>
             <dt>Loaded</dt>
             <dd>{{ countValue(items.length) }}</dd>
@@ -159,19 +152,7 @@ nav a.active {
   border-right: 1px solid #dfe5ee;
   border-left: 1px solid #dfe5ee;
   background: #fff;
-}
-
-.feed-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 16px;
-  border-bottom: 1px solid #dfe5ee;
-  background: rgba(255, 255, 255, 0.96);
+  padding-top: 4px;
 }
 
 h1,
@@ -188,8 +169,7 @@ h2 {
   font-size: 0.95rem;
 }
 
-.feed-head p {
-  margin-top: 2px;
+.search-panel p {
   color: #647084;
   font-size: 0.82rem;
 }
@@ -214,13 +194,13 @@ button:disabled {
   opacity: 0.55;
 }
 
-.toolbar {
+.search-panel {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(140px, 0.7fr) 120px auto;
-  gap: 8px;
-  padding: 10px 16px;
-  border-bottom: 1px solid #e8edf3;
-  background: #fbfcfe;
+  gap: 9px;
+  border: 1px solid #dfe5ee;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
 }
 
 .tweet-list {
@@ -249,13 +229,19 @@ button:disabled {
   margin: 14px 16px 20px;
 }
 
-.side-panel section {
+.summary-panel {
   display: grid;
   gap: 12px;
   border: 1px solid #dfe5ee;
   border-radius: 8px;
   padding: 12px;
   background: #fff;
+}
+
+.panel-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 dl {
@@ -284,8 +270,20 @@ dd {
     grid-template-columns: 180px minmax(0, 760px);
   }
 
+  .rail {
+    grid-row: span 2;
+  }
+
   .side-panel {
-    display: none;
+    position: static;
+    grid-column: 2;
+    grid-row: 1;
+    height: auto;
+  }
+
+  .feed {
+    grid-column: 2;
+    grid-row: 2;
   }
 }
 
@@ -297,19 +295,26 @@ dd {
 
   .rail {
     position: static;
+    grid-row: auto;
     height: auto;
     padding: 10px 12px;
     border-bottom: 1px solid #dfe5ee;
     background: #fff;
   }
 
+  .side-panel,
+  .feed {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
+  .side-panel {
+    padding: 10px 12px;
+  }
+
   nav {
     display: flex;
     flex-wrap: wrap;
-  }
-
-  .toolbar {
-    grid-template-columns: 1fr;
   }
 }
 </style>

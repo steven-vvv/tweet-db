@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::Row;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{
     auth::ActiveSession,
@@ -323,6 +324,9 @@ async fn fetch_tweet_media_array(
             to_jsonb(media.details) AS details,
             to_jsonb(resource) AS latest_resource,
             warnings.sensitivity_warnings,
+            transfer.status::text AS transfer_status,
+            transfer.storage_object_id,
+            transfer.object_key AS storage_object_key,
             media.created_at,
             media.updated_at
         FROM tweet.tweet_media_ref AS ref
@@ -330,6 +334,8 @@ async fn fetch_tweet_media_array(
           ON media.id = ref.media_id
         LEFT JOIN tweet.v_latest_media_resource AS resource
           ON resource.media_id = media.id
+        LEFT JOIN media.v_latest_transfer_overview AS transfer
+          ON transfer.media_id = media.id
         LEFT JOIN LATERAL (
             SELECT jsonb_agg(dict.value ORDER BY warning.ord) FILTER (WHERE dict.value IS NOT NULL) AS sensitivity_warnings
             FROM unnest(media.sensitivity_warning_ids) WITH ORDINALITY AS warning(id, ord)
@@ -359,6 +365,7 @@ async fn fetch_tweet_media_array(
                         row.get::<Option<Value>, _>("sensitivity_warnings")
                             .unwrap_or_else(|| json!([])),
                     );
+                    insert_media_transfer_fields(object, &row);
                     if include_latest_resource {
                         object.insert(
                             "latestResource".to_owned(),
@@ -560,6 +567,9 @@ async fn fetch_tweet_media_map(
             to_jsonb(media.details) AS details,
             to_jsonb(resource) AS latest_resource,
             warnings.sensitivity_warnings,
+            transfer.status::text AS transfer_status,
+            transfer.storage_object_id,
+            transfer.object_key AS storage_object_key,
             media.created_at,
             media.updated_at
         FROM tweet.tweet_media_ref AS ref
@@ -567,6 +577,8 @@ async fn fetch_tweet_media_map(
           ON media.id = ref.media_id
         LEFT JOIN tweet.v_latest_media_resource AS resource
           ON resource.media_id = media.id
+        LEFT JOIN media.v_latest_transfer_overview AS transfer
+          ON transfer.media_id = media.id
         LEFT JOIN LATERAL (
             SELECT jsonb_agg(dict.value ORDER BY warning.ord) FILTER (WHERE dict.value IS NOT NULL) AS sensitivity_warnings
             FROM unnest(media.sensitivity_warning_ids) WITH ORDINALITY AS warning(id, ord)
@@ -595,6 +607,7 @@ async fn fetch_tweet_media_map(
                 row.get::<Option<Value>, _>("sensitivity_warnings")
                     .unwrap_or_else(|| json!([])),
             );
+            insert_media_transfer_fields(object, &row);
             if include_latest_resource {
                 object.insert(
                     "latestResource".to_owned(),
@@ -607,6 +620,27 @@ async fn fetch_tweet_media_map(
     }
 
     Ok(map)
+}
+
+fn insert_media_transfer_fields(object: &mut Map<String, Value>, row: &sqlx::postgres::PgRow) {
+    object.insert(
+        "latestTransferStatus".to_owned(),
+        row.get::<Option<String>, _>("transfer_status")
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "storageObjectId".to_owned(),
+        row.get::<Option<Uuid>, _>("storage_object_id")
+            .map(|value| json!(value))
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "storageObjectKey".to_owned(),
+        row.get::<Option<String>, _>("storage_object_key")
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
 }
 
 fn string_i64_field(item: &Value, field: &str) -> Option<i64> {

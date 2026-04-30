@@ -1,7 +1,7 @@
 <template>
   <main class="user-layout">
     <section class="profile">
-      <header class="profile-head">
+      <header class="profile-nav">
         <a href="/browse" class="back">Back</a>
         <h1>{{ displayName }}</h1>
       </header>
@@ -40,7 +40,7 @@
       </section>
 
       <section class="tweet-list">
-        <header class="section-head">
+        <header class="section-toolbar">
           <h2>Recent posts</h2>
           <button type="button" :disabled="loadingTweets" @click="reloadTweets">Refresh</button>
         </header>
@@ -179,10 +179,7 @@ async function loadTweets(reset: boolean) {
   background: #fff;
 }
 
-.profile-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+.profile-nav {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -283,7 +280,7 @@ dd {
   font-weight: 800;
 }
 
-.section-head {
+.section-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;

@@ -6,7 +6,7 @@
     </RouterLink>
 
     <section class="tweet-main">
-      <header class="tweet-head">
+      <header class="tweet-meta">
         <div class="author">
           <RouterLink class="name" :to="`/browse/users/${tweet.authorId}`">
             {{ authorDisplayName(tweet) }}
@@ -17,11 +17,15 @@
             {{ timeLabel(tweet.publishedAt) }}
           </RouterLink>
         </div>
-        <span class="relation">{{ relationLabel(tweet) }}</span>
       </header>
 
       <RouterLink class="text-link" :to="`/browse/tweets/${tweet.id}`">
-        <TweetText :text="tweetText(tweet)" :max-lines="8" />
+        <TweetText
+          :text="tweetText(tweet)"
+          :max-lines="8"
+          :hide-media-entities="media.length > 0"
+        />
+        <span v-if="hasLongText" class="show-more">Show more</span>
       </RouterLink>
 
       <TweetMediaGrid v-if="media.length > 0" :media="media" />
@@ -46,9 +50,9 @@ import {
   authorDisplayName,
   authorUserName,
   countValue,
+  hasNoteText,
   latestStats,
   mediaItems,
-  relationLabel,
   timeLabel,
   tweetText,
 } from '../browse-helpers'
@@ -63,6 +67,7 @@ const avatar = computed(() => authorAvatar(props.tweet))
 const media = computed(() => mediaItems(props.tweet))
 const stats = computed(() => latestStats(props.tweet))
 const authorInitial = computed(() => authorDisplayName(props.tweet).slice(0, 1).toUpperCase())
+const hasLongText = computed(() => hasNoteText(props.tweet))
 </script>
 
 <style scoped>
@@ -104,11 +109,9 @@ const authorInitial = computed(() => authorDisplayName(props.tweet).slice(0, 1).
   gap: 9px;
 }
 
-.tweet-head {
+.tweet-meta {
   min-width: 0;
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
+  display: block;
 }
 
 .author {
@@ -142,14 +145,12 @@ const authorInitial = computed(() => authorDisplayName(props.tweet).slice(0, 1).
   text-decoration: none;
 }
 
-.relation {
-  flex: 0 0 auto;
-  border-radius: 999px;
-  padding: 2px 7px;
-  background: #eef2f7;
-  color: #526175;
-  font-size: 0.72rem;
-  font-weight: 650;
+.show-more {
+  display: inline-block;
+  margin-top: 4px;
+  color: #1d72d2;
+  font-size: 0.86rem;
+  font-weight: 750;
 }
 
 .metrics {

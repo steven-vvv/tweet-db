@@ -31,9 +31,11 @@ const props = withDefaults(
   defineProps<{
     text: JsonRecord
     maxLines?: number
+    hideMediaEntities?: boolean
   }>(),
   {
     maxLines: 0,
+    hideMediaEntities: false,
   },
 )
 
@@ -59,6 +61,10 @@ const parts = computed<TextPart[]>(() => {
     }
 
     const rawText = source.slice(start, Math.min(end, source.length)).join('')
+    if (props.hideMediaEntities && optionalText(entity.kind) === 'media') {
+      cursor = Math.min(end, source.length)
+      continue
+    }
     const part = entityPart(entity, rawText)
     if (part.text) {
       output.push(part)
@@ -69,7 +75,8 @@ const parts = computed<TextPart[]>(() => {
   if (cursor < source.length) {
     output.push({ text: source.slice(cursor).join('') })
   }
-  return output.length > 0 ? output : [{ text: body.value }]
+  const trimmed = props.hideMediaEntities ? trimTrailingWhitespace(output) : output
+  return trimmed.length > 0 ? trimmed : [{ text: body.value }]
 })
 
 function collectEntities(text: JsonRecord): TextEntity[] {
@@ -80,7 +87,17 @@ function collectEntities(text: JsonRecord): TextEntity[] {
     ...asArray<TextEntity>(entities.hashtags).map((item) => ({ ...item, kind: 'hashtag' })),
     ...asArray<TextEntity>(entities.symbols).map((item) => ({ ...item, kind: 'symbol' })),
     ...asArray<TextEntity>(entities.media).map((item) => ({ ...item, kind: 'media' })),
-  ].sort((a, b) => (a.range?.start ?? 0) - (b.range?.start ?? 0))
+  ].sort((a, b) => {
+    const startDelta = (a.range?.start ?? 0) - (b.range?.start ?? 0)
+    if (startDelta !== 0) {
+      return startDelta
+    }
+    return entityPriority(a) - entityPriority(b)
+  })
+}
+
+function entityPriority(entity: TextEntity): number {
+  return optionalText(entity.kind) === 'media' ? 0 : 1
 }
 
 function entityPart(entity: TextEntity, rawText: string): TextPart {
@@ -95,6 +112,20 @@ function entityPart(entity: TextEntity, rawText: string): TextPart {
     return userId ? { text: rawText, to: `/browse/users/${userId}` } : { text: rawText }
   }
   return { text: rawText }
+}
+
+function trimTrailingWhitespace(parts: TextPart[]): TextPart[] {
+  const output = [...parts]
+  while (output.length > 0) {
+    const last = output[output.length - 1]
+    const nextText = last.text.replace(/\s+$/u, '')
+    if (nextText) {
+      output[output.length - 1] = { ...last, text: nextText }
+      break
+    }
+    output.pop()
+  }
+  return output
 }
 </script>
 

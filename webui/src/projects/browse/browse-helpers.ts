@@ -52,19 +52,6 @@ export function timeLabel(value: unknown): string {
   }).format(date)
 }
 
-export function relationLabel(tweet: JsonRecord): string {
-  if (tweet.repostId) {
-    return 'Repost'
-  }
-  if (tweet.quoteTweetId) {
-    return 'Quote'
-  }
-  if (tweet.replyToTweetId) {
-    return 'Reply'
-  }
-  return 'Original'
-}
-
 export function authorSnapshot(tweetOrAuthor: JsonRecord): JsonRecord {
   const author = asRecord(tweetOrAuthor.author)
   return asRecord(author.latestSnapshot ?? tweetOrAuthor.latestSnapshot)
@@ -119,7 +106,8 @@ export function mediaPreviewUrl(media: JsonRecord): string {
 }
 
 export function mediaOpenUrl(media: JsonRecord): string {
-  return mediaResourceUrl(media)
+  const objectId = optionalText(media.storageObjectId)
+  return objectId ? `/internal/v1/admin/storage-objects/${encodeURIComponent(objectId)}/open` : ''
 }
 
 export function mediaResourceUrl(media: JsonRecord): string {
@@ -137,4 +125,8 @@ export function mediaResourceUrl(media: JsonRecord): string {
 
 export function mediaAlt(media: JsonRecord): string {
   return optionalText(media.altText) || `${textValue(media.type, 'media')} ${textValue(media.id)}`
+}
+
+export function hasNoteText(tweet: JsonRecord): boolean {
+  return Boolean(tweet.noteText)
 }
