@@ -355,6 +355,7 @@ tweet 列表参数：
 - `q`
 - `authorId`
 - `relation=all|original|reply|quote|repost`
+- `sort=publishedAt|createdAt|updatedAt`：默认 `publishedAt`，按源站发布时间、本库写入时间、本库更新时间倒序分页。
 - `include=author,stats,media,media-resources`
 - `limit`
 - `cursor`

@@ -25,6 +25,42 @@ pub struct TweetListQuery {
     list: ListQuery,
     author_id: Option<String>,
     relation: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum TweetListSort {
+    PublishedAt,
+    CreatedAt,
+    UpdatedAt,
+}
+
+impl Default for TweetListSort {
+    fn default() -> Self {
+        Self::PublishedAt
+    }
+}
+
+impl TweetListSort {
+    fn parse(raw: Option<&str>) -> AppResult<Self> {
+        match raw.unwrap_or("publishedAt").trim() {
+            "publishedAt" => Ok(Self::PublishedAt),
+            "createdAt" => Ok(Self::CreatedAt),
+            "updatedAt" => Ok(Self::UpdatedAt),
+            _ => Err(AppError::bad_request(
+                "sort must be one of publishedAt, createdAt, updatedAt",
+            )),
+        }
+    }
+
+    fn sql_column(self) -> &'static str {
+        match self {
+            Self::PublishedAt => "published_at",
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,9 +69,25 @@ struct TweetCursor {
     q: Option<String>,
     author_id: Option<i64>,
     relation: String,
-    #[serde(with = "time::serde::rfc3339")]
-    published_at: OffsetDateTime,
+    #[serde(default)]
+    sort: TweetListSort,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    sort_at: Option<OffsetDateTime>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    published_at: Option<OffsetDateTime>,
     id: i64,
+}
+
+impl TweetCursor {
+    fn sort_time(&self) -> AppResult<OffsetDateTime> {
+        self.sort_at
+            .or(self.published_at)
+            .ok_or_else(|| AppError::bad_request("invalid cursor"))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +108,7 @@ pub async fn list_tweets(
     let q = normalize_query(query.list.q.as_deref());
     let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
     let relation = normalize_tweet_relation(query.relation.as_deref())?;
+    let sort = TweetListSort::parse(query.sort.as_deref())?;
     let includes = IncludeSet::parse(query.list.include.as_deref())?;
     let cursor = decode_cursor::<TweetCursor>(query.list.cursor.as_deref())?;
 
@@ -69,11 +122,16 @@ pub async fn list_tweets(
         if cursor.author_id != author_id || cursor.relation != relation {
             return Err(AppError::bad_request("cursor does not match filters"));
         }
+        if cursor.sort != sort {
+            return Err(AppError::bad_request("cursor does not match sort"));
+        }
     }
 
     let q_prefix = prefix_pattern(q.as_deref());
     let use_cursor = cursor.is_some();
-    let sql = tweet_select_sql(
+    let sort_column = sort.sql_column();
+    let cursor_sort_at = cursor.as_ref().map(TweetCursor::sort_time).transpose()?;
+    let tail = format!(
         r#"
         WHERE ($1::BIGINT IS NULL OR t.author_id = $1)
           AND (
@@ -90,25 +148,26 @@ pub async fn list_tweets(
           )
           AND (
                 NOT $4
-            OR (t.published_at, t.id) < ($5, $6)
+            OR (t.{sort_column}, t.id) < ($5, $6)
           )
-        ORDER BY t.published_at DESC, t.id DESC
+        ORDER BY t.{sort_column} DESC, t.id DESC
         LIMIT $7
-        "#,
+        "#
     );
+    let sql = tweet_select_sql(&tail);
     let rows = sqlx::query(&sql)
         .bind(author_id)
         .bind(&relation)
         .bind(q_prefix.as_deref())
         .bind(use_cursor)
-        .bind(cursor.as_ref().map(|item| item.published_at))
+        .bind(cursor_sort_at)
         .bind(cursor.as_ref().map(|item| item.id))
         .bind(limit_plus_one(limit))
         .fetch_all(&state.db)
         .await?;
 
     let (mut data, next_cursor) = paginate_rows(rows, limit, |row| {
-        let published_at: OffsetDateTime = row.get("published_at");
+        let sort_at: OffsetDateTime = row.get(sort_column);
         let id: i64 = row.get("id");
         (
             tweet_json_from_row(&row),
@@ -117,7 +176,9 @@ pub async fn list_tweets(
                 q: q.clone(),
                 author_id,
                 relation: relation.clone(),
-                published_at,
+                sort,
+                sort_at: Some(sort_at),
+                published_at: None,
                 id,
             },
         )
@@ -678,4 +739,63 @@ fn tweet_select_sql(tail: &str) -> String {
         {tail}
         "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_tweet_list_sort() {
+        assert_eq!(
+            TweetListSort::parse(None).unwrap(),
+            TweetListSort::PublishedAt
+        );
+        assert_eq!(
+            TweetListSort::parse(Some("createdAt")).unwrap(),
+            TweetListSort::CreatedAt
+        );
+        assert_eq!(
+            TweetListSort::parse(Some("updatedAt")).unwrap(),
+            TweetListSort::UpdatedAt
+        );
+        assert!(TweetListSort::parse(Some("time")).is_err());
+    }
+
+    #[test]
+    fn tweet_cursor_accepts_legacy_published_at() {
+        let cursor: TweetCursor = serde_json::from_value(json!({
+            "v": CURSOR_VERSION,
+            "q": null,
+            "author_id": null,
+            "relation": "all",
+            "published_at": "2026-04-10T08:30:00Z",
+            "id": 1
+        }))
+        .unwrap();
+
+        assert_eq!(cursor.sort, TweetListSort::PublishedAt);
+        assert!(cursor.sort_at.is_none());
+        assert!(cursor.sort_time().is_ok());
+    }
+
+    #[test]
+    fn tweet_cursor_serializes_sort_time() {
+        let cursor = TweetCursor {
+            v: CURSOR_VERSION,
+            q: Some("12".to_owned()),
+            author_id: Some(42),
+            relation: "all".to_owned(),
+            sort: TweetListSort::UpdatedAt,
+            sort_at: Some(time::macros::datetime!(2026-04-10 08:30:00 UTC)),
+            published_at: None,
+            id: 1,
+        };
+        let value = serde_json::to_value(cursor).unwrap();
+
+        assert_eq!(value["sort"], "updatedAt");
+        assert_eq!(value["sort_at"], "2026-04-10T08:30:00Z");
+        assert!(value.get("published_at").is_none());
+    }
 }
