@@ -50,12 +50,7 @@ async fn admin_index(State(state): State<AppState>) -> Response {
 
 async fn entry_index(state: &AppState, entry_path: &str) -> Response {
     if dist_exists(state) {
-        let index_path = state
-            .settings
-            .config
-            .server
-            .webui_dist_dir
-            .join(entry_path);
+        let index_path = state.settings.config.server.webui_dist_dir.join(entry_path);
         match tokio::fs::read_to_string(index_path).await {
             Ok(contents) => Html(contents).into_response(),
             Err(_) => placeholder_index().into_response(),

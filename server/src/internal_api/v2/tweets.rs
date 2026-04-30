@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
@@ -53,6 +55,7 @@ pub async fn list_tweets(
     let q = normalize_query(query.list.q.as_deref());
     let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
     let relation = normalize_tweet_relation(query.relation.as_deref())?;
+    let includes = IncludeSet::parse(query.list.include.as_deref())?;
     let cursor = decode_cursor::<TweetCursor>(query.list.cursor.as_deref())?;
 
     if let Some(cursor) = cursor.as_ref() {
@@ -103,7 +106,7 @@ pub async fn list_tweets(
         .fetch_all(&state.db)
         .await?;
 
-    let (data, next_cursor) = paginate_rows(rows, limit, |row| {
+    let (mut data, next_cursor) = paginate_rows(rows, limit, |row| {
         let published_at: OffsetDateTime = row.get("published_at");
         let id: i64 = row.get("id");
         (
@@ -118,6 +121,7 @@ pub async fn list_tweets(
             },
         )
     })?;
+    hydrate_tweet_list(&state.db, &mut data, &includes).await?;
 
     Ok(Json(list_response(data, limit, next_cursor)))
 }
@@ -132,6 +136,7 @@ pub async fn get_tweet(
     let row = fetch_tweet_row(&state.db, tweet_id).await?;
     let includes = IncludeSet::parse(query.include.as_deref())?;
     let mut included = Map::new();
+    let author_id: i64 = row.get("author_id");
 
     if includes.contains("stats") {
         included.insert(
@@ -175,10 +180,19 @@ pub async fn get_tweet(
             .unwrap_or(Value::Null),
         );
     }
+    if includes.contains("author") {
+        included.insert(
+            "author".to_owned(),
+            fetch_author_summary(&state.db, author_id)
+                .await?
+                .unwrap_or(Value::Null),
+        );
+    }
     if includes.contains("media") {
         included.insert(
             "media".to_owned(),
-            fetch_tweet_media_array(&state.db, tweet_id).await?,
+            fetch_tweet_media_array(&state.db, tweet_id, includes.contains("media-resources"))
+                .await?,
         );
     }
 
@@ -287,7 +301,11 @@ async fn fetch_tweet_optional(
         .await?)
 }
 
-async fn fetch_tweet_media_array(pool: &sqlx::PgPool, tweet_id: i64) -> AppResult<Value> {
+async fn fetch_tweet_media_array(
+    pool: &sqlx::PgPool,
+    tweet_id: i64,
+    include_latest_resource: bool,
+) -> AppResult<Value> {
     let rows = sqlx::query(
         r#"
         SELECT
@@ -303,11 +321,21 @@ async fn fetch_tweet_media_array(pool: &sqlx::PgPool, tweet_id: i64) -> AppResul
             media.origin_tweet_id,
             media.origin_user_id,
             to_jsonb(media.details) AS details,
+            to_jsonb(resource) AS latest_resource,
+            warnings.sensitivity_warnings,
             media.created_at,
             media.updated_at
         FROM tweet.tweet_media_ref AS ref
         INNER JOIN tweet.media AS media
           ON media.id = ref.media_id
+        LEFT JOIN tweet.v_latest_media_resource AS resource
+          ON resource.media_id = media.id
+        LEFT JOIN LATERAL (
+            SELECT jsonb_agg(dict.value ORDER BY warning.ord) FILTER (WHERE dict.value IS NOT NULL) AS sensitivity_warnings
+            FROM unnest(media.sensitivity_warning_ids) WITH ORDINALITY AS warning(id, ord)
+            LEFT JOIN tweet.string_dict AS dict
+              ON dict.id = warning.id
+        ) AS warnings ON TRUE
         WHERE ref.tweet_id = $1
         ORDER BY ref.display_order ASC, media.id ASC
         LIMIT 100
@@ -326,11 +354,263 @@ async fn fetch_tweet_media_array(pool: &sqlx::PgPool, tweet_id: i64) -> AppResul
                         "displayOrder".to_owned(),
                         json!(row.get::<i16, _>("display_order")),
                     );
+                    object.insert(
+                        "sensitivityWarnings".to_owned(),
+                        row.get::<Option<Value>, _>("sensitivity_warnings")
+                            .unwrap_or_else(|| json!([])),
+                    );
+                    if include_latest_resource {
+                        object.insert(
+                            "latestResource".to_owned(),
+                            row.get::<Option<Value>, _>("latest_resource")
+                                .unwrap_or(Value::Null),
+                        );
+                    }
                 }
                 item
             })
             .collect(),
     ))
+}
+
+async fn hydrate_tweet_list(
+    pool: &sqlx::PgPool,
+    data: &mut [Value],
+    includes: &IncludeSet,
+) -> AppResult<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let include_author = includes.contains("author");
+    let include_stats = includes.contains("stats");
+    let include_media = includes.contains("media") || includes.contains("media-resources");
+    if !include_author && !include_stats && !include_media {
+        return Ok(());
+    }
+
+    let tweet_ids = data
+        .iter()
+        .filter_map(|item| string_i64_field(item, "id"))
+        .collect::<Vec<_>>();
+    let author_ids = data
+        .iter()
+        .filter_map(|item| string_i64_field(item, "authorId"))
+        .collect::<Vec<_>>();
+
+    let authors = if include_author {
+        fetch_author_summary_map(pool, &author_ids).await?
+    } else {
+        HashMap::new()
+    };
+    let stats = if include_stats {
+        fetch_tweet_stats_map(pool, &tweet_ids).await?
+    } else {
+        HashMap::new()
+    };
+    let media = if include_media {
+        fetch_tweet_media_map(pool, &tweet_ids, includes.contains("media-resources")).await?
+    } else {
+        HashMap::new()
+    };
+
+    for item in data {
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        if include_author {
+            if let Some(author) = object
+                .get("authorId")
+                .and_then(Value::as_str)
+                .and_then(|id| authors.get(id))
+            {
+                object.insert("author".to_owned(), author.clone());
+            }
+        }
+        if include_stats {
+            if let Some(latest_stats) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| stats.get(id))
+            {
+                object.insert("latestStats".to_owned(), latest_stats.clone());
+            }
+        }
+        if include_media {
+            let media_items = object
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| media.get(id))
+                .cloned()
+                .unwrap_or_default();
+            object.insert("media".to_owned(), Value::Array(media_items));
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_author_summary_map(
+    pool: &sqlx::PgPool,
+    author_ids: &[i64],
+) -> AppResult<HashMap<String, Value>> {
+    if author_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            u.id,
+            u.registered_at,
+            u.created_at,
+            u.updated_at,
+            to_jsonb(snapshot) AS latest_snapshot,
+            to_jsonb(stats) AS latest_stats
+        FROM tweet.twitter_user AS u
+        LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
+          ON snapshot.user_id = u.id
+        LEFT JOIN tweet.v_latest_user_stats AS stats
+          ON stats.user_id = u.id
+        WHERE u.id = ANY($1::BIGINT[])
+        "#,
+    )
+    .bind(author_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id = row.get::<i64, _>("id");
+            (
+                id.to_string(),
+                json!({
+                    "id": json_i64(id),
+                    "registeredAt": row_time_opt(&row, "registered_at"),
+                    "createdAt": row_time(&row, "created_at"),
+                    "updatedAt": row_time(&row, "updated_at"),
+                    "latestSnapshot": row.get::<Option<Value>, _>("latest_snapshot").unwrap_or(Value::Null),
+                    "latestStats": row.get::<Option<Value>, _>("latest_stats").unwrap_or(Value::Null),
+                }),
+            )
+        })
+        .collect())
+}
+
+async fn fetch_author_summary(pool: &sqlx::PgPool, author_id: i64) -> AppResult<Option<Value>> {
+    let mut authors = fetch_author_summary_map(pool, &[author_id]).await?;
+    Ok(authors.remove(&author_id.to_string()))
+}
+
+async fn fetch_tweet_stats_map(
+    pool: &sqlx::PgPool,
+    tweet_ids: &[i64],
+) -> AppResult<HashMap<String, Value>> {
+    if tweet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT tweet_id, to_jsonb(stats) AS data
+        FROM tweet.v_latest_tweet_stats AS stats
+        WHERE tweet_id = ANY($1::BIGINT[])
+        "#,
+    )
+    .bind(tweet_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<i64, _>("tweet_id").to_string(),
+                row.get::<Value, _>("data"),
+            )
+        })
+        .collect())
+}
+
+async fn fetch_tweet_media_map(
+    pool: &sqlx::PgPool,
+    tweet_ids: &[i64],
+    include_latest_resource: bool,
+) -> AppResult<HashMap<String, Vec<Value>>> {
+    if tweet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            ref.tweet_id,
+            ref.display_order,
+            media.id,
+            media.type::text AS media_type,
+            media.alt_text,
+            media.grok_post_id,
+            to_jsonb(media.geometry) AS geometry,
+            to_jsonb(media.size_variants) AS size_variants,
+            to_jsonb(media.tagged_users) AS tagged_users,
+            to_jsonb(media.sensitivity_warning_ids) AS sensitivity_warning_ids,
+            media.origin_tweet_id,
+            media.origin_user_id,
+            to_jsonb(media.details) AS details,
+            to_jsonb(resource) AS latest_resource,
+            warnings.sensitivity_warnings,
+            media.created_at,
+            media.updated_at
+        FROM tweet.tweet_media_ref AS ref
+        INNER JOIN tweet.media AS media
+          ON media.id = ref.media_id
+        LEFT JOIN tweet.v_latest_media_resource AS resource
+          ON resource.media_id = media.id
+        LEFT JOIN LATERAL (
+            SELECT jsonb_agg(dict.value ORDER BY warning.ord) FILTER (WHERE dict.value IS NOT NULL) AS sensitivity_warnings
+            FROM unnest(media.sensitivity_warning_ids) WITH ORDINALITY AS warning(id, ord)
+            LEFT JOIN tweet.string_dict AS dict
+              ON dict.id = warning.id
+        ) AS warnings ON TRUE
+        WHERE ref.tweet_id = ANY($1::BIGINT[])
+        ORDER BY ref.tweet_id ASC, ref.display_order ASC, media.id ASC
+        "#,
+    )
+    .bind(tweet_ids)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::<String, Vec<Value>>::new();
+    for row in rows {
+        let tweet_id = row.get::<i64, _>("tweet_id").to_string();
+        let mut item = media_json_from_row(&row);
+        if let Some(object) = item.as_object_mut() {
+            object.insert(
+                "displayOrder".to_owned(),
+                json!(row.get::<i16, _>("display_order")),
+            );
+            object.insert(
+                "sensitivityWarnings".to_owned(),
+                row.get::<Option<Value>, _>("sensitivity_warnings")
+                    .unwrap_or_else(|| json!([])),
+            );
+            if include_latest_resource {
+                object.insert(
+                    "latestResource".to_owned(),
+                    row.get::<Option<Value>, _>("latest_resource")
+                        .unwrap_or(Value::Null),
+                );
+            }
+        }
+        map.entry(tweet_id).or_default().push(item);
+    }
+
+    Ok(map)
+}
+
+fn string_i64_field(item: &Value, field: &str) -> Option<i64> {
+    item.get(field)?.as_str()?.parse().ok()
 }
 
 fn tweet_select_sql(tail: &str) -> String {
