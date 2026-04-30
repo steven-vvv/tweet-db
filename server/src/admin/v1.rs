@@ -14,7 +14,7 @@ use crate::{
     auth::{self, ActiveSession},
     db,
     error::{AppError, AppResult},
-    search::{SearchHit, SearchSort, SearchState, TweetSearchFilters},
+    search::{SearchHit, SearchSort, SearchState, TweetSearchFilters, TweetSearchSort},
     state::AppState,
     storage,
 };
@@ -1038,7 +1038,13 @@ async fn list_tweets_search(
         relation: Some(relation.to_owned()),
     };
     let mut hits = search
-        .search_tweets(Some(q), &filters, sort, limit.saturating_add(1), offset)
+        .search_tweets(
+            Some(q),
+            &filters,
+            TweetSearchSort::from(sort),
+            limit.saturating_add(1),
+            offset,
+        )
         .await?;
     let has_more = hits.len() > limit;
     if has_more {

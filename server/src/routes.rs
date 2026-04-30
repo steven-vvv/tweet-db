@@ -363,4 +363,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn v2_tweet_search_query_accepts_sort_and_limit_url_strings() {
+        let response = test_router()
+            .oneshot(
+                Request::get(
+                    "/internal/v2/search/tweets?q=rust&sort=updatedAt&include=author%2Cstats&limit=30",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

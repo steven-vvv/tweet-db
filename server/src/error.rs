@@ -21,6 +21,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    ServiceUnavailable(String),
+    #[error("{0}")]
     Upstream(String),
     #[error("{0}")]
     Config(String),
@@ -64,6 +66,10 @@ impl AppError {
         Self::Conflict(message.into())
     }
 
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(message.into())
+    }
+
     pub fn upstream(message: impl Into<String>) -> Self {
         Self::Upstream(message.into())
     }
@@ -83,6 +89,7 @@ impl AppError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Upstream(_) => StatusCode::BAD_GATEWAY,
             Self::Search(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,

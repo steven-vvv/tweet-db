@@ -111,5 +111,6 @@ pub fn routes() -> Router<AppState> {
             "/internal/v2/search/index-tasks/{task_id}",
             get(search::get_index_task),
         )
+        .route("/internal/v2/search/tweets", get(tweets::search_tweets))
         .route("/internal/v2/system/summary", get(system::summary))
 }

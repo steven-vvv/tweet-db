@@ -6,13 +6,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     auth::ActiveSession,
     error::{AppError, AppResult},
+    search::{SearchHit, TweetSearchFilters, TweetSearchSort},
     state::AppState,
 };
 
@@ -21,6 +22,16 @@ use super::{common::*, rows::*};
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TweetListQuery {
+    #[serde(flatten)]
+    list: ListQuery,
+    author_id: Option<String>,
+    relation: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TweetSearchListQuery {
     #[serde(flatten)]
     list: ListQuery,
     author_id: Option<String>,
@@ -96,6 +107,16 @@ struct TweetMediaCursor {
     tweet_id: i64,
     display_order: i16,
     media_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TweetSearchCursor {
+    v: u8,
+    q: String,
+    author_id: Option<i64>,
+    relation: String,
+    sort: TweetSearchSort,
+    offset: usize,
 }
 
 pub async fn list_tweets(
@@ -261,6 +282,71 @@ pub async fn get_tweet(
     Ok(Json(detail_response(tweet_json_from_row(&row), included)))
 }
 
+pub async fn search_tweets(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Query(query): Query<TweetSearchListQuery>,
+) -> AppResult<Json<ListResponse>> {
+    let _session = require_capability(session, Capability::TweetRead)?;
+    let search = state
+        .search
+        .as_ref()
+        .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
+    let limit = resolve_limit(query.list.limit);
+    let q = normalize_query(query.list.q.as_deref())
+        .ok_or_else(|| AppError::bad_request("q is required"))?;
+    let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
+    let relation = normalize_tweet_relation(query.relation.as_deref())?;
+    let sort = TweetSearchSort::parse(query.sort.as_deref())?;
+    let includes = IncludeSet::parse(query.list.include.as_deref())?;
+    let cursor = decode_cursor::<TweetSearchCursor>(query.list.cursor.as_deref())?;
+
+    if let Some(cursor) = cursor.as_ref() {
+        ensure_cursor_version(cursor.v)?;
+        ensure_filter_match(
+            Some(cursor.q.as_str()),
+            Some(q.as_str()),
+            "cursor does not match query",
+        )?;
+        if cursor.author_id != author_id || cursor.relation != relation {
+            return Err(AppError::bad_request("cursor does not match filters"));
+        }
+        if cursor.sort != sort {
+            return Err(AppError::bad_request("cursor does not match sort"));
+        }
+    }
+
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let filters = TweetSearchFilters {
+        author_id,
+        relation: Some(relation.clone()),
+    };
+    let mut hits = search
+        .search_tweets(Some(&q), &filters, sort, limit.saturating_add(1), offset)
+        .await?;
+    let has_more = hits.len() > limit;
+    if has_more {
+        hits.truncate(limit);
+    }
+
+    let mut data = fetch_tweets_by_search_hits(&state.db, &hits).await?;
+    hydrate_tweet_list(&state.db, &mut data, &includes).await?;
+    let next_cursor = if has_more {
+        Some(encode_cursor(&TweetSearchCursor {
+            v: CURSOR_VERSION,
+            q,
+            author_id,
+            relation,
+            sort,
+            offset: offset.saturating_add(limit),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(Json(list_response(data, limit, next_cursor)))
+}
+
 pub async fn list_tweet_media(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -341,6 +427,35 @@ pub async fn list_tweet_media(
     })?;
 
     Ok(Json(list_response(data, limit, next_cursor)))
+}
+
+async fn fetch_tweets_by_search_hits(pool: &PgPool, hits: &[SearchHit]) -> AppResult<Vec<Value>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    let sql = tweet_select_sql("WHERE t.id = ANY($1::BIGINT[])");
+    let rows = sqlx::query(&sql).bind(&ids).fetch_all(pool).await?;
+
+    let mut by_id = HashMap::<i64, Value>::new();
+    for row in rows {
+        let id: i64 = row.get("id");
+        by_id.insert(id, tweet_json_from_row(&row));
+    }
+
+    Ok(hits
+        .iter()
+        .filter_map(|hit| {
+            by_id.remove(&hit.id).map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("searchScore".to_owned(), json!(hit.score));
+                    object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
+                }
+                item
+            })
+        })
+        .collect())
 }
 
 async fn fetch_tweet_row(pool: &sqlx::PgPool, tweet_id: i64) -> AppResult<sqlx::postgres::PgRow> {
@@ -797,5 +912,21 @@ mod tests {
         assert_eq!(value["sort"], "updatedAt");
         assert_eq!(value["sort_at"], "2026-04-10T08:30:00Z");
         assert!(value.get("published_at").is_none());
+    }
+
+    #[test]
+    fn tweet_search_cursor_serializes_sort_and_offset() {
+        let cursor = TweetSearchCursor {
+            v: CURSOR_VERSION,
+            q: "rust".to_owned(),
+            author_id: Some(42),
+            relation: "all".to_owned(),
+            sort: TweetSearchSort::UpdatedAt,
+            offset: 30,
+        };
+        let value = serde_json::to_value(cursor).unwrap();
+
+        assert_eq!(value["sort"], "updatedAt");
+        assert_eq!(value["offset"], 30);
     }
 }

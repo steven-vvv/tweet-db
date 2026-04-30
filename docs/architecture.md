@@ -122,13 +122,13 @@ v2 响应统一使用 `data`、`pagination`、`included`、`result`。资源详�
 
 ## 全文搜索
 
-搜索子系统使用 Tantivy 嵌入在服务进程内。索引目录由 `[search].index_dir` 配置，当前包含 `users-v1` 和 `tweets-v1` 两个索引。
+搜索子系统使用 Tantivy 嵌入在服务进程内。索引目录由 `[search].index_dir` 配置，当前包含 `users-v1` 和 `tweets-v2` 两个索引。
 
 索引内容：
 
 - Users：`tweet.user_snapshot` 最新版本的 `user_name` 和 `display_name`。
 - Tweets：`tweet.tweet` 的正文，优先使用 `note_text.body`，缺失时使用 `legacy_text.body`。
-- Tweets 同时写入 author、relation、published_at fast field，用于筛选和时间排序。
+- Tweets 同时写入 author、relation、published_at、created_at、updated_at fast field，用于筛选和时间排序。
 
 写入流程：
 

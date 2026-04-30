@@ -430,6 +430,7 @@ tweet 列表使用浏览视图友好的 hydrate 字段：
 - `GET /internal/v2/search/index-tasks`
 - `GET /internal/v2/search/index-tasks/{task_id}`
 - `POST /internal/v2/search/index-tasks`
+- `GET /internal/v2/search/tweets`
 - `GET /internal/v2/audit/events`
 - `GET /internal/v2/audit/events/{event_id}`
 - `GET /internal/v2/system/summary`
@@ -439,6 +440,16 @@ tweet 列表使用浏览视图友好的 hydrate 字段：
 - `q`
 - `status=all|pending|processing|completed|failed`
 - `targetKind=all|user|tweet`
+- `limit`
+- `cursor`
+
+tweet 全文搜索参数：
+
+- `q`：正文全文、tweet ID 前缀、author ID 前缀。
+- `authorId`
+- `relation=all|original|reply|quote|repost`
+- `sort=relevance|publishedAt|createdAt|updatedAt`：默认 `relevance`，时间排序均为倒序。
+- `include=author,stats,media,media-resources`
 - `limit`
 - `cursor`
 

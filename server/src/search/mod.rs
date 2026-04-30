@@ -29,7 +29,7 @@ pub use queue::{EnqueueStatus, IndexTarget, IndexTargetKind, enqueue_targets};
 pub use worker::start_workers;
 
 const USER_INDEX_DIR: &str = "users-v1";
-const TWEET_INDEX_DIR: &str = "tweets-v1";
+const TWEET_INDEX_DIR: &str = "tweets-v2";
 const JIEBA_TOKENIZER: &str = "jieba";
 const PREFIX_TOKENIZER: &str = "prefix_ngram";
 const MAX_QUERY_CHARS: usize = 256;
@@ -70,6 +70,8 @@ struct TweetFields {
     body: Field,
     relation: Field,
     published_at: Field,
+    created_at: Field,
+    updated_at: Field,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +87,38 @@ impl SearchSort {
             "relevance" => Ok(Self::Relevance),
             "time" => Ok(Self::Time),
             _ => Err(AppError::bad_request("sort must be one of relevance, time")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TweetSearchSort {
+    Relevance,
+    PublishedAt,
+    CreatedAt,
+    UpdatedAt,
+}
+
+impl TweetSearchSort {
+    pub fn parse(raw: Option<&str>) -> AppResult<Self> {
+        match raw.unwrap_or("relevance").trim() {
+            "relevance" => Ok(Self::Relevance),
+            "publishedAt" => Ok(Self::PublishedAt),
+            "createdAt" => Ok(Self::CreatedAt),
+            "updatedAt" => Ok(Self::UpdatedAt),
+            _ => Err(AppError::bad_request(
+                "sort must be one of relevance, publishedAt, createdAt, updatedAt",
+            )),
+        }
+    }
+}
+
+impl From<SearchSort> for TweetSearchSort {
+    fn from(value: SearchSort) -> Self {
+        match value {
+            SearchSort::Relevance => Self::Relevance,
+            SearchSort::Time => Self::PublishedAt,
         }
     }
 }
@@ -155,23 +189,14 @@ impl SearchState {
         &self,
         raw_query: Option<&str>,
         filters: &TweetSearchFilters,
-        sort: SearchSort,
+        sort: TweetSearchSort,
         limit: usize,
         offset: usize,
     ) -> AppResult<Vec<SearchHit>> {
         let index = &self.inner.tweets;
         index.reload()?;
         let query = build_tweet_query(index, raw_query, filters)?;
-        collect_hits(
-            index,
-            &*query,
-            sort,
-            index.fields.id,
-            index.fields.published_at,
-            "published_at",
-            limit,
-            offset,
-        )
+        collect_tweet_hits(index, &*query, sort, index.fields.id, limit, offset)
     }
 
     async fn index_task(&self, pool: &PgPool, task: &queue::ClaimedIndexTask) -> AppResult<()> {
@@ -216,6 +241,8 @@ impl SearchState {
                 index.fields.body => record.body,
                 index.fields.relation => record.relation,
                 index.fields.published_at => record.published_at.unix_timestamp(),
+                index.fields.created_at => record.created_at.unix_timestamp(),
+                index.fields.updated_at => record.updated_at.unix_timestamp(),
             ))?;
         }
         writer.commit()?;
@@ -379,7 +406,9 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
     let author_id_prefix = builder.add_text_field("author_id_prefix", prefix_text_options());
     let body = builder.add_text_field("body", jieba_text_options());
     let relation = builder.add_text_field("relation", STORED | tantivy::schema::STRING);
-    let published_at = builder.add_i64_field("published_at", numeric);
+    let published_at = builder.add_i64_field("published_at", numeric.clone());
+    let created_at = builder.add_i64_field("created_at", numeric.clone());
+    let updated_at = builder.add_i64_field("updated_at", numeric);
     let schema = builder.build();
     let index = open_index(
         &config.index_dir.join(TWEET_INDEX_DIR),
@@ -402,6 +431,8 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
             body,
             relation,
             published_at,
+            created_at,
+            updated_at,
         },
     })
 }
@@ -583,6 +614,74 @@ fn collect_hits<F>(
     }
 }
 
+fn collect_tweet_hits(
+    index: &SearchIndex<TweetFields>,
+    query: &dyn Query,
+    sort: TweetSearchSort,
+    id_field: Field,
+    limit: usize,
+    offset: usize,
+) -> AppResult<Vec<SearchHit>> {
+    let (time_field, time_field_name) = tweet_sort_field(index.fields, sort);
+    let searcher = index.reader.searcher();
+    match sort {
+        TweetSearchSort::Relevance => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_score(),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(score, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, id_field)?,
+                        score: Some(score),
+                        sort_time: stored_i64_opt(&doc, time_field),
+                    })
+                })
+                .collect()
+        }
+        TweetSearchSort::PublishedAt | TweetSearchSort::CreatedAt | TweetSearchSort::UpdatedAt => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<i64>(time_field_name, Order::Desc),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(sort_time, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, id_field)?,
+                        score: None,
+                        sort_time: sort_time.or_else(|| stored_i64_opt(&doc, time_field)),
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+fn tweet_sort_field(fields: TweetFields, sort: TweetSearchSort) -> (Field, &'static str) {
+    match sort {
+        TweetSearchSort::Relevance | TweetSearchSort::PublishedAt => {
+            (fields.published_at, "published_at")
+        }
+        TweetSearchSort::CreatedAt => (fields.created_at, "created_at"),
+        TweetSearchSort::UpdatedAt => (fields.updated_at, "updated_at"),
+    }
+}
+
 fn normalized_query(raw_query: Option<&str>) -> Option<String> {
     let raw = raw_query?.trim();
     if raw.is_empty() {
@@ -656,6 +755,8 @@ struct TweetIndexDocument {
     body: String,
     relation: String,
     published_at: OffsetDateTime,
+    created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
 }
 
 async fn fetch_user_document(pool: &PgPool, user_id: i64) -> AppResult<Option<UserIndexDocument>> {
@@ -700,7 +801,9 @@ async fn fetch_tweet_document(
                 WHEN t.reply_to_tweet_id IS NOT NULL THEN 'reply'
                 ELSE 'original'
             END AS relation,
-            t.published_at
+            t.published_at,
+            t.created_at,
+            t.updated_at
         FROM tweet.tweet AS t
         WHERE t.id = $1
         "#,
@@ -715,6 +818,8 @@ async fn fetch_tweet_document(
         body: row.get("body"),
         relation: row.get("relation"),
         published_at: row.get("published_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
     }))
 }
 
@@ -793,6 +898,8 @@ mod tests {
                     index.fields.body => "人工智能 搜索 排序",
                     index.fields.relation => "original",
                     index.fields.published_at => 10i64,
+                    index.fields.created_at => 30i64,
+                    index.fields.updated_at => 40i64,
                 ))
                 .unwrap();
             writer
@@ -804,6 +911,8 @@ mod tests {
                     index.fields.body => "人工智能 搜索 新帖子",
                     index.fields.relation => "reply",
                     index.fields.published_at => 20i64,
+                    index.fields.created_at => 20i64,
+                    index.fields.updated_at => 50i64,
                 ))
                 .unwrap();
             writer.commit().unwrap();
@@ -816,7 +925,7 @@ mod tests {
                     author_id: Some(9001),
                     relation: Some("all".to_owned()),
                 },
-                SearchSort::Time,
+                TweetSearchSort::PublishedAt,
                 10,
                 0,
             )
@@ -834,7 +943,7 @@ mod tests {
                     author_id: Some(9001),
                     relation: Some("reply".to_owned()),
                 },
-                SearchSort::Time,
+                TweetSearchSort::PublishedAt,
                 10,
                 0,
             )
@@ -844,6 +953,42 @@ mod tests {
             reply_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
             vec![2002]
         );
+
+        let created_hits = state
+            .search_tweets(
+                Some("人工智能"),
+                &TweetSearchFilters {
+                    author_id: Some(9001),
+                    relation: Some("all".to_owned()),
+                },
+                TweetSearchSort::CreatedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            created_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2001, 2002]
+        );
+
+        let updated_hits = state
+            .search_tweets(
+                Some("人工智能"),
+                &TweetSearchFilters {
+                    author_id: Some(9001),
+                    relation: Some("all".to_owned()),
+                },
+                TweetSearchSort::UpdatedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2002, 2001]
+        );
     }
 
     #[test]
@@ -852,6 +997,27 @@ mod tests {
         assert!(!should_backfill_index(10, 10));
         assert!(should_backfill_index(0, 10));
         assert!(should_backfill_index(12, 10));
+    }
+
+    #[test]
+    fn parses_tweet_search_sort() {
+        assert_eq!(
+            TweetSearchSort::parse(None).unwrap(),
+            TweetSearchSort::Relevance
+        );
+        assert_eq!(
+            TweetSearchSort::parse(Some("publishedAt")).unwrap(),
+            TweetSearchSort::PublishedAt
+        );
+        assert_eq!(
+            TweetSearchSort::parse(Some("createdAt")).unwrap(),
+            TweetSearchSort::CreatedAt
+        );
+        assert_eq!(
+            TweetSearchSort::parse(Some("updatedAt")).unwrap(),
+            TweetSearchSort::UpdatedAt
+        );
+        assert!(TweetSearchSort::parse(Some("time")).is_err());
     }
 
     #[test]
