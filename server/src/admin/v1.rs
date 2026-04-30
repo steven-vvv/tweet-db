@@ -161,6 +161,10 @@ struct TransferTaskCursor {
 
 use super::{cursor_datetime, support::*};
 
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
 pub async fn list_users(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,

@@ -6,7 +6,9 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{admin, auth, db, error::AppResult, state::AppState, tweet_query, tweet_submit};
+use crate::{
+    admin, auth, db, error::AppResult, internal_api, state::AppState, tweet_query, tweet_submit,
+};
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
@@ -18,6 +20,7 @@ pub fn api_routes(state: &AppState) -> Router<AppState> {
         .route("/healthz", get(healthz))
         .merge(public_api_routes())
         .merge(internal_api_routes())
+        .merge(internal_api::v2::routes())
         .merge(admin_api_routes())
         .merge(browser_routes())
         .merge(integration_routes())
@@ -285,6 +288,16 @@ mod tests {
             ),
             (
                 Request::get("/internal/v1/admin/users")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::get("/internal/v2/me").body(Body::empty()).unwrap(),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                Request::get("/internal/v2/system/summary")
                     .body(Body::empty())
                     .unwrap(),
                 StatusCode::UNAUTHORIZED,

@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod frontend;
+pub mod internal_api;
 pub mod routes;
 pub mod search;
 pub mod security;

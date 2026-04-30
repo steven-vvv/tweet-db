@@ -25,7 +25,7 @@ use crate::{
 mod queue;
 mod worker;
 
-pub use queue::{IndexTarget, IndexTargetKind, enqueue_targets};
+pub use queue::{EnqueueStatus, IndexTarget, IndexTargetKind, enqueue_targets};
 pub use worker::start_workers;
 
 const USER_INDEX_DIR: &str = "users-v1";
