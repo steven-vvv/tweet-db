@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::Path,
     sync::{Arc, Mutex},
@@ -201,25 +202,46 @@ impl SearchState {
 
     async fn index_task(&self, pool: &PgPool, task: &queue::ClaimedIndexTask) -> AppResult<()> {
         match task.parsed_kind()? {
-            IndexTargetKind::User => self.index_user(pool, task.target_id).await,
-            IndexTargetKind::Tweet => self.index_tweet(pool, task.target_id).await,
+            IndexTargetKind::User => self.index_users(pool, &[task.target_id]).await,
+            IndexTargetKind::Tweet => self.index_tweets(pool, &[task.target_id]).await,
         }
     }
 
-    async fn index_user(&self, pool: &PgPool, user_id: i64) -> AppResult<()> {
-        let record = fetch_user_document(pool, user_id).await?;
+    async fn index_tasks(&self, pool: &PgPool, tasks: &[queue::ClaimedIndexTask]) -> AppResult<()> {
+        let mut user_ids = Vec::new();
+        let mut tweet_ids = Vec::new();
+        for task in tasks {
+            match task.parsed_kind()? {
+                IndexTargetKind::User => user_ids.push(task.target_id),
+                IndexTargetKind::Tweet => tweet_ids.push(task.target_id),
+            }
+        }
+
+        self.index_users(pool, &user_ids).await?;
+        self.index_tweets(pool, &tweet_ids).await?;
+        Ok(())
+    }
+
+    async fn index_users(&self, pool: &PgPool, user_ids: &[i64]) -> AppResult<()> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let records = fetch_user_documents(pool, user_ids).await?;
         let index = &self.inner.users;
         let mut writer = index.lock_writer()?;
-        writer.delete_term(Term::from_field_i64(index.fields.id, user_id));
-        if let Some(record) = record {
-            writer.add_document(doc!(
-                index.fields.id => record.id,
-                index.fields.id_prefix => record.id.to_string(),
-                index.fields.user_name => record.user_name.as_deref().unwrap_or_default(),
-                index.fields.user_name_prefix => record.user_name.as_deref().unwrap_or_default(),
-                index.fields.display_name => record.display_name.as_deref().unwrap_or_default(),
-                index.fields.updated_at => record.updated_at.unix_timestamp(),
-            ))?;
+        for user_id in user_ids {
+            writer.delete_term(Term::from_field_i64(index.fields.id, *user_id));
+            if let Some(record) = records.get(user_id) {
+                writer.add_document(doc!(
+                    index.fields.id => record.id,
+                    index.fields.id_prefix => record.id.to_string(),
+                    index.fields.user_name => record.user_name.as_deref().unwrap_or_default(),
+                    index.fields.user_name_prefix => record.user_name.as_deref().unwrap_or_default(),
+                    index.fields.display_name => record.display_name.as_deref().unwrap_or_default(),
+                    index.fields.updated_at => record.updated_at.unix_timestamp(),
+                ))?;
+            }
         }
         writer.commit()?;
         drop(writer);
@@ -227,23 +249,29 @@ impl SearchState {
         Ok(())
     }
 
-    async fn index_tweet(&self, pool: &PgPool, tweet_id: i64) -> AppResult<()> {
-        let record = fetch_tweet_document(pool, tweet_id).await?;
+    async fn index_tweets(&self, pool: &PgPool, tweet_ids: &[i64]) -> AppResult<()> {
+        if tweet_ids.is_empty() {
+            return Ok(());
+        }
+
+        let records = fetch_tweet_documents(pool, tweet_ids).await?;
         let index = &self.inner.tweets;
         let mut writer = index.lock_writer()?;
-        writer.delete_term(Term::from_field_i64(index.fields.id, tweet_id));
-        if let Some(record) = record {
-            writer.add_document(doc!(
-                index.fields.id => record.id,
-                index.fields.id_prefix => record.id.to_string(),
-                index.fields.author_id => record.author_id,
-                index.fields.author_id_prefix => record.author_id.to_string(),
-                index.fields.body => record.body,
-                index.fields.relation => record.relation,
-                index.fields.published_at => record.published_at.unix_timestamp(),
-                index.fields.created_at => record.created_at.unix_timestamp(),
-                index.fields.updated_at => record.updated_at.unix_timestamp(),
-            ))?;
+        for tweet_id in tweet_ids {
+            writer.delete_term(Term::from_field_i64(index.fields.id, *tweet_id));
+            if let Some(record) = records.get(tweet_id) {
+                writer.add_document(doc!(
+                    index.fields.id => record.id,
+                    index.fields.id_prefix => record.id.to_string(),
+                    index.fields.author_id => record.author_id,
+                    index.fields.author_id_prefix => record.author_id.to_string(),
+                    index.fields.body => record.body.as_str(),
+                    index.fields.relation => record.relation.as_str(),
+                    index.fields.published_at => record.published_at.unix_timestamp(),
+                    index.fields.created_at => record.created_at.unix_timestamp(),
+                    index.fields.updated_at => record.updated_at.unix_timestamp(),
+                ))?;
+            }
         }
         writer.commit()?;
         drop(writer);
@@ -759,8 +787,15 @@ struct TweetIndexDocument {
     updated_at: OffsetDateTime,
 }
 
-async fn fetch_user_document(pool: &PgPool, user_id: i64) -> AppResult<Option<UserIndexDocument>> {
-    let row = sqlx::query(
+async fn fetch_user_documents(
+    pool: &PgPool,
+    user_ids: &[i64],
+) -> AppResult<HashMap<i64, UserIndexDocument>> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
         r#"
         SELECT
             u.id,
@@ -770,26 +805,39 @@ async fn fetch_user_document(pool: &PgPool, user_id: i64) -> AppResult<Option<Us
         FROM tweet.twitter_user AS u
         LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
           ON snapshot.user_id = u.id
-        WHERE u.id = $1
+        WHERE u.id = ANY($1::BIGINT[])
         "#,
     )
-    .bind(user_id)
-    .fetch_optional(pool)
+    .bind(user_ids)
+    .fetch_all(pool)
     .await?;
 
-    Ok(row.map(|row| UserIndexDocument {
-        id: row.get("id"),
-        user_name: row.get("user_name"),
-        display_name: row.get("display_name"),
-        updated_at: row.get("updated_at"),
-    }))
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id = row.get("id");
+            (
+                id,
+                UserIndexDocument {
+                    id,
+                    user_name: row.get("user_name"),
+                    display_name: row.get("display_name"),
+                    updated_at: row.get("updated_at"),
+                },
+            )
+        })
+        .collect())
 }
 
-async fn fetch_tweet_document(
+async fn fetch_tweet_documents(
     pool: &PgPool,
-    tweet_id: i64,
-) -> AppResult<Option<TweetIndexDocument>> {
-    let row = sqlx::query(
+    tweet_ids: &[i64],
+) -> AppResult<HashMap<i64, TweetIndexDocument>> {
+    if tweet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
         r#"
         SELECT
             t.id,
@@ -805,22 +853,31 @@ async fn fetch_tweet_document(
             t.created_at,
             t.updated_at
         FROM tweet.tweet AS t
-        WHERE t.id = $1
+        WHERE t.id = ANY($1::BIGINT[])
         "#,
     )
-    .bind(tweet_id)
-    .fetch_optional(pool)
+    .bind(tweet_ids)
+    .fetch_all(pool)
     .await?;
 
-    Ok(row.map(|row| TweetIndexDocument {
-        id: row.get("id"),
-        author_id: row.get("author_id"),
-        body: row.get("body"),
-        relation: row.get("relation"),
-        published_at: row.get("published_at"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }))
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id = row.get("id");
+            (
+                id,
+                TweetIndexDocument {
+                    id,
+                    author_id: row.get("author_id"),
+                    body: row.get("body"),
+                    relation: row.get("relation"),
+                    published_at: row.get("published_at"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                },
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]

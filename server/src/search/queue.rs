@@ -184,28 +184,55 @@ pub(super) async fn claim_next_tasks(
 }
 
 pub(super) async fn mark_task_completed(db: &PgPool, task: &ClaimedIndexTask) -> AppResult<bool> {
-    let result = sqlx::query(
+    Ok(mark_tasks_completed(db, std::slice::from_ref(task)).await? == 1)
+}
+
+pub(super) async fn mark_tasks_completed(
+    db: &PgPool,
+    tasks: &[ClaimedIndexTask],
+) -> AppResult<usize> {
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+
+    let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
+    let claimed_by = tasks
+        .iter()
+        .map(|task| task.claimed_by.clone())
+        .collect::<Vec<_>>();
+    let claimed_at = tasks.iter().map(|task| task.claimed_at).collect::<Vec<_>>();
+
+    let updated = sqlx::query_scalar::<_, i64>(
         r#"
-        UPDATE search.index_queue
-        SET status = 'completed',
-            last_error = NULL,
-            claimed_by = NULL,
-            claimed_at = NULL,
-            completed_at = NOW(),
-            updated_at = NOW()
-        WHERE id = $1
-          AND status = 'processing'
-          AND claimed_by = $2
-          AND claimed_at = $3
+        WITH input AS (
+            SELECT *
+            FROM unnest($1::UUID[], $2::TEXT[], $3::TIMESTAMPTZ[]) AS item(id, claimed_by, claimed_at)
+        ),
+        updated AS (
+            UPDATE search.index_queue AS task
+            SET status = 'completed',
+                last_error = NULL,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                completed_at = NOW(),
+                updated_at = NOW()
+            FROM input
+            WHERE task.id = input.id
+              AND task.status = 'processing'
+              AND task.claimed_by = input.claimed_by
+              AND task.claimed_at = input.claimed_at
+            RETURNING task.id
+        )
+        SELECT COUNT(*)::BIGINT FROM updated
         "#,
     )
-    .bind(task.id)
-    .bind(&task.claimed_by)
-    .bind(task.claimed_at)
-    .execute(db)
+    .bind(ids)
+    .bind(claimed_by)
+    .bind(claimed_at)
+    .fetch_one(db)
     .await?;
 
-    Ok(result.rows_affected() > 0)
+    Ok(usize::try_from(updated).unwrap_or(usize::MAX))
 }
 
 pub(super) async fn mark_task_failed(
