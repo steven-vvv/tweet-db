@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use axum::{
     Json,
     extract::{Extension, Query},
@@ -137,6 +139,17 @@ pub(super) fn action_response(data: Value, result: Value) -> ActionResponse {
 
 pub(super) fn resolve_limit(value: Option<usize>) -> usize {
     value.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+}
+
+pub(super) async fn maybe_fetch<T, F>(enabled: bool, future: F) -> AppResult<Option<T>>
+where
+    F: Future<Output = AppResult<T>>,
+{
+    if enabled {
+        Ok(Some(future.await?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn deserialize_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>

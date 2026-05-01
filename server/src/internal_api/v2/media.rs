@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 use sqlx::Row;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::try_join;
 use uuid::Uuid;
 
 use crate::{
@@ -174,26 +175,38 @@ pub async fn get_media(
     let row = fetch_media_row(&state.db, media_id).await?;
     let includes = IncludeSet::parse(query.include.as_deref())?;
     let mut included = Map::new();
+    let include_latest_resource = includes.contains("latest-resource");
+    let include_transfer_tasks = includes.contains("transfer-tasks");
+    let include_tweets = includes.contains("tweets");
+    let (latest_resource, transfer_tasks, tweets) = try_join!(
+        maybe_fetch(
+            include_latest_resource,
+            fetch_latest_media_resource(&state.db, media_id)
+        ),
+        maybe_fetch(
+            include_transfer_tasks,
+            fetch_media_transfer_tasks_array(&state.db, media_id, 20)
+        ),
+        maybe_fetch(
+            include_tweets,
+            fetch_media_tweets_array(&state.db, media_id)
+        ),
+    )?;
 
-    if includes.contains("latest-resource") {
+    if include_latest_resource {
         included.insert(
             "latestResource".to_owned(),
-            fetch_latest_media_resource(&state.db, media_id)
-                .await?
-                .unwrap_or(Value::Null),
+            latest_resource.flatten().unwrap_or(Value::Null),
         );
     }
-    if includes.contains("transfer-tasks") {
+    if include_transfer_tasks {
         included.insert(
             "transferTasks".to_owned(),
-            fetch_media_transfer_tasks_array(&state.db, media_id, 20).await?,
+            transfer_tasks.unwrap_or_else(|| json!([])),
         );
     }
-    if includes.contains("tweets") {
-        included.insert(
-            "tweets".to_owned(),
-            fetch_media_tweets_array(&state.db, media_id).await?,
-        );
+    if include_tweets {
+        included.insert("tweets".to_owned(), tweets.unwrap_or_else(|| json!([])));
     }
 
     Ok(Json(detail_response(media_json_from_row(&row), included)))

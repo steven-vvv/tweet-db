@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sqlx::{Postgres, Row, Transaction};
 use time::OffsetDateTime;
+use tokio::try_join;
 use uuid::Uuid;
 
 use crate::{
@@ -136,24 +137,32 @@ pub async fn get_user(
     let row = fetch_user_row(&state.db, user_id).await?;
     let includes = IncludeSet::parse(query.include.as_deref())?;
     let mut included = Map::new();
+    let include_sessions = includes.contains("sessions");
+    let include_authorizations = includes.contains("sso-authorizations");
+    let include_audits = includes.contains("audit-events");
+    let (sessions, authorizations, audit_events) = try_join!(
+        maybe_fetch(
+            include_sessions,
+            fetch_user_sessions_array(&state.db, user_id, 20)
+        ),
+        maybe_fetch(
+            include_authorizations,
+            fetch_user_sso_authorizations_array(&state.db, user_id, 20)
+        ),
+        maybe_fetch(
+            include_audits,
+            fetch_user_audit_events_array(&state.db, user_id, 20)
+        ),
+    )?;
 
-    if includes.contains("sessions") {
-        included.insert(
-            "sessions".to_owned(),
-            fetch_user_sessions_array(&state.db, user_id, 20).await?,
-        );
+    if let Some(value) = sessions {
+        included.insert("sessions".to_owned(), value);
     }
-    if includes.contains("sso-authorizations") {
-        included.insert(
-            "ssoAuthorizations".to_owned(),
-            fetch_user_sso_authorizations_array(&state.db, user_id, 20).await?,
-        );
+    if let Some(value) = authorizations {
+        included.insert("ssoAuthorizations".to_owned(), value);
     }
-    if includes.contains("audit-events") {
-        included.insert(
-            "auditEvents".to_owned(),
-            fetch_user_audit_events_array(&state.db, user_id, 20).await?,
-        );
+    if let Some(value) = audit_events {
+        included.insert("auditEvents".to_owned(), value);
     }
 
     Ok(Json(detail_response(user_json_from_row(&row), included)))

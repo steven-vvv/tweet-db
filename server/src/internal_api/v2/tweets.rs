@@ -221,62 +221,72 @@ pub async fn get_tweet(
     let mut included = Map::new();
     let author_id: i64 = row.get("author_id");
 
-    if includes.contains("stats") {
-        included.insert(
-            "latestStats".to_owned(),
+    let include_stats = includes.contains("stats");
+    let include_edit = includes.contains("edit");
+    let include_policy = includes.contains("policy");
+    let include_note = includes.contains("community-note");
+    let include_author = includes.contains("author");
+    let include_media = includes.contains("media");
+    let (latest_stats, edit, policy, community_note, author, media) = tokio::try_join!(
+        maybe_fetch(
+            include_stats,
             fetch_tweet_optional(
                 &state.db,
                 "tweet.v_latest_tweet_stats",
                 "tweet_id",
-                tweet_id,
+                tweet_id
             )
-            .await?
-            .unwrap_or(Value::Null),
-        );
-    }
-    if includes.contains("edit") {
-        included.insert(
-            "edit".to_owned(),
+        ),
+        maybe_fetch(
+            include_edit,
             fetch_tweet_optional(&state.db, "tweet.tweet_edit", "tweet_id", tweet_id)
-                .await?
-                .unwrap_or(Value::Null),
-        );
-    }
-    if includes.contains("policy") {
-        included.insert(
-            "policy".to_owned(),
+        ),
+        maybe_fetch(
+            include_policy,
             fetch_tweet_optional(&state.db, "tweet.tweet_policy", "tweet_id", tweet_id)
-                .await?
-                .unwrap_or(Value::Null),
-        );
-    }
-    if includes.contains("community-note") {
-        included.insert(
-            "communityNote".to_owned(),
+        ),
+        maybe_fetch(
+            include_note,
             fetch_tweet_optional(
                 &state.db,
                 "tweet.tweet_community_note",
                 "tweet_id",
-                tweet_id,
+                tweet_id
             )
-            .await?
-            .unwrap_or(Value::Null),
-        );
-    }
-    if includes.contains("author") {
-        included.insert(
-            "author".to_owned(),
-            fetch_author_summary(&state.db, author_id)
-                .await?
-                .unwrap_or(Value::Null),
-        );
-    }
-    if includes.contains("media") {
-        included.insert(
-            "media".to_owned(),
+        ),
+        maybe_fetch(include_author, fetch_author_summary(&state.db, author_id)),
+        maybe_fetch(
+            include_media,
             fetch_tweet_media_array(&state.db, tweet_id, includes.contains("media-resources"))
-                .await?,
+        ),
+    )?;
+
+    if include_stats {
+        included.insert(
+            "latestStats".to_owned(),
+            latest_stats.flatten().unwrap_or(Value::Null),
         );
+    }
+    if include_edit {
+        included.insert("edit".to_owned(), edit.flatten().unwrap_or(Value::Null));
+    }
+    if include_policy {
+        included.insert(
+            "policy".to_owned(),
+            policy.flatten().unwrap_or(Value::Null),
+        );
+    }
+    if include_note {
+        included.insert(
+            "communityNote".to_owned(),
+            community_note.flatten().unwrap_or(Value::Null),
+        );
+    }
+    if include_author {
+        included.insert("author".to_owned(), author.flatten().unwrap_or(Value::Null));
+    }
+    if include_media {
+        included.insert("media".to_owned(), media.unwrap_or_else(|| json!([])));
     }
 
     Ok(Json(detail_response(tweet_json_from_row(&row), included)))
@@ -435,19 +445,46 @@ async fn fetch_tweets_by_search_hits(pool: &PgPool, hits: &[SearchHit]) -> AppRe
     }
 
     let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
-    let sql = tweet_select_sql("WHERE t.id = ANY($1::BIGINT[])");
+    let sql = format!(
+        r#"
+        SELECT
+            input.ord,
+            t.id,
+            t.published_at,
+            t.source_id,
+            t.author_id,
+            t.place_id,
+            to_jsonb(t.legacy_text) AS legacy_text,
+            t.note_id,
+            to_jsonb(t.note_text) AS note_text,
+            t.language_id,
+            t.conversation_id,
+            t.reply_to_tweet_id,
+            t.reply_to_user_id,
+            t.quote_tweet_id,
+            to_jsonb(t.quote_permalink) AS quote_permalink,
+            t.repost_id,
+            t.created_at,
+            t.updated_at
+        FROM unnest($1::BIGINT[]) WITH ORDINALITY AS input(id, ord)
+        INNER JOIN tweet.tweet AS t
+          ON t.id = input.id
+        ORDER BY input.ord
+        "#
+    );
     let rows = sqlx::query(&sql).bind(&ids).fetch_all(pool).await?;
-
-    let mut by_id = HashMap::<i64, Value>::new();
-    for row in rows {
-        let id: i64 = row.get("id");
-        by_id.insert(id, tweet_json_from_row(&row));
-    }
+    let by_id = rows
+        .into_iter()
+        .map(|row| {
+            let id: i64 = row.get("id");
+            (id, tweet_json_from_row(&row))
+        })
+        .collect::<HashMap<_, _>>();
 
     Ok(hits
         .iter()
         .filter_map(|hit| {
-            by_id.remove(&hit.id).map(|mut item| {
+            by_id.get(&hit.id).cloned().map(|mut item| {
                 if let Some(object) = item.as_object_mut() {
                     object.insert("searchScore".to_owned(), json!(hit.score));
                     object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
@@ -587,21 +624,17 @@ async fn hydrate_tweet_list(
         .filter_map(|item| string_i64_field(item, "authorId"))
         .collect::<Vec<_>>();
 
-    let authors = if include_author {
-        fetch_author_summary_map(pool, &author_ids).await?
-    } else {
-        HashMap::new()
-    };
-    let stats = if include_stats {
-        fetch_tweet_stats_map(pool, &tweet_ids).await?
-    } else {
-        HashMap::new()
-    };
-    let media = if include_media {
-        fetch_tweet_media_map(pool, &tweet_ids, includes.contains("media-resources")).await?
-    } else {
-        HashMap::new()
-    };
+    let (authors, stats, media) = tokio::try_join!(
+        maybe_fetch(include_author, fetch_author_summary_map(pool, &author_ids)),
+        maybe_fetch(include_stats, fetch_tweet_stats_map(pool, &tweet_ids)),
+        maybe_fetch(
+            include_media,
+            fetch_tweet_media_map(pool, &tweet_ids, includes.contains("media-resources"))
+        ),
+    )?;
+    let authors = authors.unwrap_or_default();
+    let stats = stats.unwrap_or_default();
+    let media = media.unwrap_or_default();
 
     for item in data {
         let Some(object) = item.as_object_mut() else {

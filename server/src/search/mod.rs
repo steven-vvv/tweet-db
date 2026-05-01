@@ -217,8 +217,10 @@ impl SearchState {
             }
         }
 
-        self.index_users(pool, &user_ids).await?;
-        self.index_tweets(pool, &tweet_ids).await?;
+        tokio::try_join!(
+            self.index_users(pool, &user_ids),
+            self.index_tweets(pool, &tweet_ids),
+        )?;
         Ok(())
     }
 
@@ -302,7 +304,7 @@ pub async fn enqueue_startup_backfill(
     search: &SearchState,
     batch_size: usize,
 ) -> AppResult<()> {
-    let user_db_count = count_user_facts(db).await?;
+    let (user_db_count, tweet_db_count) = count_facts(db).await?;
     let user_index_count = search.user_document_count()?;
     if should_backfill_index(user_index_count, user_db_count) {
         let queued = enqueue_existing_targets(db, IndexTargetKind::User, batch_size).await?;
@@ -314,7 +316,6 @@ pub async fn enqueue_startup_backfill(
         );
     }
 
-    let tweet_db_count = count_tweet_facts(db).await?;
     let tweet_index_count = search.tweet_document_count()?;
     if should_backfill_index(tweet_index_count, tweet_db_count) {
         let queued = enqueue_existing_targets(db, IndexTargetKind::Tweet, batch_size).await?;
@@ -329,17 +330,21 @@ pub async fn enqueue_startup_backfill(
     Ok(())
 }
 
-async fn count_user_facts(db: &PgPool) -> AppResult<u64> {
-    count_facts(db, "SELECT COUNT(*) FROM tweet.twitter_user").await
-}
+async fn count_facts(db: &PgPool) -> AppResult<(u64, u64)> {
+    let counts = sqlx::query(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM tweet.twitter_user) AS user_count,
+            (SELECT COUNT(*) FROM tweet.tweet) AS tweet_count
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
 
-async fn count_tweet_facts(db: &PgPool) -> AppResult<u64> {
-    count_facts(db, "SELECT COUNT(*) FROM tweet.tweet").await
-}
-
-async fn count_facts(db: &PgPool, sql: &str) -> AppResult<u64> {
-    let count = sqlx::query_scalar::<_, i64>(sql).fetch_one(db).await?;
-    Ok(u64::try_from(count).unwrap_or(0))
+    Ok((
+        u64::try_from(counts.get::<i64, _>("user_count")).unwrap_or(0),
+        u64::try_from(counts.get::<i64, _>("tweet_count")).unwrap_or(0),
+    ))
 }
 
 fn should_backfill_index(index_count: u64, db_count: u64) -> bool {

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::Row;
 use time::OffsetDateTime;
+use tokio::try_join;
 
 use crate::{
     auth::ActiveSession,
@@ -138,21 +139,23 @@ pub async fn get_twitter_user(
     let row = fetch_twitter_user_row(&state.db, user_id).await?;
     let includes = IncludeSet::parse(query.include.as_deref())?;
     let mut included = Map::new();
+    let include_snapshot = includes.contains("latest-snapshot");
+    let include_stats = includes.contains("latest-stats");
+    let (latest_snapshot, latest_stats) = try_join!(
+        maybe_fetch(include_snapshot, fetch_latest_snapshot(&state.db, user_id)),
+        maybe_fetch(include_stats, fetch_latest_stats(&state.db, user_id)),
+    )?;
 
-    if includes.contains("latest-snapshot") {
+    if include_snapshot {
         included.insert(
             "latestSnapshot".to_owned(),
-            fetch_latest_snapshot(&state.db, user_id)
-                .await?
-                .unwrap_or(Value::Null),
+            latest_snapshot.flatten().unwrap_or(Value::Null),
         );
     }
-    if includes.contains("latest-stats") {
+    if include_stats {
         included.insert(
             "latestStats".to_owned(),
-            fetch_latest_stats(&state.db, user_id)
-                .await?
-                .unwrap_or(Value::Null),
+            latest_stats.flatten().unwrap_or(Value::Null),
         );
     }
 
