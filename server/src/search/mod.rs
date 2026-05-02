@@ -900,6 +900,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tweet_search_normalizes_cjk_punctuation_and_symbols() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.tweets;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2001i64,
+                    index.fields.author_id => 9001i64,
+                    index.fields.body => "人工智能，搜索！#Rust @alice 😀",
+                    index.fields.relation => "original",
+                    index.fields.published_at => 10i64,
+                    index.fields.created_at => 10i64,
+                    index.fields.updated_at => 10i64,
+                ))
+                .unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2002i64,
+                    index.fields.author_id => 9002i64,
+                    index.fields.body => "人工智能 其他",
+                    index.fields.relation => "original",
+                    index.fields.published_at => 20i64,
+                    index.fields.created_at => 20i64,
+                    index.fields.updated_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let punctuation_hits = state
+            .search_tweets(
+                Some("人工智能，搜索！"),
+                &TweetSearchFilters::default(),
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            punctuation_hits
+                .iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>(),
+            vec![2001]
+        );
+
+        let hashtag_hits = state
+            .search_tweets(
+                Some("#Rust"),
+                &TweetSearchFilters::default(),
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            hashtag_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2001]
+        );
+
+        let mention_hits = state
+            .search_tweets(
+                Some("@alice"),
+                &TweetSearchFilters::default(),
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mention_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2001]
+        );
+
+        let emoji_hits = state
+            .search_tweets(
+                Some("😀🔥"),
+                &TweetSearchFilters::default(),
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(emoji_hits.is_empty());
+    }
+
     #[test]
     fn startup_backfill_decision_detects_count_mismatch() {
         assert!(!should_backfill_index(0, 0));
@@ -959,5 +1052,19 @@ mod tests {
             normalized_query(Some(r#"field:value +(测试) OR rust"#)).unwrap(),
             "field value 测试 or rust"
         );
+        assert_eq!(
+            normalized_query(Some(r#""人工智能"，#Rust @alice 😀"#)).unwrap(),
+            "人工智能 Rust alice"
+        );
+        assert_eq!(normalized_query(Some("😀🔥")), None);
+    }
+
+    #[test]
+    fn trims_search_tokens_to_alphanumeric_bounds() {
+        let bounds = token_text_bounds("#Rust!").unwrap();
+        assert_eq!(&"#Rust!"[bounds.0..bounds.1], "Rust");
+        let bounds = token_text_bounds("，测试！").unwrap();
+        assert_eq!(&"，测试！"[bounds.0..bounds.1], "测试");
+        assert_eq!(token_text_bounds("😀🔥"), None);
     }
 }
