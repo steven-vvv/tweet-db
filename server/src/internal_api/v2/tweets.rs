@@ -1179,4 +1179,47 @@ mod tests {
         assert_eq!(value["sort"], "updatedAt");
         assert_eq!(value["offset"], 30);
     }
+
+    #[test]
+    fn tweet_search_query_spec_parses_exact_filters() {
+        let spec = tweet_query_spec_from_search_query(TweetSearchListQuery {
+            list: ListQuery {
+                q: Some("rust search".to_owned()),
+                limit: Some(25),
+                ..Default::default()
+            },
+            tweet_ids: Some("2,1,2".to_owned()),
+            author_ids: Some("42".to_owned()),
+            author_user_names: Some("@Alice,bob".to_owned()),
+            author_id: Some("7".to_owned()),
+            relation: Some("reply".to_owned()),
+            sort: None,
+        })
+        .unwrap();
+
+        assert_eq!(spec.q.as_deref(), Some("rust search"));
+        assert_eq!(spec.tweet_ids, vec![1, 2]);
+        assert_eq!(spec.author_ids, vec![7, 42]);
+        assert_eq!(spec.author_user_names, vec!["alice", "bob"]);
+        assert_eq!(spec.relation, "reply");
+        assert_eq!(spec.sort, TweetSearchSort::Relevance);
+        assert_eq!(spec.limit, 25);
+    }
+
+    #[test]
+    fn tweet_search_query_spec_defaults_to_published_time_without_text() {
+        let spec = tweet_query_spec_from_search_query(TweetSearchListQuery {
+            list: ListQuery::default(),
+            tweet_ids: None,
+            author_ids: None,
+            author_user_names: None,
+            author_id: None,
+            relation: None,
+            sort: None,
+        })
+        .unwrap();
+
+        assert!(spec.q.is_none());
+        assert_eq!(spec.sort, TweetSearchSort::PublishedAt);
+    }
 }

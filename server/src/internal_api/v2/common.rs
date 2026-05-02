@@ -504,6 +504,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_csv_filters() {
+        assert_eq!(
+            parse_i64_csv(Some(" 2,1,2 "), "ids").unwrap(),
+            vec![1, 2]
+        );
+        assert!(parse_i64_csv(Some("bad"), "ids").is_err());
+        assert_eq!(
+            normalize_user_name_csv(Some("@Alice, bob, alice")),
+            vec!["alice", "bob"]
+        );
+    }
+
+    #[test]
     fn non_admin_capabilities_are_read_only_for_browse() {
         let session = test_session(false);
         assert_eq!(

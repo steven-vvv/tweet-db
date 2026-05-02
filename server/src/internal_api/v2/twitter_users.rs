@@ -393,7 +393,7 @@ async fn fetch_twitter_user_row(
     .bind(user_id)
     .fetch_optional(pool)
     .await?
-        .ok_or_else(|| AppError::not_found("twitter user not found"))
+    .ok_or_else(|| AppError::not_found("twitter user not found"))
 }
 
 fn twitter_user_summary_json_from_row(row: sqlx::postgres::PgRow) -> Value {
@@ -435,6 +435,20 @@ async fn fetch_latest_snapshot(pool: &sqlx::PgPool, user_id: i64) -> AppResult<O
     .bind(user_id)
     .fetch_optional(pool)
     .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_user_query_prefixes() {
+        assert_eq!(
+            normalize_user_query_prefix(Some(" @Alice ")).as_deref(),
+            Some("alice")
+        );
+        assert_eq!(normalize_user_query_prefix(Some("   ")), None);
+    }
 }
 
 async fn fetch_latest_stats(pool: &sqlx::PgPool, user_id: i64) -> AppResult<Option<Value>> {

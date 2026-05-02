@@ -1074,6 +1074,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tweet_search_keeps_ids_as_exact_filters() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.tweets;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2001i64,
+                    index.fields.author_id => 9001i64,
+                    index.fields.body => "alpha only",
+                    index.fields.relation => "original",
+                    index.fields.published_at => 10i64,
+                    index.fields.created_at => 10i64,
+                    index.fields.updated_at => 10i64,
+                ))
+                .unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 2002i64,
+                    index.fields.author_id => 9002i64,
+                    index.fields.body => "2001 alpha",
+                    index.fields.relation => "original",
+                    index.fields.published_at => 20i64,
+                    index.fields.created_at => 20i64,
+                    index.fields.updated_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let body_hits = state
+            .search_tweets(
+                Some("2001"),
+                &TweetSearchFilters::default(),
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            body_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2002]
+        );
+
+        let exact_hits = state
+            .search_tweets(
+                Some("alpha"),
+                &TweetSearchFilters {
+                    tweet_ids: vec![2001],
+                    author_ids: vec![9001],
+                    author_id: None,
+                    relation: Some("all".to_owned()),
+                },
+                TweetSearchSort::PublishedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![2001]
+        );
+    }
+
     #[test]
     fn startup_backfill_decision_detects_count_mismatch() {
         assert!(!should_backfill_index(0, 0));
