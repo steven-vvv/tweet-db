@@ -441,6 +441,7 @@ storage object open 路由返回 `302` 到短期对象存储 URL。
 - `GET /internal/v2/search/index-tasks/{task_id}`
 - `POST /internal/v2/search/index-tasks`
 - `GET /internal/v2/search/tweets`
+- `GET /internal/v2/search/users`
 - `GET /internal/v2/audit/events`
 - `GET /internal/v2/audit/events/{event_id}`
 - `GET /internal/v2/system/summary`
@@ -456,10 +457,21 @@ storage object open 路由返回 `302` 到短期对象存储 URL。
 tweet 全文搜索参数：
 
 - `q`：正文全文、tweet ID 前缀、author ID 前缀。
+- `tweetIds`
+- `authorIds`
 - `authorId`
+- `authorUserNames`
 - `relation=all|original|reply|quote|repost`
 - `sort=relevance|publishedAt|createdAt|updatedAt`：默认 `relevance`，时间排序均为倒序。
 - `include=author,stats,media,media-resources`
+- `limit`
+- `cursor`
+
+user 搜索参数：
+
+- `userIds`
+- `userNamePrefix`
+- `displayNamePrefix`
 - `limit`
 - `cursor`
 

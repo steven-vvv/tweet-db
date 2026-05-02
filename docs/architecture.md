@@ -122,13 +122,13 @@ v2 响应统一使用 `data`、`pagination`、`included`、`result`。资源详�
 
 ## 全文搜索
 
-搜索子系统使用 Tantivy 嵌入在服务进程内。索引目录由 `[search].index_dir` 配置，当前包含 `users-v1` 和 `tweets-v2` 两个索引。
+搜索子系统使用 Tantivy 嵌入在服务进程内。索引目录由 `[search].index_dir` 配置，当前包含 `users-v2` 和 `tweets-v5` 两个索引。
 
 索引内容：
 
-- Users：`tweet.user_snapshot` 最新版本的 `user_name` 和 `display_name`。
-- Tweets：`tweet.tweet` 的正文，优先使用 `note_text.body`，缺失时使用 `legacy_text.body`。
-- Tweets 同时写入 author、relation、published_at、created_at、updated_at fast field，用于筛选和时间排序。
+- Users：`tweet.twitter_user` 主体 ID、最新 `user_name`、最新 `display_name`、updated_at。
+- Tweets：`tweet.tweet` 主体 ID、author ID、正文，正文优先使用 `note_text.body`，缺失时使用 `legacy_text.body`。
+- Tweets 同时写入 relation、published_at、created_at、updated_at fast field，用于筛选和时间排序。
 
 写入流程：
 
@@ -136,14 +136,14 @@ v2 响应统一使用 `data`、`pagination`、`included`、`result`。资源详�
 2. 用户主体、用户 snapshot 或 tweet 主体发生变化时，数据库函数在同一事务内刷新 `search.index_queue`。
 3. 服务启动时比较 Tantivy 文档数和数据库事实表数量；存在差异时按批次把现有用户和 tweet 刷新进 `search.index_queue`。
 4. search worker 领取 pending 任务，读取数据库最新态，更新 Tantivy 文档并 commit。
-5. 管理台搜索从 Tantivy 取命中 ID，再按 ID 回表生成列表 JSON。
+5. 搜索接口和管理台搜索从 Tantivy 取命中 ID，再按 ID 回表生成列表 JSON。
 
 用户索引文档始终以 `tweet.twitter_user` 为主体；缺少 snapshot 的用户也会写入 ID 字段，后续 snapshot 到达后同一队列目标会刷新为带 handle/display name 的文档。
 
 分词：
 
-- 正文、display name 和 handle 的主要全文字段使用 `tantivy-jieba`。
-- ID、handle 辅助字段使用 Tantivy ngram tokenizer，支持前缀和片段匹配。
+- 正文使用 `tantivy-jieba`。
+- ID、handle、display name 辅助字段使用 Tantivy prefix ngram tokenizer，支持前缀匹配。
 - 查询框使用简化语法，默认 AND，支持引号短语，字段名和范围语法会被清洗为普通文本。
 
 ## 字符串字典
