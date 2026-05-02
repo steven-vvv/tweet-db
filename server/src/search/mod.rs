@@ -168,6 +168,7 @@ pub struct TweetSearchFilters {
 pub struct UserSearchFilters {
     pub q: Option<String>,
     pub user_ids: Vec<i64>,
+    pub user_names: Vec<String>,
     pub user_name_prefix: Option<String>,
     pub display_name_prefix: Option<String>,
 }
@@ -751,6 +752,32 @@ fn build_user_query(
             Box::new(BooleanQuery::new(id_terms)) as Box<dyn Query>
         };
         should.push((Occur::Should, Box::new(BoostQuery::new(id_query, 6.0))));
+    }
+
+    if !filters.user_names.is_empty() {
+        let mut name_terms = filters
+            .user_names
+            .iter()
+            .map(|value| normalized_keyword(value))
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(index.fields.user_name, &value),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        if !name_terms.is_empty() {
+            let name_query = if name_terms.len() == 1 {
+                name_terms.remove(0).1
+            } else {
+                Box::new(BooleanQuery::new(name_terms)) as Box<dyn Query>
+            };
+            should.push((Occur::Should, Box::new(BoostQuery::new(name_query, 5.0))));
+        }
     }
 
     if let Some(prefix) = filters
