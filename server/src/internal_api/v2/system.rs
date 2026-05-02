@@ -41,6 +41,11 @@ pub async fn summary(
     )
     .fetch_one(&state.db)
     .await?;
+    let search_index_counts = state
+        .search
+        .as_ref()
+        .map(|search| search.index_counts())
+        .transpose()?;
 
     Ok(Json(detail_response(
         json!({
@@ -76,6 +81,10 @@ pub async fn summary(
             },
             "search": {
                 "enabled": state.settings.config.search.enabled,
+                "tantivy": {
+                    "tweets": search_index_counts.as_ref().map(|counts| counts.tweets),
+                    "users": search_index_counts.as_ref().map(|counts| counts.users),
+                },
                 "indexTasks": {
                     "total": counts.get::<i64, _>("search_total"),
                     "pending": counts.get::<i64, _>("search_pending"),
