@@ -87,6 +87,10 @@ pub fn routes() -> Router<AppState> {
             get(storage::get_storage_object),
         )
         .route(
+            "/internal/v2/storage/objects/{object_id}/open",
+            get(storage::open_storage_object),
+        )
+        .route(
             "/internal/v2/storage/objects/{object_id}/transfer-tasks",
             get(storage::list_storage_object_transfer_tasks),
         )

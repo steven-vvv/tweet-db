@@ -85,7 +85,10 @@ pub async fn me(
     let includes = IncludeSet::parse(query.include.as_deref())?;
     let mut included = Map::new();
     if includes.contains("capabilities") {
-        included.insert("capabilities".to_owned(), json!(all_capability_names()));
+        included.insert(
+            "capabilities".to_owned(),
+            json!(session_capability_names(&session)),
+        );
     }
 
     Ok(Json(detail_response(
@@ -113,9 +116,13 @@ pub(super) struct MeQuery {
 
 pub(super) fn require_capability(
     session: Option<Extension<ActiveSession>>,
-    _capability: Capability,
+    capability: Capability,
 ) -> AppResult<ActiveSession> {
-    auth::require_admin_session(session)
+    let session = auth::require_registered_session(session)?;
+    if session.record.user_is_admin || user_capabilities(&session).contains(&capability) {
+        return Ok(session);
+    }
+    Err(AppError::forbidden("capability required"))
 }
 
 pub(super) fn list_response(
@@ -375,20 +382,52 @@ pub(super) fn json_i64_opt(value: Option<i64>) -> Option<String> {
     value.map(|value| value.to_string())
 }
 
-fn all_capability_names() -> Vec<&'static str> {
+fn session_capability_names(session: &ActiveSession) -> Vec<&'static str> {
+    user_capabilities(session)
+        .into_iter()
+        .map(capability_name)
+        .collect()
+}
+
+fn user_capabilities(session: &ActiveSession) -> Vec<Capability> {
+    if session.record.user_is_admin {
+        return vec![
+            Capability::IdentityRead,
+            Capability::IdentityWrite,
+            Capability::TweetRead,
+            Capability::MediaRead,
+            Capability::MediaTransferWrite,
+            Capability::StorageRead,
+            Capability::TransferWrite,
+            Capability::SearchRead,
+            Capability::SearchWrite,
+            Capability::AuditRead,
+            Capability::SystemRead,
+        ];
+    }
+
     vec![
-        "identity.read",
-        "identity.write",
-        "tweet.read",
-        "media.read",
-        "media.transfer.write",
-        "storage.read",
-        "transfer.write",
-        "search.read",
-        "search.write",
-        "audit.read",
-        "system.read",
+        Capability::TweetRead,
+        Capability::MediaRead,
+        Capability::StorageRead,
+        Capability::SystemRead,
     ]
+}
+
+fn capability_name(capability: Capability) -> &'static str {
+    match capability {
+        Capability::IdentityRead => "identity.read",
+        Capability::IdentityWrite => "identity.write",
+        Capability::TweetRead => "tweet.read",
+        Capability::MediaRead => "media.read",
+        Capability::MediaTransferWrite => "media.transfer.write",
+        Capability::StorageRead => "storage.read",
+        Capability::TransferWrite => "transfer.write",
+        Capability::SearchRead => "search.read",
+        Capability::SearchWrite => "search.write",
+        Capability::AuditRead => "audit.read",
+        Capability::SystemRead => "system.read",
+    }
 }
 
 #[cfg(test)]

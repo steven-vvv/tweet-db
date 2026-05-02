@@ -118,7 +118,7 @@ export function mediaOpenUrl(media: JsonRecord): string {
       transfer.storageObjectId ??
       transfer.storage_object_id,
   )
-  return objectId ? `/internal/v1/admin/storage-objects/${encodeURIComponent(objectId)}/open` : ''
+  return objectId ? `/internal/v2/storage/objects/${encodeURIComponent(objectId)}/open` : ''
 }
 
 export function mediaResourceUrl(media: JsonRecord): string {

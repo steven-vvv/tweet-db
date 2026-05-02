@@ -13,8 +13,8 @@ const router = createRouter({
 router.beforeEach(async () => {
   try {
     const response = await fetchV2Me({ include: 'capabilities' })
-    if (!response.data.isAdmin) {
-      window.location.href = '/forbidden'
+    if (!response.data.registered || response.data.disabled) {
+      window.location.href = '/account'
       return false
     }
   } catch {

@@ -4,7 +4,7 @@
       <a class="brand" href="/browse">tweet-db</a>
       <nav>
         <a href="/browse" class="active">Browse</a>
-        <a href="/admin/overview">Admin</a>
+        <a v-if="isAdmin" href="/admin/overview">Admin</a>
         <a href="/account">Account</a>
       </nav>
     </aside>
@@ -84,7 +84,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
-import { fetchV2TweetSearch, fetchV2Tweets, type JsonRecord } from '../../../shared/api'
+import { fetchV2Me, fetchV2TweetSearch, fetchV2Tweets, type JsonRecord } from '../../../shared/api'
 import { countValue } from '../browse-helpers'
 import TweetCard from '../components/TweetCard.vue'
 
@@ -101,6 +101,7 @@ const sort = ref<TweetSort>('publishedAt')
 const queryWasActive = ref(false)
 const loading = ref(false)
 const error = ref('')
+const isAdmin = ref(false)
 
 const sortLabels: Record<TweetSort, string> = {
   relevance: 'Relevance',
@@ -124,7 +125,10 @@ const cardTimeField = computed<TweetTimeField>(() =>
   requestSort.value === 'relevance' ? 'publishedAt' : requestSort.value,
 )
 
-onMounted(reload)
+onMounted(async () => {
+  await loadSession()
+  await reload()
+})
 
 async function reload() {
   await load(true)
@@ -171,6 +175,15 @@ function handleQueryInput() {
     sort.value = 'publishedAt'
   }
   queryWasActive.value = nextActive
+}
+
+async function loadSession() {
+  try {
+    const response = await fetchV2Me()
+    isAdmin.value = Boolean(response.data.isAdmin)
+  } catch {
+    isAdmin.value = false
+  }
 }
 </script>
 

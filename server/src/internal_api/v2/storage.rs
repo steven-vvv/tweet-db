@@ -1,6 +1,7 @@
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
+    response::Redirect,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -224,6 +225,35 @@ pub async fn create_storage_object_presigned_url(
         }),
         json!({ "ok": true }),
     )))
+}
+
+pub async fn open_storage_object(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Path(object_id): Path<Uuid>,
+) -> AppResult<Redirect> {
+    let _session = require_capability(session, Capability::StorageRead)?;
+    let row = sqlx::query(
+        r#"
+        SELECT bucket, object_key
+        FROM media.storage_object
+        WHERE id = $1
+        "#,
+    )
+    .bind(object_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("storage object not found"))?;
+    let client = storage::build_client(&state.settings)?;
+    let url = storage::presign_get_object(
+        &client,
+        &row.get::<String, _>("bucket"),
+        &row.get::<String, _>("object_key"),
+        Duration::from_secs(300),
+    )
+    .await?;
+
+    Ok(Redirect::temporary(&url))
 }
 
 fn fetch_storage_object_sql() -> &'static str {
