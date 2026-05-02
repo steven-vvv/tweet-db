@@ -32,10 +32,12 @@ const props = withDefaults(
     text: JsonRecord
     maxLines?: number
     hideMediaEntities?: boolean
+    routeBasePath?: string
   }>(),
   {
     maxLines: 0,
     hideMediaEntities: false,
+    routeBasePath: '/browse',
   },
 )
 
@@ -109,7 +111,7 @@ function entityPart(entity: TextEntity, rawText: string): TextPart {
   }
   if (kind === 'mention') {
     const userId = optionalText(entity.userId)
-    return userId ? { text: rawText, to: `/browse/users/${userId}` } : { text: rawText }
+    return userId ? { text: rawText, to: `${props.routeBasePath}/users/${userId}` } : { text: rawText }
   }
   return { text: rawText }
 }
