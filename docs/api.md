@@ -228,10 +228,13 @@
   "registered": true,
   "is_admin": true,
   "disabled": false,
+  "activation_required": false,
   "user_id": "0195f1df-0d69-7f7d-8c24-0c1af2d75001",
   "username": "demo_user",
   "subject_id": "0195f1de-fce0-7d91-b86d-7d7e8f2c1001",
   "authorization_id": "0195f1df-0730-7f69-9a92-cd8e4eb4d001",
+  "disabled_at": null,
+  "disabled_by_user_id": null,
   "expires_at": "2026-04-01T08:00:00Z"
 }
 ```
@@ -247,6 +250,8 @@
   "username": "demo_user"
 }
 ```
+
+注册完成后账号默认进入待激活状态：`registration_state = active`，用户记录带 `disabled_at`，`disabled_by_user_id = null`。管理员在 `/admin/users` 启用该账号后，浏览和只读 API 才可用。
 
 ### `DELETE /internal/v1/session`
 
@@ -308,6 +313,8 @@ v2 内部接口统一使用 `/internal/v2/...` 前缀。当前实现仍要求管
 
 返回当前内部会话资源。可选 `include=capabilities`。
 
+已激活普通用户拥有 `tweet.read`、`media.read`、`storage.read`、`system.read`。管理员拥有全部 capabilities。待激活或已禁用账号访问 v2 资源返回拒绝。
+
 ### Identity
 
 - `GET /internal/v2/identity/users`
@@ -319,7 +326,7 @@ v2 内部接口统一使用 `/internal/v2/...` 前缀。当前实现仍要求管
 用户列表参数：
 
 - `q`
-- `status=all|active|disabled`
+- `status=all|active|pending|disabled`
 - `limit`
 - `cursor`
 
@@ -381,6 +388,7 @@ tweet 列表使用浏览视图友好的 hydrate 字段：
 
 - `GET /internal/v2/storage/objects`
 - `GET /internal/v2/storage/objects/{object_id}`
+- `GET /internal/v2/storage/objects/{object_id}/open`
 - `GET /internal/v2/storage/objects/{object_id}/transfer-tasks`
 - `POST /internal/v2/storage/objects/{object_id}/presigned-url`
 - `GET /internal/v2/transfer/tasks`
@@ -414,6 +422,8 @@ tweet 列表使用浏览视图友好的 hydrate 字段：
   }
 }
 ```
+
+storage object open 路由返回 `302` 到短期对象存储 URL。
 
 转储任务状态变更请求体：
 
@@ -484,7 +494,8 @@ tweet 全文搜索参数：
 查询参数：
 
 - `q`
-- `status=all|active|disabled`
+- `status=all|active|pending|disabled`
+- `role=all|admin|user`
 - `limit`
 - `cursor`
 
@@ -515,7 +526,7 @@ tweet 全文搜索参数：
 
 ### `POST /internal/v1/admin/users/:user_id/enable`
 
-恢复已禁用用户。
+恢复已禁用用户，或激活待管理员审核的新注册用户。
 
 ### 管理列表分页约定
 

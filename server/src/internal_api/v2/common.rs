@@ -433,6 +433,9 @@ fn capability_name(capability: Capability) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
+    use time::{Duration, OffsetDateTime};
+    use uuid::Uuid;
 
     #[test]
     fn clamps_limits() {
@@ -447,5 +450,47 @@ mod tests {
         assert!(includes.contains("stats"));
         assert!(includes.contains("media"));
         assert!(!includes.contains("audit"));
+    }
+
+    #[test]
+    fn non_admin_capabilities_are_read_only_for_browse() {
+        let session = test_session(false);
+        assert_eq!(
+            session_capability_names(&session),
+            vec!["tweet.read", "media.read", "storage.read", "system.read"]
+        );
+    }
+
+    #[test]
+    fn admin_capabilities_include_identity_and_write_permissions() {
+        let session = test_session(true);
+        let capabilities = session_capability_names(&session);
+        assert!(capabilities.contains(&"identity.write"));
+        assert!(capabilities.contains(&"media.transfer.write"));
+        assert!(capabilities.contains(&"audit.read"));
+    }
+
+    fn test_session(user_is_admin: bool) -> ActiveSession {
+        let now = OffsetDateTime::now_utc();
+        ActiveSession {
+            record: db::SessionRecord {
+                selector: Uuid::now_v7(),
+                verifier_hash: vec![1, 2, 3],
+                user_id: Some(Uuid::now_v7()),
+                username: Some("demo_user".to_owned()),
+                user_is_admin,
+                user_disabled_at: None,
+                user_disabled_by_user_id: None,
+                sso_subject_id: Uuid::now_v7(),
+                authorization_id: Uuid::now_v7(),
+                registration_state: "active".to_owned(),
+                expires_at: now + Duration::hours(1),
+                last_seen_at: now,
+                created_at: now,
+                authorization_status: "active".to_owned(),
+                authorization_last_checked_at: now,
+                authorization_remote_expires_at: None,
+            },
+        }
     }
 }
