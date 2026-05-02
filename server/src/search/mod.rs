@@ -9,11 +9,14 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tantivy::{
     Index, IndexReader, IndexWriter, Order, TantivyDocument, Term, doc,
-    query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, QueryParser, TermQuery},
+    query::{AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, QueryParser, TermQuery},
     schema::{
         Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions, Value,
     },
-    tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenFilter, TokenStream, Tokenizer},
+    tokenizer::{
+        LowerCaser, NgramTokenizer, RemoveLongFilter, TextAnalyzer, TokenFilter, TokenStream,
+        Tokenizer,
+    },
 };
 use time::OffsetDateTime;
 
@@ -28,9 +31,12 @@ mod worker;
 pub use queue::{EnqueueStatus, IndexTarget, IndexTargetKind, enqueue_targets};
 pub use worker::start_workers;
 
-const TWEET_INDEX_DIR: &str = "tweets-v4";
+const TWEET_INDEX_DIR: &str = "tweets-v5";
+const USER_INDEX_DIR: &str = "users-v2";
 const JIEBA_TOKENIZER: &str = "jieba";
+const PREFIX_TOKENIZER: &str = "prefix";
 const MAX_QUERY_CHARS: usize = 256;
+const MAX_PREFIX_CHARS: usize = 64;
 
 #[derive(Clone)]
 pub struct SearchState {
@@ -39,6 +45,7 @@ pub struct SearchState {
 
 struct SearchRuntime {
     tweets: SearchIndex<TweetFields>,
+    users: SearchIndex<UserFields>,
 }
 
 struct SearchIndex<F> {
@@ -51,11 +58,23 @@ struct SearchIndex<F> {
 #[derive(Clone, Copy)]
 struct TweetFields {
     id: Field,
+    id_prefix: Field,
     author_id: Field,
+    author_id_prefix: Field,
     body: Field,
     relation: Field,
     published_at: Field,
     created_at: Field,
+    updated_at: Field,
+}
+
+#[derive(Clone, Copy)]
+struct UserFields {
+    id: Field,
+    id_prefix: Field,
+    user_name: Field,
+    user_name_prefix: Field,
+    display_name_prefix: Field,
     updated_at: Field,
 }
 
@@ -108,11 +127,33 @@ impl From<SearchSort> for TweetSearchSort {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserSearchSort {
+    Relevance,
+    UpdatedAt,
+}
+
+impl From<SearchSort> for UserSearchSort {
+    fn from(value: SearchSort) -> Self {
+        match value {
+            SearchSort::Relevance => Self::Relevance,
+            SearchSort::Time => Self::UpdatedAt,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub id: i64,
     pub score: Option<f32>,
     pub sort_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexCounts {
+    pub tweets: u64,
+    pub users: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +164,14 @@ pub struct TweetSearchFilters {
     pub relation: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UserSearchFilters {
+    pub q: Option<String>,
+    pub user_ids: Vec<i64>,
+    pub user_name_prefix: Option<String>,
+    pub display_name_prefix: Option<String>,
+}
+
 pub fn build_state(settings: &Settings) -> AppResult<Option<SearchState>> {
     if !settings.config.search.enabled {
         tracing::info!("search subsystem is disabled by config");
@@ -130,19 +179,31 @@ pub fn build_state(settings: &Settings) -> AppResult<Option<SearchState>> {
     }
 
     let tweets = open_tweet_index(&settings.config.search)?;
+    let users = open_user_index(&settings.config.search)?;
     tracing::info!(
         index_dir = %settings.config.search.index_dir.display(),
         "initialized search indexes"
     );
 
     Ok(Some(SearchState {
-        inner: Arc::new(SearchRuntime { tweets }),
+        inner: Arc::new(SearchRuntime { tweets, users }),
     }))
 }
 
 impl SearchState {
+    pub fn index_counts(&self) -> AppResult<SearchIndexCounts> {
+        Ok(SearchIndexCounts {
+            tweets: self.tweet_document_count()?,
+            users: self.user_document_count()?,
+        })
+    }
+
     fn tweet_document_count(&self) -> AppResult<u64> {
         self.inner.tweets.document_count()
+    }
+
+    fn user_document_count(&self) -> AppResult<u64> {
+        self.inner.users.document_count()
     }
 
     pub async fn search_tweets(
@@ -159,22 +220,37 @@ impl SearchState {
         collect_tweet_hits(index, &*query, sort, index.fields.id, limit, offset)
     }
 
+    pub async fn search_users(
+        &self,
+        filters: &UserSearchFilters,
+        sort: UserSearchSort,
+        limit: usize,
+        offset: usize,
+    ) -> AppResult<Vec<SearchHit>> {
+        let index = &self.inner.users;
+        index.reload()?;
+        let query = build_user_query(index, filters)?;
+        collect_user_hits(index, &*query, sort, limit, offset)
+    }
+
     async fn index_task(&self, pool: &PgPool, task: &queue::ClaimedIndexTask) -> AppResult<()> {
         match task.parsed_kind()? {
-            IndexTargetKind::User => Ok(()),
+            IndexTargetKind::User => self.index_users(pool, &[task.target_id]).await,
             IndexTargetKind::Tweet => self.index_tweets(pool, &[task.target_id]).await,
         }
     }
 
     async fn index_tasks(&self, pool: &PgPool, tasks: &[queue::ClaimedIndexTask]) -> AppResult<()> {
         let mut tweet_ids = Vec::new();
+        let mut user_ids = Vec::new();
         for task in tasks {
             match task.parsed_kind()? {
-                IndexTargetKind::User => {}
+                IndexTargetKind::User => user_ids.push(task.target_id),
                 IndexTargetKind::Tweet => tweet_ids.push(task.target_id),
             }
         }
 
+        self.index_users(pool, &user_ids).await?;
         self.index_tweets(pool, &tweet_ids).await
     }
 
@@ -189,15 +265,53 @@ impl SearchState {
         for tweet_id in tweet_ids {
             writer.delete_term(Term::from_field_i64(index.fields.id, *tweet_id));
             if let Some(record) = records.get(tweet_id) {
+                let id_text = record.id.to_string();
+                let author_id_text = record.author_id.to_string();
                 writer.add_document(doc!(
                     index.fields.id => record.id,
+                    index.fields.id_prefix => id_text.as_str(),
                     index.fields.author_id => record.author_id,
+                    index.fields.author_id_prefix => author_id_text.as_str(),
                     index.fields.body => record.body.as_str(),
                     index.fields.relation => record.relation.as_str(),
                     index.fields.published_at => record.published_at.unix_timestamp(),
                     index.fields.created_at => record.created_at.unix_timestamp(),
                     index.fields.updated_at => record.updated_at.unix_timestamp(),
                 ))?;
+            }
+        }
+        writer.commit()?;
+        drop(writer);
+        index.reload()?;
+        Ok(())
+    }
+
+    async fn index_users(&self, pool: &PgPool, user_ids: &[i64]) -> AppResult<()> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+
+        let records = fetch_user_documents(pool, user_ids).await?;
+        let index = &self.inner.users;
+        let mut writer = index.lock_writer()?;
+        for user_id in user_ids {
+            writer.delete_term(Term::from_field_i64(index.fields.id, *user_id));
+            if let Some(record) = records.get(user_id) {
+                let id_text = record.id.to_string();
+                let mut document = doc!(
+                    index.fields.id => record.id,
+                    index.fields.id_prefix => id_text.as_str(),
+                    index.fields.updated_at => record.updated_at.unix_timestamp(),
+                );
+                if let Some(user_name) = record.user_name.as_deref() {
+                    let user_name = normalized_keyword(user_name);
+                    document.add_text(index.fields.user_name, &user_name);
+                    document.add_text(index.fields.user_name_prefix, &user_name);
+                }
+                if let Some(display_name) = record.display_name.as_deref() {
+                    document.add_text(index.fields.display_name_prefix, display_name);
+                }
+                writer.add_document(document)?;
             }
         }
         writer.commit()?;
@@ -241,6 +355,18 @@ pub async fn enqueue_startup_backfill(
         );
     }
 
+    let user_db_count = count_users(db).await?;
+    let user_index_count = search.user_document_count()?;
+    if should_backfill_index(user_index_count, user_db_count) {
+        let queued = enqueue_existing_targets(db, IndexTargetKind::User, batch_size).await?;
+        tracing::info!(
+            db_count = user_db_count,
+            index_count = user_index_count,
+            queued,
+            "queued startup user search backfill"
+        );
+    }
+
     Ok(())
 }
 
@@ -248,6 +374,18 @@ async fn count_tweets(db: &PgPool) -> AppResult<u64> {
     let count = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*) FROM tweet.tweet
+        "#,
+    )
+    .fetch_one(db)
+    .await?;
+
+    Ok(u64::try_from(count).unwrap_or(0))
+}
+
+async fn count_users(db: &PgPool) -> AppResult<u64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*) FROM tweet.twitter_user
         "#,
     )
     .fetch_one(db)
@@ -306,7 +444,9 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
         .set_fast()
         .set_stored();
     let id = builder.add_i64_field("id", numeric.clone());
+    let id_prefix = builder.add_text_field("id_prefix", prefix_text_options());
     let author_id = builder.add_i64_field("author_id", numeric.clone());
+    let author_id_prefix = builder.add_text_field("author_id_prefix", prefix_text_options());
     let body = builder.add_text_field("body", jieba_text_options());
     let relation = builder.add_text_field("relation", tantivy::schema::STRING);
     let published_at = builder.add_i64_field("published_at", numeric.clone());
@@ -328,11 +468,50 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
         writer: Mutex::new(writer),
         fields: TweetFields {
             id,
+            id_prefix,
             author_id,
+            author_id_prefix,
             body,
             relation,
             published_at,
             created_at,
+            updated_at,
+        },
+    })
+}
+
+fn open_user_index(config: &SearchSection) -> AppResult<SearchIndex<UserFields>> {
+    let mut builder = Schema::builder();
+    let numeric = NumericOptions::default()
+        .set_indexed()
+        .set_fast()
+        .set_stored();
+    let id = builder.add_i64_field("id", numeric.clone());
+    let id_prefix = builder.add_text_field("id_prefix", prefix_text_options());
+    let user_name = builder.add_text_field("user_name", tantivy::schema::STRING);
+    let user_name_prefix = builder.add_text_field("user_name_prefix", prefix_text_options());
+    let display_name_prefix = builder.add_text_field("display_name_prefix", prefix_text_options());
+    let updated_at = builder.add_i64_field("updated_at", numeric);
+    let schema = builder.build();
+    let index = open_index(
+        &config.index_dir.join(USER_INDEX_DIR),
+        schema,
+        config.writer_memory_mb,
+    )?;
+    register_tokenizers(&index)?;
+    let reader = index.reader()?;
+    let writer = index.writer_with_num_threads(1, memory_bytes(config.writer_memory_mb))?;
+
+    Ok(SearchIndex {
+        index,
+        reader,
+        writer: Mutex::new(writer),
+        fields: UserFields {
+            id,
+            id_prefix,
+            user_name,
+            user_name_prefix,
+            display_name_prefix,
             updated_at,
         },
     })
@@ -354,6 +533,12 @@ fn register_tokenizers(index: &Index) -> AppResult<()> {
         .filter(LowerCaser)
         .build();
     index.tokenizers().register(JIEBA_TOKENIZER, jieba);
+    let prefix = TextAnalyzer::builder(NgramTokenizer::new(1, MAX_PREFIX_CHARS, true)?)
+        .filter(SearchTextFilter)
+        .filter(RemoveLongFilter::limit(80))
+        .filter(LowerCaser)
+        .build();
+    index.tokenizers().register(PREFIX_TOKENIZER, prefix);
     Ok(())
 }
 
@@ -428,12 +613,19 @@ fn token_text_bounds(value: &str) -> Option<(usize, usize)> {
 }
 
 fn jieba_text_options() -> TextOptions {
-    TextOptions::default()
-        .set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer(JIEBA_TOKENIZER)
-                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-        )
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(JIEBA_TOKENIZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
+fn prefix_text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(PREFIX_TOKENIZER)
+            .set_index_option(IndexRecordOption::Basic),
+    )
 }
 
 fn build_tweet_query(
@@ -446,15 +638,46 @@ fn build_tweet_query(
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
     if let Some(query_text) = normalized_query(raw_query) {
+        let mut query_parts = Vec::<(Occur, Box<dyn Query>)>::new();
         let mut parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
         parser.set_conjunction_by_default();
         parser.set_field_boost(index.fields.body, 2.0);
-        parts.push((
-            Occur::Must,
-            parser.parse_query(&query_text).map_err(search_error)?,
+        query_parts.push((
+            Occur::Should,
+            Box::new(BoostQuery::new(
+                parser.parse_query(&query_text).map_err(search_error)?,
+                3.0,
+            )),
         ));
+        if let Some(prefix) = raw_query.and_then(normalized_prefix_query) {
+            query_parts.push((
+                Occur::Should,
+                boosted_term_query(index.fields.id_prefix, &prefix, 100.0),
+            ));
+            query_parts.push((
+                Occur::Should,
+                boosted_term_query(index.fields.author_id_prefix, &prefix, 50.0),
+            ));
+        }
+        parts.push((Occur::Must, Box::new(BooleanQuery::new(query_parts))));
     } else if raw_has_query {
-        return Ok(Box::new(EmptyQuery));
+        if let Some(prefix) = raw_query.and_then(normalized_prefix_query) {
+            parts.push((
+                Occur::Must,
+                Box::new(BooleanQuery::new(vec![
+                    (
+                        Occur::Should,
+                        boosted_term_query(index.fields.id_prefix, &prefix, 100.0),
+                    ),
+                    (
+                        Occur::Should,
+                        boosted_term_query(index.fields.author_id_prefix, &prefix, 50.0),
+                    ),
+                ])),
+            ));
+        } else {
+            return Ok(Box::new(EmptyQuery));
+        }
     }
 
     push_i64_filter(&mut parts, index.fields.id, &filters.tweet_ids);
@@ -483,6 +706,96 @@ fn build_tweet_query(
     } else {
         Ok(Box::new(BooleanQuery::new(parts)))
     }
+}
+
+fn build_user_query(
+    index: &SearchIndex<UserFields>,
+    filters: &UserSearchFilters,
+) -> AppResult<Box<dyn Query>> {
+    let mut parts = Vec::<(Occur, Box<dyn Query>)>::new();
+    let mut should = Vec::<(Occur, Box<dyn Query>)>::new();
+
+    if let Some(q) = filters.q.as_deref().and_then(normalized_prefix_query) {
+        should.push((
+            Occur::Should,
+            boosted_term_query(index.fields.id_prefix, &q, 6.0),
+        ));
+        should.push((
+            Occur::Should,
+            boosted_term_query(index.fields.user_name_prefix, &q, 4.0),
+        ));
+        should.push((
+            Occur::Should,
+            boosted_term_query(index.fields.display_name_prefix, &q, 2.0),
+        ));
+    }
+
+    if !filters.user_ids.is_empty() {
+        let mut id_terms = filters
+            .user_ids
+            .iter()
+            .copied()
+            .map(|value| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_i64(index.fields.id, value),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect::<Vec<_>>();
+        let id_query = if id_terms.len() == 1 {
+            id_terms.remove(0).1
+        } else {
+            Box::new(BooleanQuery::new(id_terms)) as Box<dyn Query>
+        };
+        should.push((Occur::Should, Box::new(BoostQuery::new(id_query, 6.0))));
+    }
+
+    if let Some(prefix) = filters
+        .user_name_prefix
+        .as_deref()
+        .and_then(normalized_prefix_query)
+    {
+        should.push((
+            Occur::Should,
+            boosted_term_query(index.fields.user_name_prefix, &prefix, 4.0),
+        ));
+    }
+
+    if let Some(prefix) = filters
+        .display_name_prefix
+        .as_deref()
+        .and_then(normalized_prefix_query)
+    {
+        should.push((
+            Occur::Should,
+            boosted_term_query(index.fields.display_name_prefix, &prefix, 2.0),
+        ));
+    }
+
+    if should.is_empty() {
+        parts.push((Occur::Must, Box::new(AllQuery)));
+    } else {
+        parts.push((Occur::Must, Box::new(BooleanQuery::new(should))));
+    }
+
+    if parts.len() == 1 {
+        Ok(parts.remove(0).1)
+    } else {
+        Ok(Box::new(BooleanQuery::new(parts)))
+    }
+}
+
+fn boosted_term_query(field: Field, value: &str, boost: f32) -> Box<dyn Query> {
+    Box::new(BoostQuery::new(
+        Box::new(TermQuery::new(
+            Term::from_field_text(field, value),
+            IndexRecordOption::Basic,
+        )),
+        boost,
+    ))
 }
 
 fn push_i64_filter(parts: &mut Vec<(Occur, Box<dyn Query>)>, field: Field, values: &[i64]) {
@@ -581,6 +894,63 @@ fn tweet_sort_field(fields: TweetFields, sort: TweetSearchSort) -> (Field, &'sta
     }
 }
 
+fn collect_user_hits(
+    index: &SearchIndex<UserFields>,
+    query: &dyn Query,
+    sort: UserSearchSort,
+    limit: usize,
+    offset: usize,
+) -> AppResult<Vec<SearchHit>> {
+    let searcher = index.reader.searcher();
+    match sort {
+        UserSearchSort::Relevance => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_score(),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(score, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, index.fields.id)?,
+                        score: Some(score),
+                        sort_time: stored_i64_opt(&doc, index.fields.updated_at),
+                    })
+                })
+                .collect()
+        }
+        UserSearchSort::UpdatedAt => {
+            let docs = searcher
+                .search(
+                    query,
+                    &tantivy::collector::TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<i64>("updated_at", Order::Desc),
+                )
+                .map_err(search_error)?;
+            docs.into_iter()
+                .map(|(sort_time, address)| {
+                    let doc = searcher
+                        .doc::<TantivyDocument>(address)
+                        .map_err(search_error)?;
+                    Ok(SearchHit {
+                        id: stored_i64(&doc, index.fields.id)?,
+                        score: None,
+                        sort_time: sort_time
+                            .or_else(|| stored_i64_opt(&doc, index.fields.updated_at)),
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
 fn normalized_query(raw_query: Option<&str>) -> Option<String> {
     let raw = raw_query?.trim();
     if raw.is_empty() {
@@ -615,6 +985,22 @@ fn normalized_query(raw_query: Option<&str>) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+fn normalized_prefix_query(raw_query: &str) -> Option<String> {
+    let raw = raw_query.trim().trim_start_matches('@').trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let value = raw.chars().take(MAX_PREFIX_CHARS).collect::<String>();
+    let (start, end) = token_text_bounds(&value)?;
+    let value = normalized_keyword(&value[start..end]);
+    (!value.is_empty()).then_some(value)
+}
+
+fn normalized_keyword(value: &str) -> String {
+    value.trim().trim_start_matches('@').trim().to_lowercase()
+}
+
 fn stored_i64(doc: &TantivyDocument, field: Field) -> AppResult<i64> {
     stored_i64_opt(doc, field).ok_or_else(|| AppError::search("indexed document is missing id"))
 }
@@ -640,6 +1026,14 @@ struct TweetIndexDocument {
     relation: String,
     published_at: OffsetDateTime,
     created_at: OffsetDateTime,
+    updated_at: OffsetDateTime,
+}
+
+#[derive(Debug)]
+struct UserIndexDocument {
+    id: i64,
+    user_name: Option<String>,
+    display_name: Option<String>,
     updated_at: OffsetDateTime,
 }
 
@@ -694,6 +1088,48 @@ async fn fetch_tweet_documents(
         .collect())
 }
 
+async fn fetch_user_documents(
+    pool: &PgPool,
+    user_ids: &[i64],
+) -> AppResult<HashMap<i64, UserIndexDocument>> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            u.id,
+            snapshot.user_name,
+            snapshot.display_name,
+            u.updated_at
+        FROM tweet.twitter_user AS u
+        LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
+          ON snapshot.user_id = u.id
+        WHERE u.id = ANY($1::BIGINT[])
+        "#,
+    )
+    .bind(user_ids)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id = row.get("id");
+            (
+                id,
+                UserIndexDocument {
+                    id,
+                    user_name: row.get("user_name"),
+                    display_name: row.get("display_name"),
+                    updated_at: row.get("updated_at"),
+                },
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -715,6 +1151,7 @@ mod tests {
         SearchState {
             inner: Arc::new(SearchRuntime {
                 tweets: open_tweet_index(&config).unwrap(),
+                users: open_user_index(&config).unwrap(),
             }),
         }
     }
@@ -729,7 +1166,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2001i64,
+                    index.fields.id_prefix => "2001",
                     index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能 搜索 排序",
                     index.fields.relation => "original",
                     index.fields.published_at => 10i64,
@@ -740,7 +1179,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2002i64,
+                    index.fields.id_prefix => "2002",
                     index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能 搜索 新帖子",
                     index.fields.relation => "reply",
                     index.fields.published_at => 20i64,
@@ -842,7 +1283,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2001i64,
+                    index.fields.id_prefix => "2001",
                     index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "alpha only",
                     index.fields.relation => "original",
                     index.fields.published_at => 10i64,
@@ -853,7 +1296,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2002i64,
+                    index.fields.id_prefix => "2002",
                     index.fields.author_id => 9002i64,
+                    index.fields.author_id_prefix => "9002",
                     index.fields.body => "2001 alpha",
                     index.fields.relation => "original",
                     index.fields.published_at => 20i64,
@@ -876,7 +1321,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             body_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
-            vec![2002]
+            vec![2002, 2001]
         );
 
         let exact_hits = state
@@ -910,7 +1355,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2001i64,
+                    index.fields.id_prefix => "2001",
                     index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能，搜索！#Rust @alice 😀",
                     index.fields.relation => "original",
                     index.fields.published_at => 10i64,
@@ -921,7 +1368,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2002i64,
+                    index.fields.id_prefix => "2002",
                     index.fields.author_id => 9002i64,
+                    index.fields.author_id_prefix => "9002",
                     index.fields.body => "人工智能 其他",
                     index.fields.relation => "original",
                     index.fields.published_at => 20i64,
@@ -993,6 +1442,105 @@ mod tests {
         assert!(emoji_hits.is_empty());
     }
 
+    #[tokio::test]
+    async fn user_search_matches_ids_handles_names_and_time_sort() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = test_search_state(&temp_dir);
+        let index = &state.inner.users;
+        {
+            let mut writer = index.lock_writer().unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 1001i64,
+                    index.fields.id_prefix => "1001",
+                    index.fields.user_name => "alice",
+                    index.fields.user_name_prefix => "alice",
+                    index.fields.display_name_prefix => "Alice Chen",
+                    index.fields.updated_at => 10i64,
+                ))
+                .unwrap();
+            writer
+                .add_document(doc!(
+                    index.fields.id => 1002i64,
+                    index.fields.id_prefix => "1002",
+                    index.fields.user_name => "bob",
+                    index.fields.user_name_prefix => "bob",
+                    index.fields.display_name_prefix => "Alice Builder",
+                    index.fields.updated_at => 20i64,
+                ))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let handle_hits = state
+            .search_users(
+                &UserSearchFilters {
+                    user_name_prefix: Some("@Ali".to_owned()),
+                    ..Default::default()
+                },
+                UserSearchSort::Relevance,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1001]
+        );
+
+        let display_hits = state
+            .search_users(
+                &UserSearchFilters {
+                    display_name_prefix: Some("Alice".to_owned()),
+                    ..Default::default()
+                },
+                UserSearchSort::UpdatedAt,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            display_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1002, 1001]
+        );
+
+        let q_hits = state
+            .search_users(
+                &UserSearchFilters {
+                    q: Some("100".to_owned()),
+                    ..Default::default()
+                },
+                UserSearchSort::Relevance,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            q_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1001, 1002]
+        );
+
+        let exact_hits = state
+            .search_users(
+                &UserSearchFilters {
+                    user_ids: vec![1002],
+                    ..Default::default()
+                },
+                UserSearchSort::Relevance,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            vec![1002]
+        );
+    }
+
     #[test]
     fn startup_backfill_decision_detects_count_mismatch() {
         assert!(!should_backfill_index(0, 0));
@@ -1032,7 +1580,9 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2001i64,
+                    index.fields.id_prefix => "2001",
                     index.fields.author_id => 9001i64,
+                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能 搜索",
                     index.fields.relation => "original",
                     index.fields.published_at => 20i64,
