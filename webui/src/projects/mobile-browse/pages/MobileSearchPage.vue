@@ -14,42 +14,78 @@
 
     <section v-if="searchPanelOpen" id="mobile-search-panel" class="search-panel">
       <form class="search-form" @submit.prevent="submitSearch">
-        <input
-          v-model="form.q"
-          type="search"
-          placeholder="Search saved posts"
-          enterkeyhint="search"
-        />
-        <input v-model="form.authorId" type="text" placeholder="Author ID" />
-        <div class="field-row">
-          <select v-model="form.sort">
-            <option value="relevance" :disabled="!hasQuery">Relevance</option>
-            <option value="publishedAt">Posted</option>
-            <option value="createdAt">Saved</option>
-            <option value="updatedAt">Updated</option>
-          </select>
-          <select v-model="form.relation">
-            <option value="all">All</option>
-            <option value="original">Original</option>
-            <option value="reply">Reply</option>
-            <option value="quote">Quote</option>
-            <option value="repost">Repost</option>
-          </select>
+        <div class="mode-tabs">
+          <button type="button" :class="{ active: searchKind === 'posts' }" @click="setSearchKind('posts')">
+            Posts
+          </button>
+          <button type="button" :class="{ active: searchKind === 'users' }" @click="setSearchKind('users')">
+            Users
+          </button>
         </div>
+
+        <template v-if="searchKind === 'posts'">
+          <input
+            v-model="postForm.q"
+            type="search"
+            placeholder="Post text"
+            enterkeyhint="search"
+          />
+          <input v-model="postForm.tweetIds" type="text" placeholder="Tweet IDs" />
+          <input v-model="postForm.authorIds" type="text" placeholder="Author IDs" />
+          <input v-model="postForm.authorUserNames" type="text" placeholder="Author usernames" />
+          <div class="field-row">
+            <select v-model="postForm.sort">
+              <option value="relevance" :disabled="!hasPostQuery">Relevance</option>
+              <option value="publishedAt">Posted</option>
+              <option value="createdAt">Saved</option>
+              <option value="updatedAt">Updated</option>
+            </select>
+            <select v-model="postForm.relation">
+              <option value="all">All</option>
+              <option value="original">Original</option>
+              <option value="reply">Reply</option>
+              <option value="quote">Quote</option>
+              <option value="repost">Repost</option>
+            </select>
+          </div>
+        </template>
+
+        <template v-else>
+          <input v-model="userForm.userIds" type="text" placeholder="User IDs" />
+          <input v-model="userForm.userNamePrefix" type="search" placeholder="Username prefix" />
+          <input v-model="userForm.displayNamePrefix" type="search" placeholder="Display name prefix" />
+        </template>
         <button type="submit" :disabled="loading">Search</button>
       </form>
     </section>
 
     <p v-if="error" class="status error">{{ error }}</p>
 
-    <section class="tweet-list">
-      <MobileTweetCard
-        v-for="item in items"
-        :key="item.id"
-        :tweet="item"
-        :time-field="cardTimeField"
-      />
-      <p v-if="!loading && searched && items.length === 0" class="status empty">No posts matched.</p>
+    <section class="result-list">
+      <template v-if="searchKind === 'posts'">
+        <MobileTweetCard
+          v-for="item in tweetItems"
+          :key="item.id"
+          :tweet="item"
+          :time-field="cardTimeField"
+        />
+      </template>
+      <template v-else>
+        <RouterLink
+          v-for="item in userItems"
+          :key="item.id"
+          class="user-result"
+          :to="`/mobile/browse/users/${item.id}`"
+        >
+          <img v-if="userAvatar(item)" :src="userAvatar(item)" alt="" />
+          <span v-else class="user-fallback">{{ userDisplayName(item).slice(0, 1).toUpperCase() }}</span>
+          <span class="user-copy">
+            <strong>{{ userDisplayName(item) }}</strong>
+            <small>{{ userHandle(item) }}</small>
+          </span>
+        </RouterLink>
+      </template>
+      <p v-if="!loading && searched && resultItems.length === 0" class="status empty">No results matched.</p>
     </section>
 
     <button v-if="nextCursor" class="load-more" type="button" :disabled="loading" @click="loadMore">
@@ -60,48 +96,61 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import {
   fetchV2TweetSearch,
-  fetchV2Tweets,
+  fetchV2UserSearch,
   type JsonRecord,
 } from '../../../shared/api'
+import { asRecord, optionalText, textValue } from '../../browse/browse-helpers'
 import MobileShell from '../components/MobileShell.vue'
 import MobileTweetCard from '../components/MobileTweetCard.vue'
 
 type TweetSort = 'relevance' | 'publishedAt' | 'createdAt' | 'updatedAt'
 type TweetTimeField = 'publishedAt' | 'createdAt' | 'updatedAt'
+type SearchKind = 'posts' | 'users'
 
-type SearchForm = {
+type PostSearchForm = {
   q: string
-  authorId: string
+  tweetIds: string
+  authorIds: string
+  authorUserNames: string
   relation: string
   sort: TweetSort
 }
 
-const include = 'author,stats,media,media-resources'
 const route = useRoute()
 const router = useRouter()
-const items = ref<JsonRecord[]>([])
+const resultItems = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
 const loading = ref(false)
 const error = ref('')
 const searched = ref(false)
 const searchPanelOpen = ref(true)
-const form = reactive<SearchForm>({
+const searchKind = ref<SearchKind>('posts')
+const postForm = reactive<PostSearchForm>({
   q: '',
-  authorId: '',
+  tweetIds: '',
+  authorIds: '',
+  authorUserNames: '',
   relation: 'all',
   sort: 'relevance',
 })
+const userForm = reactive({
+  userIds: '',
+  userNamePrefix: '',
+  displayNamePrefix: '',
+})
 
-const hasQuery = computed(() => form.q.trim() !== '')
+const tweetItems = computed(() => resultItems.value)
+const userItems = computed(() => resultItems.value)
+const hasPostQuery = computed(() => postForm.q.trim() !== '')
 const requestSort = computed<TweetSort>(() => {
-  if (!hasQuery.value && form.sort === 'relevance') {
+  if (!hasPostQuery.value && postForm.sort === 'relevance') {
     return 'publishedAt'
   }
-  return form.sort
+  return postForm.sort
 })
 const cardTimeField = computed<TweetTimeField>(() =>
   requestSort.value === 'relevance' ? 'publishedAt' : requestSort.value,
@@ -123,7 +172,7 @@ watch(
       searchPanelOpen.value = false
       await load(true)
     } else {
-      items.value = []
+      resultItems.value = []
       nextCursor.value = null
       searched.value = false
       searchPanelOpen.value = true
@@ -132,15 +181,15 @@ watch(
 )
 
 watch(
-  () => form.q,
+  () => postForm.q,
   (next, previous) => {
     const nextActive = next.trim() !== ''
     const previousActive = previous.trim() !== ''
     if (nextActive && !previousActive) {
-      form.sort = 'relevance'
+      postForm.sort = 'relevance'
     }
-    if (!nextActive && previousActive && form.sort === 'relevance') {
-      form.sort = 'publishedAt'
+    if (!nextActive && previousActive && postForm.sort === 'relevance') {
+      postForm.sort = 'publishedAt'
     }
   },
 )
@@ -163,27 +212,40 @@ function toggleSearchPanel() {
   searchPanelOpen.value = !searchPanelOpen.value
 }
 
+function setSearchKind(kind: SearchKind) {
+  if (searchKind.value === kind) {
+    return
+  }
+  searchKind.value = kind
+  resultItems.value = []
+  nextCursor.value = null
+}
+
 async function load(reset: boolean) {
   loading.value = true
   error.value = ''
   searched.value = true
   try {
-    const query = form.q.trim()
-    const params = {
-      authorId: form.authorId.trim() || undefined,
-      relation: form.relation,
-      sort: requestSort.value,
-      include,
-      cursor: reset ? undefined : nextCursor.value,
-      limit: 25,
-    }
-    const response = query
-      ? await fetchV2TweetSearch({
-          ...params,
-          q: query,
-        })
-      : await fetchV2Tweets(params)
-    items.value = reset ? response.data : [...items.value, ...response.data]
+    const response =
+      searchKind.value === 'posts'
+        ? await fetchV2TweetSearch({
+            q: trimmed(postForm.q) || undefined,
+            tweetIds: trimmed(postForm.tweetIds) || undefined,
+            authorIds: trimmed(postForm.authorIds) || undefined,
+            authorUserNames: trimmed(postForm.authorUserNames) || undefined,
+            relation: postForm.relation,
+            sort: requestSort.value,
+            cursor: reset ? undefined : nextCursor.value,
+            limit: 25,
+          })
+        : await fetchV2UserSearch({
+            userIds: trimmed(userForm.userIds) || undefined,
+            userNamePrefix: trimmed(userForm.userNamePrefix) || undefined,
+            displayNamePrefix: trimmed(userForm.displayNamePrefix) || undefined,
+            cursor: reset ? undefined : nextCursor.value,
+            limit: 25,
+          })
+    resultItems.value = reset ? response.data : [...resultItems.value, ...response.data]
     nextCursor.value = response.pagination.nextCursor
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to load search results'
@@ -193,43 +255,77 @@ async function load(reset: boolean) {
 }
 
 function syncFormFromRoute() {
-  form.q = queryText('q')
-  form.authorId = queryText('authorId')
-  form.relation = queryText('relation') || 'all'
-  form.sort = querySort(queryText('sort') || (form.q ? 'relevance' : 'publishedAt'))
+  searchKind.value = querySearchKind(queryText('type'))
+  postForm.q = queryText('q')
+  postForm.tweetIds = queryText('tweetIds')
+  postForm.authorIds = queryText('authorIds')
+  postForm.authorUserNames = queryText('authorUserNames')
+  postForm.relation = queryText('relation') || 'all'
+  postForm.sort = querySort(queryText('sort') || (postForm.q ? 'relevance' : 'publishedAt'))
+  userForm.userIds = queryText('userIds')
+  userForm.userNamePrefix = queryText('userNamePrefix')
+  userForm.displayNamePrefix = queryText('displayNamePrefix')
 }
 
 function queryFromForm(): Record<string, string> {
-  const query: Record<string, string> = {}
-  const q = form.q.trim()
-  const authorId = form.authorId.trim()
-  if (q) {
-    query.q = q
+  const query: Record<string, string> = { type: searchKind.value }
+  if (searchKind.value === 'users') {
+    addQuery(query, 'userIds', userForm.userIds)
+    addQuery(query, 'userNamePrefix', userForm.userNamePrefix)
+    addQuery(query, 'displayNamePrefix', userForm.displayNamePrefix)
+    return query
   }
-  if (authorId) {
-    query.authorId = authorId
+
+  addQuery(query, 'q', postForm.q)
+  addQuery(query, 'tweetIds', postForm.tweetIds)
+  addQuery(query, 'authorIds', postForm.authorIds)
+  addQuery(query, 'authorUserNames', postForm.authorUserNames)
+  if (postForm.relation !== 'all') {
+    query.relation = postForm.relation
   }
-  if (form.relation !== 'all') {
-    query.relation = form.relation
-  }
-  if (requestSort.value !== 'publishedAt' || q) {
+  if (requestSort.value !== 'publishedAt' || postForm.q.trim()) {
     query.sort = requestSort.value
   }
   return query
 }
 
 function hasActiveFilters(): boolean {
+  if (searchKind.value === 'users') {
+    return (
+      userForm.userIds.trim() !== '' ||
+      userForm.userNamePrefix.trim() !== '' ||
+      userForm.displayNamePrefix.trim() !== ''
+    )
+  }
+
   return (
-    form.q.trim() !== '' ||
-    form.authorId.trim() !== '' ||
-    form.relation !== 'all' ||
+    postForm.q.trim() !== '' ||
+    postForm.tweetIds.trim() !== '' ||
+    postForm.authorIds.trim() !== '' ||
+    postForm.authorUserNames.trim() !== '' ||
+    postForm.relation !== 'all' ||
     requestSort.value !== 'publishedAt'
   )
+}
+
+function addQuery(query: Record<string, string>, key: string, value: string) {
+  const normalized = value.trim()
+  if (normalized) {
+    query[key] = normalized
+  }
+}
+
+function trimmed(value: string): string {
+  return value.trim()
 }
 
 function queryText(key: string): string {
   const value = route.query[key]
   return typeof value === 'string' ? value : ''
+}
+
+function querySearchKind(value: string): SearchKind {
+  return value === 'users' ? 'users' : 'posts'
 }
 
 function querySort(value: string): TweetSort {
@@ -241,7 +337,27 @@ function querySort(value: string): TweetSort {
   ) {
     return value
   }
-  return hasQuery.value ? 'relevance' : 'publishedAt'
+  return hasPostQuery.value ? 'relevance' : 'publishedAt'
+}
+
+function userSnapshot(user: JsonRecord): JsonRecord {
+  return asRecord(user.latestSnapshot)
+}
+
+function userDisplayName(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  return textValue(snapshot.display_name ?? snapshot.displayName ?? snapshot.user_name ?? snapshot.userName ?? user.id)
+}
+
+function userHandle(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  const handle = optionalText(snapshot.user_name ?? snapshot.userName)
+  return handle ? `@${handle}` : textValue(user.id)
+}
+
+function userAvatar(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  return optionalText(snapshot.avatar_url ?? snapshot.avatarUrl)
 }
 </script>
 
@@ -271,6 +387,25 @@ function querySort(value: string): TweetSort {
 .search-form {
   display: grid;
   gap: 9px;
+}
+
+.mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.mode-tabs button {
+  min-height: 36px;
+  border: 1px solid #cfd9de;
+  background: #ffffff;
+  color: #0f1419;
+}
+
+.mode-tabs button.active {
+  border-color: #0f1419;
+  background: #0f1419;
+  color: #ffffff;
 }
 
 .field-row {
@@ -312,8 +447,60 @@ button:disabled {
   opacity: 0.55;
 }
 
-.tweet-list {
+.result-list {
   display: grid;
+}
+
+.user-result {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #eff3f4;
+  background: #ffffff;
+  text-decoration: none;
+}
+
+.user-result img,
+.user-fallback {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+}
+
+.user-result img {
+  object-fit: cover;
+}
+
+.user-fallback {
+  display: grid;
+  place-items: center;
+  background: #d8e0e8;
+  color: #536471;
+  font-weight: 800;
+}
+
+.user-copy {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+}
+
+.user-copy strong,
+.user-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-copy strong {
+  color: #0f1419;
+}
+
+.user-copy small {
+  color: #536471;
 }
 
 .load-more {

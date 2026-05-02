@@ -21,8 +21,30 @@
       <p v-if="error" class="error">{{ error }}</p>
 
       <section class="tweet-list">
-        <TweetCard v-for="item in items" :key="item.id" :tweet="item" :time-field="cardTimeField" />
-        <p v-if="!loading && items.length === 0" class="empty">No posts matched.</p>
+        <template v-if="searchKind === 'posts'">
+          <TweetCard
+            v-for="item in tweetItems"
+            :key="item.id"
+            :tweet="item"
+            :time-field="cardTimeField"
+          />
+        </template>
+        <template v-else>
+          <RouterLink
+            v-for="item in userItems"
+            :key="item.id"
+            class="user-result"
+            :to="`/browse/users/${item.id}`"
+          >
+            <img v-if="userAvatar(item)" :src="userAvatar(item)" alt="" />
+            <span v-else class="user-fallback">{{ userDisplayName(item).slice(0, 1).toUpperCase() }}</span>
+            <span class="user-copy">
+              <strong>{{ userDisplayName(item) }}</strong>
+              <small>{{ userHandle(item) }}</small>
+            </span>
+          </RouterLink>
+        </template>
+        <p v-if="!loading && searched && resultItems.length === 0" class="empty">No results matched.</p>
       </section>
 
       <button v-if="nextCursor" class="load-more" type="button" :disabled="loading" @click="loadMore">
@@ -32,28 +54,47 @@
 
     <aside class="side-panel">
       <form class="search-panel" @submit.prevent="reload">
-        <h1>Timeline</h1>
-        <p>Latest saved posts</p>
-        <input
-          v-model="q"
-          type="search"
-          placeholder="Text, Tweet ID, or author ID"
-          @input="handleQueryInput"
-        />
-        <input v-model="authorId" type="text" placeholder="Author ID" />
-        <select v-model="sort" @change="reload">
-          <option value="relevance" :disabled="!hasQuery">Relevance</option>
-          <option value="publishedAt">Posted</option>
-          <option value="createdAt">Saved</option>
-          <option value="updatedAt">Updated</option>
-        </select>
-        <select v-model="relation">
-          <option value="all">All relations</option>
-          <option value="original">Original</option>
-          <option value="reply">Reply</option>
-          <option value="quote">Quote</option>
-          <option value="repost">Repost</option>
-        </select>
+        <h1>Search</h1>
+        <p>Saved posts and authors</p>
+        <div class="mode-tabs">
+          <button type="button" :class="{ active: searchKind === 'posts' }" @click="setSearchKind('posts')">
+            Posts
+          </button>
+          <button type="button" :class="{ active: searchKind === 'users' }" @click="setSearchKind('users')">
+            Users
+          </button>
+        </div>
+
+        <template v-if="searchKind === 'posts'">
+          <input
+            v-model="postForm.q"
+            type="search"
+            placeholder="Post text"
+            @input="handleQueryInput"
+          />
+          <input v-model="postForm.tweetIds" type="text" placeholder="Tweet IDs" />
+          <input v-model="postForm.authorIds" type="text" placeholder="Author IDs" />
+          <input v-model="postForm.authorUserNames" type="text" placeholder="Author usernames" />
+          <select v-model="postForm.sort" @change="reload">
+            <option value="relevance" :disabled="!hasPostQuery">Relevance</option>
+            <option value="publishedAt">Posted</option>
+            <option value="createdAt">Saved</option>
+            <option value="updatedAt">Updated</option>
+          </select>
+          <select v-model="postForm.relation">
+            <option value="all">All relations</option>
+            <option value="original">Original</option>
+            <option value="reply">Reply</option>
+            <option value="quote">Quote</option>
+            <option value="repost">Repost</option>
+          </select>
+        </template>
+
+        <template v-else>
+          <input v-model="userForm.userIds" type="text" placeholder="User IDs" />
+          <input v-model="userForm.userNamePrefix" type="search" placeholder="Username prefix" />
+          <input v-model="userForm.displayNamePrefix" type="search" placeholder="Display name prefix" />
+        </template>
         <div class="panel-actions">
           <button type="submit" :disabled="loading">Search</button>
           <button type="button" :disabled="loading" @click="reload">Refresh</button>
@@ -69,9 +110,9 @@
           </div>
           <div>
             <dt>Loaded</dt>
-            <dd>{{ countValue(items.length) }}</dd>
+            <dd>{{ countValue(resultItems.length) }}</dd>
           </div>
-          <div>
+          <div v-if="searchKind === 'posts'">
             <dt>Sort</dt>
             <dd>{{ sortLabel }}</dd>
           </div>
@@ -82,26 +123,43 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 
-import { fetchV2Me, fetchV2TweetSearch, fetchV2Tweets, type JsonRecord } from '../../../shared/api'
-import { countValue } from '../browse-helpers'
+import {
+  fetchV2Me,
+  fetchV2TweetSearch,
+  fetchV2UserSearch,
+  type JsonRecord,
+} from '../../../shared/api'
+import { asRecord, countValue, optionalText, textValue } from '../browse-helpers'
 import TweetCard from '../components/TweetCard.vue'
 
 type TweetSort = 'relevance' | 'publishedAt' | 'createdAt' | 'updatedAt'
 type TweetTimeField = 'publishedAt' | 'createdAt' | 'updatedAt'
+type SearchKind = 'posts' | 'users'
 
-const include = 'author,stats,media,media-resources'
-const items = ref<JsonRecord[]>([])
+const resultItems = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
-const q = ref('')
-const authorId = ref('')
-const relation = ref('all')
-const sort = ref<TweetSort>('publishedAt')
+const searchKind = ref<SearchKind>('posts')
 const queryWasActive = ref(false)
 const loading = ref(false)
 const error = ref('')
 const isAdmin = ref(false)
+const searched = ref(false)
+const postForm = reactive({
+  q: '',
+  tweetIds: '',
+  authorIds: '',
+  authorUserNames: '',
+  relation: 'all',
+  sort: 'publishedAt' as TweetSort,
+})
+const userForm = reactive({
+  userIds: '',
+  userNamePrefix: '',
+  displayNamePrefix: '',
+})
 
 const sortLabels: Record<TweetSort, string> = {
   relevance: 'Relevance',
@@ -109,17 +167,19 @@ const sortLabels: Record<TweetSort, string> = {
   createdAt: 'Saved',
   updatedAt: 'Updated',
 }
-const hasQuery = computed(() => q.value.trim() !== '')
-const sortLabel = computed(() => sortLabels[sort.value])
-const modeLabel = computed(() => (hasQuery.value ? 'Search' : 'Timeline'))
+const tweetItems = computed(() => resultItems.value)
+const userItems = computed(() => resultItems.value)
+const hasPostQuery = computed(() => postForm.q.trim() !== '')
+const sortLabel = computed(() => sortLabels[requestSort.value])
+const modeLabel = computed(() => (searchKind.value === 'posts' ? 'Posts' : 'Users'))
 const modeDescription = computed(() =>
-  hasQuery.value ? 'Full-text saved post search' : 'Latest saved posts',
+  searchKind.value === 'posts' ? 'Post text and author filters' : 'Author lookup',
 )
 const requestSort = computed<TweetSort>(() => {
-  if (!hasQuery.value && sort.value === 'relevance') {
+  if (!hasPostQuery.value && postForm.sort === 'relevance') {
     return 'publishedAt'
   }
-  return sort.value
+  return postForm.sort
 })
 const cardTimeField = computed<TweetTimeField>(() =>
   requestSort.value === 'relevance' ? 'publishedAt' : requestSort.value,
@@ -141,23 +201,28 @@ async function loadMore() {
 async function load(reset: boolean) {
   loading.value = true
   error.value = ''
+  searched.value = true
   try {
-    const query = q.value.trim()
-    const params = {
-      authorId: authorId.value.trim() || undefined,
-      relation: relation.value,
-      sort: requestSort.value,
-      include,
-      cursor: reset ? undefined : nextCursor.value,
-      limit: 30,
-    }
-    const response = query
-      ? await fetchV2TweetSearch({
-          ...params,
-          q: query,
-        })
-      : await fetchV2Tweets(params)
-    items.value = reset ? response.data : [...items.value, ...response.data]
+    const response =
+      searchKind.value === 'posts'
+        ? await fetchV2TweetSearch({
+            q: trimmed(postForm.q) || undefined,
+            tweetIds: trimmed(postForm.tweetIds) || undefined,
+            authorIds: trimmed(postForm.authorIds) || undefined,
+            authorUserNames: trimmed(postForm.authorUserNames) || undefined,
+            relation: postForm.relation,
+            sort: requestSort.value,
+            cursor: reset ? undefined : nextCursor.value,
+            limit: 30,
+          })
+        : await fetchV2UserSearch({
+            userIds: trimmed(userForm.userIds) || undefined,
+            userNamePrefix: trimmed(userForm.userNamePrefix) || undefined,
+            displayNamePrefix: trimmed(userForm.displayNamePrefix) || undefined,
+            cursor: reset ? undefined : nextCursor.value,
+            limit: 30,
+          })
+    resultItems.value = reset ? response.data : [...resultItems.value, ...response.data]
     nextCursor.value = response.pagination.nextCursor
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to load timeline'
@@ -167,14 +232,47 @@ async function load(reset: boolean) {
 }
 
 function handleQueryInput() {
-  const nextActive = q.value.trim() !== ''
+  const nextActive = postForm.q.trim() !== ''
   if (nextActive && !queryWasActive.value) {
-    sort.value = 'relevance'
+    postForm.sort = 'relevance'
   }
-  if (!nextActive && queryWasActive.value) {
-    sort.value = 'publishedAt'
+  if (!nextActive && queryWasActive.value && postForm.sort === 'relevance') {
+    postForm.sort = 'publishedAt'
   }
   queryWasActive.value = nextActive
+}
+
+function setSearchKind(kind: SearchKind) {
+  if (searchKind.value === kind) {
+    return
+  }
+  searchKind.value = kind
+  resultItems.value = []
+  nextCursor.value = null
+}
+
+function trimmed(value: string): string {
+  return value.trim()
+}
+
+function userSnapshot(user: JsonRecord): JsonRecord {
+  return asRecord(user.latestSnapshot)
+}
+
+function userDisplayName(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  return textValue(snapshot.display_name ?? snapshot.displayName ?? snapshot.user_name ?? snapshot.userName ?? user.id)
+}
+
+function userHandle(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  const handle = optionalText(snapshot.user_name ?? snapshot.userName)
+  return handle ? `@${handle}` : textValue(user.id)
+}
+
+function userAvatar(user: JsonRecord): string {
+  const snapshot = userSnapshot(user)
+  return optionalText(snapshot.avatar_url ?? snapshot.avatarUrl)
 }
 
 async function loadSession() {
@@ -301,8 +399,82 @@ button:disabled {
   background: #fff;
 }
 
+.mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.mode-tabs button {
+  min-height: 34px;
+  border-radius: 999px;
+  font-weight: 750;
+}
+
+.mode-tabs button.active {
+  border-color: #172033;
+  background: #172033;
+  color: #fff;
+}
+
 .tweet-list {
   display: grid;
+}
+
+.user-result {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #e1e6ee;
+  background: #fff;
+  text-decoration: none;
+}
+
+.user-result:hover {
+  background: #f8fafc;
+}
+
+.user-result img,
+.user-fallback {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+}
+
+.user-result img {
+  object-fit: cover;
+}
+
+.user-fallback {
+  display: grid;
+  place-items: center;
+  background: #dfe6ef;
+  color: #334155;
+  font-weight: 800;
+}
+
+.user-copy {
+  min-width: 0;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+}
+
+.user-copy strong,
+.user-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-copy strong {
+  color: #161a22;
+}
+
+.user-copy small {
+  color: #647084;
 }
 
 .error,

@@ -29,7 +29,6 @@ import { fetchV2Tweets, type JsonRecord } from '../../../shared/api'
 import MobileShell from '../components/MobileShell.vue'
 import MobileTweetCard from '../components/MobileTweetCard.vue'
 
-const include = 'author,stats,media,media-resources'
 const items = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
 const loading = ref(false)
@@ -52,7 +51,6 @@ async function load(reset: boolean) {
     const response = await fetchV2Tweets({
       relation: 'all',
       sort: 'publishedAt',
-      include,
       cursor: reset ? undefined : nextCursor.value,
       limit: 25,
     })

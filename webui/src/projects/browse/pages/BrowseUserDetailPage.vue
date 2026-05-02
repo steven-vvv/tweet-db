@@ -84,7 +84,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
-import { fetchV2Tweets, fetchV2TwitterUser, type JsonRecord } from '../../../shared/api'
+import { fetchV2TwitterUser, fetchV2TwitterUserTweets, type JsonRecord } from '../../../shared/api'
 import {
   asRecord,
   countValue,
@@ -145,10 +145,8 @@ async function loadMoreTweets() {
 async function loadTweets(reset: boolean) {
   loadingTweets.value = true
   try {
-    const response = await fetchV2Tweets({
-      authorId: String(route.params.userId),
+    const response = await fetchV2TwitterUserTweets(String(route.params.userId), {
       relation: 'all',
-      include: 'author,stats,media,media-resources',
       cursor: reset ? undefined : nextCursor.value,
       limit: 20,
     })

@@ -192,7 +192,6 @@ export function fetchV2Tweets(params?: {
   authorId?: string
   relation?: string
   sort?: string
-  include?: string
   cursor?: string | null
   limit?: number
 }) {
@@ -203,16 +202,47 @@ export function fetchV2Tweets(params?: {
 
 export function fetchV2TweetSearch(params?: {
   q?: string
-  authorId?: string
+  tweetIds?: string
+  authorIds?: string
+  authorUserNames?: string
   relation?: string
   sort?: string
-  include?: string
   cursor?: string | null
   limit?: number
 }) {
   return request<V2ListResponse>(withQuery('/internal/v2/search/tweets', params), {
     method: 'GET',
   })
+}
+
+export function fetchV2UserSearch(params?: {
+  userIds?: string
+  userNamePrefix?: string
+  displayNamePrefix?: string
+  cursor?: string | null
+  limit?: number
+}) {
+  return request<V2ListResponse>(withQuery('/internal/v2/search/users', params), {
+    method: 'GET',
+  })
+}
+
+export function fetchV2TwitterUserTweets(
+  userId: string,
+  params?: {
+    q?: string
+    relation?: string
+    sort?: string
+    cursor?: string | null
+    limit?: number
+  },
+) {
+  return request<V2ListResponse>(
+    withQuery(`/internal/v2/twitter-users/${encodeURIComponent(userId)}/tweets`, params),
+    {
+      method: 'GET',
+    },
+  )
 }
 
 export function fetchV2Tweet(tweetId: string, params?: { include?: string }) {
