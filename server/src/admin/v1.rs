@@ -37,6 +37,7 @@ pub struct UserListQuery {
     #[serde(flatten)]
     pub list: ListQuery,
     pub status: Option<String>,
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -86,9 +87,15 @@ struct UserCursor {
     v: u8,
     q: Option<String>,
     status: String,
+    #[serde(default = "default_user_role")]
+    role: String,
     #[serde(with = "cursor_datetime")]
     created_at: OffsetDateTime,
     id: Uuid,
+}
+
+fn default_user_role() -> String {
+    "all".to_owned()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -174,6 +181,7 @@ pub async fn list_users(
     let limit = resolve_limit(query.list.limit);
     let q = normalize_query(query.list.q.as_deref());
     let status = normalize_user_status(query.status.as_deref())?;
+    let role = normalize_user_role(query.role.as_deref())?;
     let cursor = decode_cursor::<UserCursor>(query.list.cursor.as_deref())?;
 
     if let Some(cursor) = cursor.as_ref() {
@@ -188,18 +196,24 @@ pub async fn list_users(
             Some(status.as_str()),
             "cursor does not match status filter",
         )?;
+        ensure_filter_match(
+            Some(cursor.role.as_str()),
+            Some(role.as_str()),
+            "cursor does not match role filter",
+        )?;
     }
 
     let search = like_pattern(q.as_deref());
     let use_cursor = cursor.is_some();
     let rows = sqlx::query(
         r#"
-        SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
+        SELECT id, username::text AS username, is_admin, disabled_at, disabled_by_user_id, created_at, updated_at
         FROM iam.users
         WHERE (
                 $1::text = 'all'
             OR ($1 = 'active' AND disabled_at IS NULL)
-            OR ($1 = 'disabled' AND disabled_at IS NOT NULL)
+            OR ($1 = 'pending' AND disabled_at IS NOT NULL AND disabled_by_user_id IS NULL)
+            OR ($1 = 'disabled' AND disabled_at IS NOT NULL AND disabled_by_user_id IS NOT NULL)
         )
           AND (
                 $2::text IS NULL
@@ -207,15 +221,21 @@ pub async fn list_users(
             OR id::text ILIKE $2
           )
           AND (
-                NOT $3
-            OR (created_at, id) < ($4, $5)
+                $3::text = 'all'
+            OR ($3 = 'admin' AND is_admin)
+            OR ($3 = 'user' AND NOT is_admin)
+          )
+          AND (
+                NOT $4
+            OR (created_at, id) < ($5, $6)
           )
         ORDER BY created_at DESC, id DESC
-        LIMIT $6
+        LIMIT $7
         "#,
     )
     .bind(&status)
     .bind(search.as_deref())
+    .bind(&role)
     .bind(use_cursor)
     .bind(cursor.as_ref().map(|item| item.created_at))
     .bind(cursor.as_ref().map(|item| item.id))
@@ -226,6 +246,7 @@ pub async fn list_users(
     let (items, next_cursor) = paginate_rows(rows, limit, |row| {
         let created_at: OffsetDateTime = row.get("created_at");
         let disabled_at: Option<OffsetDateTime> = row.get("disabled_at");
+        let disabled_by_user_id: Option<Uuid> = row.get("disabled_by_user_id");
         let id: Uuid = row.get("id");
         (
             json!({
@@ -234,6 +255,8 @@ pub async fn list_users(
                 "isAdmin": row.get::<bool, _>("is_admin"),
                 "disabled": disabled_at.is_some(),
                 "disabledAt": format_time_opt(disabled_at),
+                "disabledByUserId": disabled_by_user_id,
+                "activationRequired": disabled_at.is_some() && disabled_by_user_id.is_none(),
                 "createdAt": format_time(created_at),
                 "updatedAt": format_time(row.get("updated_at")),
             }),
@@ -241,6 +264,7 @@ pub async fn list_users(
                 v: CURSOR_VERSION,
                 q: q.clone(),
                 status: status.clone(),
+                role: role.clone(),
                 created_at,
                 id,
             },
@@ -308,6 +332,7 @@ pub async fn get_user(
 
     let row = row.ok_or_else(|| AppError::not_found("user not found"))?;
     let disabled_at: Option<OffsetDateTime> = row.get("disabled_at");
+    let disabled_by_user_id: Option<Uuid> = row.get("disabled_by_user_id");
 
     Ok(Json(detail_response(
         json!({
@@ -316,7 +341,8 @@ pub async fn get_user(
             "isAdmin": row.get::<bool, _>("is_admin"),
             "disabled": disabled_at.is_some(),
             "disabledAt": format_time_opt(disabled_at),
-            "disabledByUserId": row.get::<Option<Uuid>, _>("disabled_by_user_id"),
+            "disabledByUserId": disabled_by_user_id,
+            "activationRequired": disabled_at.is_some() && disabled_by_user_id.is_none(),
             "createdAt": format_time(row.get("created_at")),
             "updatedAt": format_time(row.get("updated_at")),
         }),
@@ -344,7 +370,7 @@ pub async fn disable_user(
     let mut tx = state.db.begin().await?;
     let existing = sqlx::query(
         r#"
-        SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
+        SELECT id, username::text AS username, is_admin, disabled_at, disabled_by_user_id, created_at, updated_at
         FROM iam.users
         WHERE id = $1
         FOR UPDATE
@@ -1993,7 +2019,7 @@ async fn fetch_user_summary_json_tx(
 ) -> AppResult<Value> {
     let row = sqlx::query(
         r#"
-        SELECT id, username::text AS username, is_admin, disabled_at, created_at, updated_at
+        SELECT id, username::text AS username, is_admin, disabled_at, disabled_by_user_id, created_at, updated_at
         FROM iam.users
         WHERE id = $1
         "#,
@@ -2002,6 +2028,7 @@ async fn fetch_user_summary_json_tx(
     .fetch_one(&mut **tx)
     .await?;
     let disabled_at: Option<OffsetDateTime> = row.get("disabled_at");
+    let disabled_by_user_id: Option<Uuid> = row.get("disabled_by_user_id");
 
     Ok(json!({
         "id": row.get::<Uuid, _>("id"),
@@ -2009,6 +2036,8 @@ async fn fetch_user_summary_json_tx(
         "isAdmin": row.get::<bool, _>("is_admin"),
         "disabled": disabled_at.is_some(),
         "disabledAt": format_time_opt(disabled_at),
+        "disabledByUserId": disabled_by_user_id,
+        "activationRequired": disabled_at.is_some() && disabled_by_user_id.is_none(),
         "createdAt": format_time(row.get("created_at")),
         "updatedAt": format_time(row.get("updated_at")),
     }))

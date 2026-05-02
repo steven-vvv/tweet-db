@@ -12,7 +12,7 @@
         :disabled="submitting"
         @click="toggleState"
       >
-        {{ summary.disabled ? 'Enable account' : 'Disable account' }}
+        {{ accountActionLabel }}
       </button>
     </header>
 
@@ -25,8 +25,8 @@
       </div>
       <div>
         <span>Status</span>
-        <strong class="badge" :class="statusTone(summary.disabled ? 'disabled' : 'active')">
-          {{ summary.disabled ? 'Disabled' : 'Active' }}
+        <strong class="badge" :class="statusTone(accountStatus(summary))">
+          {{ accountStatusLabel(summary) }}
         </strong>
       </div>
       <div>
@@ -68,7 +68,13 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 
-import { asArray, asRecord, statusTone } from '../../shared/admin-helpers'
+import {
+  accountStatus,
+  accountStatusLabel,
+  asArray,
+  asRecord,
+  statusTone,
+} from '../../shared/admin-helpers'
 import { disableAdminUser, enableAdminUser, fetchAdminUser, type DetailResponse } from '../../shared/api'
 import JsonPanel from './JsonPanel.vue'
 
@@ -81,6 +87,13 @@ const summary = computed(() => asRecord(detail.value.summary))
 const related = computed(() => asRecord(detail.value.related))
 const sessions = computed(() => asArray(related.value.sessions))
 const authorizations = computed(() => asArray(related.value.authorizations))
+const accountActionLabel = computed(() =>
+  summary.value.activationRequired
+    ? 'Activate account'
+    : summary.value.disabled
+      ? 'Enable account'
+      : 'Disable account',
+)
 
 onMounted(load)
 

@@ -75,3 +75,21 @@ export function statusTone(value: unknown): string {
       return 'neutral'
   }
 }
+
+export function accountStatus(item: JsonRecord): string {
+  if (item.activationRequired) {
+    return 'pending'
+  }
+  return item.disabled ? 'disabled' : 'active'
+}
+
+export function accountStatusLabel(item: JsonRecord): string {
+  switch (accountStatus(item)) {
+    case 'pending':
+      return 'Pending activation'
+    case 'disabled':
+      return 'Disabled'
+    default:
+      return 'Active'
+  }
+}

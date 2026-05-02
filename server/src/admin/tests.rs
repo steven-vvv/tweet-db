@@ -10,6 +10,7 @@ fn round_trips_cursor_payload() {
         v: CURSOR_VERSION,
         q: Some("demo".to_owned()),
         status: "active".to_owned(),
+        role: "all".to_owned(),
         created_at: OffsetDateTime::now_utc(),
         id: Uuid::now_v7(),
     };
@@ -38,6 +39,7 @@ fn accepts_legacy_cursor_datetime_payload() {
         .unwrap()
         .unwrap();
     assert_eq!(decoded.status, "active");
+    assert_eq!(decoded.role, "all");
     assert_eq!(
         decoded.created_at,
         time::macros::datetime!(2026-04-03 09:29:21.628560142 UTC)
@@ -55,6 +57,17 @@ fn rejects_unknown_user_status_filter() {
     let error = normalize_user_status(Some("paused")).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "status must be one of all, active, disabled"
+        "status must be one of all, active, pending, disabled"
     );
+}
+
+#[test]
+fn accepts_pending_user_status_filter() {
+    assert_eq!(normalize_user_status(Some("pending")).unwrap(), "pending");
+}
+
+#[test]
+fn rejects_unknown_user_role_filter() {
+    let error = normalize_user_role(Some("owner")).unwrap_err();
+    assert_eq!(error.to_string(), "role must be one of all, admin, user");
 }

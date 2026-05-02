@@ -51,9 +51,19 @@ pub(super) fn lowercase_prefix_pattern(value: Option<&str>) -> Option<String> {
 pub(super) fn normalize_user_status(raw: Option<&str>) -> AppResult<String> {
     let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
     match value.as_str() {
-        "all" | "active" | "disabled" => Ok(value),
+        "all" | "active" | "pending" | "disabled" => Ok(value),
         _ => Err(AppError::bad_request(
-            "status must be one of all, active, disabled",
+            "status must be one of all, active, pending, disabled",
+        )),
+    }
+}
+
+pub(super) fn normalize_user_role(raw: Option<&str>) -> AppResult<String> {
+    let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
+    match value.as_str() {
+        "all" | "admin" | "user" => Ok(value),
+        _ => Err(AppError::bad_request(
+            "role must be one of all, admin, user",
         )),
     }
 }

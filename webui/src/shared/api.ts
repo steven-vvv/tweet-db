@@ -124,6 +124,7 @@ export function logout() {
 export function fetchAdminUsers(params?: {
   q?: string
   status?: string
+  role?: string
   cursor?: string | null
   limit?: number
 }) {

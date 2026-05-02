@@ -12,7 +12,13 @@
       <select v-model="status">
         <option value="all">All statuses</option>
         <option value="active">Active</option>
+        <option value="pending">Pending activation</option>
         <option value="disabled">Disabled</option>
+      </select>
+      <select v-model="role">
+        <option value="all">All roles</option>
+        <option value="admin">Admin</option>
+        <option value="user">User</option>
       </select>
       <button type="submit" class="primary" :disabled="loading">Search</button>
     </form>
@@ -33,8 +39,8 @@
         class="table-row cols"
       >
         <strong>{{ item.username }}</strong>
-        <span class="badge" :class="statusTone(item.disabled ? 'disabled' : 'active')">
-          {{ item.disabled ? 'Disabled' : 'Active' }}
+        <span class="badge" :class="statusTone(accountStatus(item))">
+          {{ accountStatusLabel(item) }}
         </span>
         <span>{{ item.isAdmin ? 'Admin' : 'User' }}</span>
         <span class="muted">{{ item.createdAt }}</span>
@@ -52,13 +58,14 @@
 import { onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
-import { statusTone } from '../../shared/admin-helpers'
+import { accountStatus, accountStatusLabel, statusTone } from '../../shared/admin-helpers'
 import { fetchAdminUsers, type JsonRecord } from '../../shared/api'
 
 const items = ref<JsonRecord[]>([])
 const nextCursor = ref<string | null>(null)
 const q = ref('')
 const status = ref('all')
+const role = ref('all')
 const loading = ref(false)
 const error = ref('')
 
@@ -79,6 +86,7 @@ async function load(reset: boolean) {
     const response = await fetchAdminUsers({
       q: q.value.trim() || undefined,
       status: status.value,
+      role: role.value,
       cursor: reset ? undefined : nextCursor.value,
     })
     items.value = reset ? response.items : [...items.value, ...response.items]
