@@ -1,6 +1,18 @@
 <template>
   <MobileShell title="Search">
-    <section class="search-panel">
+    <template #action>
+      <button
+        class="top-action-button"
+        type="button"
+        :aria-expanded="searchPanelOpen"
+        aria-controls="mobile-search-panel"
+        @click="toggleSearchPanel"
+      >
+        {{ searchPanelOpen ? 'Hide' : 'Search' }}
+      </button>
+    </template>
+
+    <section v-if="searchPanelOpen" id="mobile-search-panel" class="search-panel">
       <form class="search-form" @submit.prevent="submitSearch">
         <input
           v-model="form.q"
@@ -76,6 +88,7 @@ const nextCursor = ref<string | null>(null)
 const loading = ref(false)
 const error = ref('')
 const searched = ref(false)
+const searchPanelOpen = ref(true)
 const form = reactive<SearchForm>({
   q: '',
   authorId: '',
@@ -97,6 +110,7 @@ const cardTimeField = computed<TweetTimeField>(() =>
 onMounted(async () => {
   syncFormFromRoute()
   if (hasActiveFilters()) {
+    searchPanelOpen.value = false
     await load(true)
   }
 })
@@ -106,11 +120,13 @@ watch(
   async () => {
     syncFormFromRoute()
     if (hasActiveFilters()) {
+      searchPanelOpen.value = false
       await load(true)
     } else {
       items.value = []
       nextCursor.value = null
       searched.value = false
+      searchPanelOpen.value = true
     }
   },
 )
@@ -134,10 +150,17 @@ async function submitSearch() {
     path: '/mobile/browse/search',
     query: queryFromForm(),
   })
+  if (hasActiveFilters()) {
+    searchPanelOpen.value = false
+  }
 }
 
 async function loadMore() {
   await load(false)
+}
+
+function toggleSearchPanel() {
+  searchPanelOpen.value = !searchPanelOpen.value
 }
 
 async function load(reset: boolean) {
@@ -231,6 +254,18 @@ function querySort(value: string): TweetSort {
   border-bottom: 1px solid #eff3f4;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(14px);
+}
+
+.top-action-button {
+  min-height: 34px;
+  border: 1px solid #cfd9de;
+  border-radius: 999px;
+  padding: 0 13px;
+  background: #ffffff;
+  color: #0f1419;
+  font-size: 0.86rem;
+  font-weight: 750;
+  cursor: pointer;
 }
 
 .search-form {
