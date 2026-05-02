@@ -84,6 +84,9 @@ pub fn require_registered_session(
     if session.record.registration_state != "active" {
         return Err(AppError::unauthorized("registration must be completed"));
     }
+    if session.record.user_disabled_at.is_some() {
+        return Err(AppError::forbidden("account is disabled"));
+    }
     Ok(session)
 }
 
@@ -141,11 +144,6 @@ async fn resolve_request_session(
     );
 
     if session.verifier_hash != expected {
-        return Ok(CookieAction::Clear);
-    }
-
-    if session.user_disabled_at.is_some() {
-        db::delete_session(&state.db, selector).await?;
         return Ok(CookieAction::Clear);
     }
 

@@ -19,6 +19,7 @@ pub struct SessionRecord {
     pub username: Option<String>,
     pub user_is_admin: bool,
     pub user_disabled_at: Option<OffsetDateTime>,
+    pub user_disabled_by_user_id: Option<Uuid>,
     pub sso_subject_id: Uuid,
     pub authorization_id: Uuid,
     pub registration_state: String,
@@ -250,6 +251,7 @@ pub async fn find_session(pool: &PgPool, selector: Uuid) -> AppResult<Option<Ses
             u.username::text AS username,
             COALESCE(u.is_admin, FALSE) AS user_is_admin,
             u.disabled_at AS user_disabled_at,
+            u.disabled_by_user_id AS user_disabled_by_user_id,
             s.sso_subject_id,
             s.authorization_id,
             s.registration_state,
@@ -276,6 +278,7 @@ pub async fn find_session(pool: &PgPool, selector: Uuid) -> AppResult<Option<Ses
         username: row.get("username"),
         user_is_admin: row.get("user_is_admin"),
         user_disabled_at: row.get("user_disabled_at"),
+        user_disabled_by_user_id: row.get("user_disabled_by_user_id"),
         sso_subject_id: row.get("sso_subject_id"),
         authorization_id: row.get("authorization_id"),
         registration_state: row.get("registration_state"),
@@ -458,8 +461,8 @@ pub async fn bind_username_to_subject(
 
     let user_insert = sqlx::query(
         r#"
-        INSERT INTO iam.users (id, username, created_at, updated_at)
-        VALUES ($1, $2, $3, $3)
+        INSERT INTO iam.users (id, username, disabled_at, created_at, updated_at)
+        VALUES ($1, $2, $3, $3, $3)
         "#,
     )
     .bind(user_id)
@@ -526,6 +529,7 @@ pub async fn bind_username_to_subject(
         serde_json::json!({
             "username": username,
             "sso_subject_id": sso_subject_id,
+            "activation_required": true,
         }),
     )
     .await?;

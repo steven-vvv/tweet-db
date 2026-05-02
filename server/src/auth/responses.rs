@@ -55,23 +55,31 @@ pub(super) fn build_internal_session_me_response(
             registered: false,
             is_admin: false,
             disabled: false,
+            activation_required: false,
             user_id: None,
             username: None,
             subject_id: None,
             authorization_id: None,
+            disabled_at: None,
+            disabled_by_user_id: None,
             expires_at: None,
         };
     };
+
+    let disabled = session.record.user_disabled_at.is_some();
 
     InternalSessionMeResponse {
         authenticated: true,
         registered: session.record.registration_state == "active",
         is_admin: session.record.user_is_admin,
-        disabled: session.record.user_disabled_at.is_some(),
+        disabled,
+        activation_required: disabled && session.record.user_disabled_by_user_id.is_none(),
         user_id: session.record.user_id,
         username: session.record.username.clone(),
         subject_id: Some(session.record.sso_subject_id),
         authorization_id: Some(session.record.authorization_id),
+        disabled_at: session.record.user_disabled_at,
+        disabled_by_user_id: session.record.user_disabled_by_user_id,
         expires_at: Some(session.record.expires_at),
     }
 }

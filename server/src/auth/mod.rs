@@ -45,10 +45,14 @@ pub struct InternalSessionMeResponse {
     pub registered: bool,
     pub is_admin: bool,
     pub disabled: bool,
+    pub activation_required: bool,
     pub user_id: Option<Uuid>,
     pub username: Option<String>,
     pub subject_id: Option<Uuid>,
     pub authorization_id: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub disabled_at: Option<OffsetDateTime>,
+    pub disabled_by_user_id: Option<Uuid>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
 }
@@ -130,6 +134,7 @@ mod tests {
             username: username.map(ToOwned::to_owned),
             user_is_admin: false,
             user_disabled_at: None,
+            user_disabled_by_user_id: None,
             sso_subject_id: Uuid::now_v7(),
             authorization_id: Uuid::now_v7(),
             registration_state: registration_state.to_owned(),
@@ -188,6 +193,16 @@ mod tests {
     }
 
     #[test]
+    fn require_registered_session_rejects_disabled_user() {
+        let mut record = sample_session("active", Some("demo_user"));
+        record.user_disabled_at = Some(OffsetDateTime::now_utc());
+        let session = ActiveSession { record };
+        let error = require_registered_session(Some(Extension(session))).unwrap_err();
+        assert!(matches!(error, AppError::Forbidden(_)));
+        assert_eq!(error.to_string(), "account is disabled");
+    }
+
+    #[test]
     fn require_admin_session_rejects_non_admin_user() {
         let session = ActiveSession {
             record: sample_session("active", Some("demo_user")),
@@ -207,6 +222,18 @@ mod tests {
         assert!(response.registered);
         assert!(response.is_admin);
         assert!(!response.disabled);
+    }
+
+    #[test]
+    fn internal_session_marks_activation_required() {
+        let mut record = sample_session("active", Some("demo_user"));
+        record.user_disabled_at = Some(OffsetDateTime::now_utc());
+        let response =
+            build_internal_session_me_response(Some(Extension(ActiveSession { record })));
+        assert!(response.authenticated);
+        assert!(response.registered);
+        assert!(response.disabled);
+        assert!(response.activation_required);
     }
 
     #[test]

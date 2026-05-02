@@ -45,6 +45,26 @@
         </button>
       </form>
     </section>
+    <section v-else-if="!loading && session?.activation_required" class="stack">
+      <div class="panel attention">
+        <div class="row">
+          <span>Status</span>
+          <strong>Pending administrator activation</strong>
+        </div>
+        <div class="row">
+          <span>Username</span>
+          <strong>{{ session.username ?? '-' }}</strong>
+        </div>
+        <div class="row mono">
+          <span>Requested At</span>
+          <strong>{{ session.disabled_at ?? '-' }}</strong>
+        </div>
+      </div>
+      <p class="hint">
+        Registration is complete. An administrator needs to activate this account before browse and
+        API access are available.
+      </p>
+    </section>
     <div v-else-if="session" class="panel">
       <div class="row">
         <span>Status</span>
@@ -57,6 +77,10 @@
       <div class="row">
         <span>Registered</span>
         <strong>{{ session.registered ? 'Yes' : 'Pending' }}</strong>
+      </div>
+      <div class="row">
+        <span>Account state</span>
+        <strong>{{ session.disabled ? 'Disabled' : 'Active' }}</strong>
       </div>
       <div class="row mono">
         <span>Expires At</span>
@@ -189,6 +213,11 @@ function readCallbackError() {
   border: 1px solid #dbe2ea;
   border-radius: 18px;
   background: #f8fafc;
+}
+
+.attention {
+  border-color: #f1d08a;
+  background: #fffaf0;
 }
 
 input {

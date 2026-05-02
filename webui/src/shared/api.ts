@@ -13,10 +13,13 @@ export type InternalSessionResponse = {
   registered: boolean
   is_admin: boolean
   disabled: boolean
+  activation_required: boolean
   user_id: string | null
   username: string | null
   subject_id: string | null
   authorization_id: string | null
+  disabled_at: string | null
+  disabled_by_user_id: string | null
   expires_at: string | null
 }
 
