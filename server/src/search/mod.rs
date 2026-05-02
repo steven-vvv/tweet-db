@@ -9,12 +9,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tantivy::{
     Index, IndexReader, IndexWriter, Order, TantivyDocument, Term, doc,
-    query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, QueryParser, TermQuery},
     schema::{
-        Field, IndexRecordOption, NumericOptions, STORED, Schema, TextFieldIndexing, TextOptions,
-        Value,
+        Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing, TextOptions, Value,
     },
-    tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer},
+    tokenizer::{LowerCaser, RemoveLongFilter, TextAnalyzer, TokenFilter, TokenStream, Tokenizer},
 };
 use time::OffsetDateTime;
 
@@ -29,7 +28,7 @@ mod worker;
 pub use queue::{EnqueueStatus, IndexTarget, IndexTargetKind, enqueue_targets};
 pub use worker::start_workers;
 
-const TWEET_INDEX_DIR: &str = "tweets-v3";
+const TWEET_INDEX_DIR: &str = "tweets-v4";
 const JIEBA_TOKENIZER: &str = "jieba";
 const MAX_QUERY_CHARS: usize = 256;
 
@@ -309,7 +308,7 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
     let id = builder.add_i64_field("id", numeric.clone());
     let author_id = builder.add_i64_field("author_id", numeric.clone());
     let body = builder.add_text_field("body", jieba_text_options());
-    let relation = builder.add_text_field("relation", STORED | tantivy::schema::STRING);
+    let relation = builder.add_text_field("relation", tantivy::schema::STRING);
     let published_at = builder.add_i64_field("published_at", numeric.clone());
     let created_at = builder.add_i64_field("created_at", numeric.clone());
     let updated_at = builder.add_i64_field("updated_at", numeric);
@@ -350,11 +349,82 @@ fn open_index(path: &Path, schema: Schema, _writer_memory_mb: usize) -> AppResul
 
 fn register_tokenizers(index: &Index) -> AppResult<()> {
     let jieba = TextAnalyzer::builder(tantivy_jieba::JiebaTokenizer::new())
+        .filter(SearchTextFilter)
         .filter(RemoveLongFilter::limit(80))
         .filter(LowerCaser)
         .build();
     index.tokenizers().register(JIEBA_TOKENIZER, jieba);
     Ok(())
+}
+
+#[derive(Clone)]
+struct SearchTextFilter;
+
+impl TokenFilter for SearchTextFilter {
+    type Tokenizer<T: Tokenizer> = SearchTextFilterWrapper<T>;
+
+    fn transform<T: Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+        SearchTextFilterWrapper { inner: tokenizer }
+    }
+}
+
+#[derive(Clone)]
+struct SearchTextFilterWrapper<T> {
+    inner: T,
+}
+
+impl<T: Tokenizer> Tokenizer for SearchTextFilterWrapper<T> {
+    type TokenStream<'a> = SearchTextFilterStream<T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        SearchTextFilterStream {
+            tail: self.inner.token_stream(text),
+            buffer: String::new(),
+        }
+    }
+}
+
+struct SearchTextFilterStream<T> {
+    tail: T,
+    buffer: String,
+}
+
+impl<T: TokenStream> TokenStream for SearchTextFilterStream<T> {
+    fn advance(&mut self) -> bool {
+        while self.tail.advance() {
+            let Some((start, end)) = token_text_bounds(&self.tail.token().text) else {
+                continue;
+            };
+            if start > 0 || end < self.tail.token().text.len() {
+                self.buffer.clear();
+                self.buffer.push_str(&self.tail.token().text[start..end]);
+                self.tail.token_mut().text.clear();
+                self.tail.token_mut().text.push_str(&self.buffer);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        self.tail.token()
+    }
+
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        self.tail.token_mut()
+    }
+}
+
+fn token_text_bounds(value: &str) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut end = 0;
+    for (index, ch) in value.char_indices() {
+        if ch.is_alphanumeric() {
+            start.get_or_insert(index);
+            end = index + ch.len_utf8();
+        }
+    }
+    start.map(|start| (start, end))
 }
 
 fn jieba_text_options() -> TextOptions {
@@ -364,7 +434,6 @@ fn jieba_text_options() -> TextOptions {
                 .set_tokenizer(JIEBA_TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
-        .set_stored()
 }
 
 fn build_tweet_query(
@@ -373,6 +442,9 @@ fn build_tweet_query(
     filters: &TweetSearchFilters,
 ) -> AppResult<Box<dyn Query>> {
     let mut parts = Vec::<(Occur, Box<dyn Query>)>::new();
+    let raw_has_query = raw_query
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
     if let Some(query_text) = normalized_query(raw_query) {
         let mut parser = QueryParser::for_index(&index.index, vec![index.fields.body]);
         parser.set_conjunction_by_default();
@@ -381,6 +453,8 @@ fn build_tweet_query(
             Occur::Must,
             parser.parse_query(&query_text).map_err(search_error)?,
         ));
+    } else if raw_has_query {
+        return Ok(Box::new(EmptyQuery));
     }
 
     push_i64_filter(&mut parts, index.fields.id, &filters.tweet_ids);
@@ -520,14 +594,7 @@ fn normalized_query(raw_query: Option<&str>) -> Option<String> {
 
     let mut normalized = String::with_capacity(value.len());
     for ch in value.chars() {
-        if ch == '"'
-            || ch == '_'
-            || ch == '@'
-            || ch == '#'
-            || ch.is_alphanumeric()
-            || ch.is_whitespace()
-            || !ch.is_ascii()
-        {
+        if ch == '_' || ch.is_alphanumeric() || ch.is_whitespace() {
             normalized.push(ch);
         } else {
             normalized.push(' ');
