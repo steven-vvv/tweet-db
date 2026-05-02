@@ -22,6 +22,8 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         .route("/account/{*path}", get(account_index))
         .route("/browse", get(browse_index))
         .route("/browse/{*path}", get(browse_index))
+        .route("/mobile/browse", get(mobile_browse_index))
+        .route("/mobile/browse/{*path}", get(mobile_browse_index))
         .route("/admin", get(admin_index))
         .route("/admin/{*path}", get(admin_index))
         .nest_service("/assets", ServeDir::new(dist_dir.join("assets")))
@@ -42,6 +44,10 @@ async fn account_index(State(state): State<AppState>) -> Response {
 
 async fn browse_index(State(state): State<AppState>) -> Response {
     entry_index(&state, "browse/index.html").await
+}
+
+async fn mobile_browse_index(State(state): State<AppState>) -> Response {
+    entry_index(&state, "mobile/browse/index.html").await
 }
 
 async fn admin_index(State(state): State<AppState>) -> Response {
@@ -230,7 +236,14 @@ mod tests {
 
     #[tokio::test]
     async fn mpa_entrypoints_return_placeholder_when_dist_is_missing() {
-        for path in ["/account", "/forbidden", "/browse", "/browse/tweets/1"] {
+        for path in [
+            "/account",
+            "/forbidden",
+            "/browse",
+            "/browse/tweets/1",
+            "/mobile/browse",
+            "/mobile/browse/tweets/1",
+        ] {
             let response = test_router()
                 .oneshot(Request::get(path).body(Body::empty()).unwrap())
                 .await

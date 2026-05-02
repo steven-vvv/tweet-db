@@ -14,6 +14,7 @@ export default defineConfig({
         account: resolve(__dirname, 'account/index.html'),
         admin: resolve(__dirname, 'admin/index.html'),
         browse: resolve(__dirname, 'browse/index.html'),
+        mobileBrowse: resolve(__dirname, 'mobile/browse/index.html'),
       },
     },
   }
