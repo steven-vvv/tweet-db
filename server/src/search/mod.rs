@@ -30,7 +30,7 @@ pub use queue::{EnqueueStatus, IndexTarget, IndexTargetKind, enqueue_targets};
 pub use worker::start_workers;
 
 const USER_INDEX_DIR: &str = "users-v1";
-const TWEET_INDEX_DIR: &str = "tweets-v2";
+const TWEET_INDEX_DIR: &str = "tweets-v3";
 const JIEBA_TOKENIZER: &str = "jieba";
 const PREFIX_TOKENIZER: &str = "prefix_ngram";
 const MAX_QUERY_CHARS: usize = 256;
@@ -65,9 +65,7 @@ struct UserFields {
 #[derive(Clone, Copy)]
 struct TweetFields {
     id: Field,
-    id_prefix: Field,
     author_id: Field,
-    author_id_prefix: Field,
     body: Field,
     relation: Field,
     published_at: Field,
@@ -133,6 +131,8 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone, Default)]
 pub struct TweetSearchFilters {
+    pub tweet_ids: Vec<i64>,
+    pub author_ids: Vec<i64>,
     pub author_id: Option<i64>,
     pub relation: Option<String>,
 }
@@ -264,9 +264,7 @@ impl SearchState {
             if let Some(record) = records.get(tweet_id) {
                 writer.add_document(doc!(
                     index.fields.id => record.id,
-                    index.fields.id_prefix => record.id.to_string(),
                     index.fields.author_id => record.author_id,
-                    index.fields.author_id_prefix => record.author_id.to_string(),
                     index.fields.body => record.body.as_str(),
                     index.fields.relation => record.relation.as_str(),
                     index.fields.published_at => record.published_at.unix_timestamp(),
@@ -434,9 +432,7 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
         .set_fast()
         .set_stored();
     let id = builder.add_i64_field("id", numeric.clone());
-    let id_prefix = builder.add_text_field("id_prefix", prefix_text_options());
     let author_id = builder.add_i64_field("author_id", numeric.clone());
-    let author_id_prefix = builder.add_text_field("author_id_prefix", prefix_text_options());
     let body = builder.add_text_field("body", jieba_text_options());
     let relation = builder.add_text_field("relation", STORED | tantivy::schema::STRING);
     let published_at = builder.add_i64_field("published_at", numeric.clone());
@@ -458,9 +454,7 @@ fn open_tweet_index(config: &SearchSection) -> AppResult<SearchIndex<TweetFields
         writer: Mutex::new(writer),
         fields: TweetFields {
             id,
-            id_prefix,
             author_id,
-            author_id_prefix,
             body,
             relation,
             published_at,
@@ -545,11 +539,7 @@ fn build_tweet_query(
     if let Some(query_text) = normalized_query(raw_query) {
         let mut parser = QueryParser::for_index(
             &index.index,
-            vec![
-                index.fields.body,
-                index.fields.id_prefix,
-                index.fields.author_id_prefix,
-            ],
+            vec![index.fields.body],
         );
         parser.set_conjunction_by_default();
         parser.set_field_boost(index.fields.body, 2.0);
@@ -559,15 +549,14 @@ fn build_tweet_query(
         ));
     }
 
-    if let Some(author_id) = filters.author_id {
-        parts.push((
-            Occur::Must,
-            Box::new(TermQuery::new(
-                Term::from_field_i64(index.fields.author_id, author_id),
-                IndexRecordOption::Basic,
-            )),
-        ));
-    }
+    push_i64_filter(&mut parts, index.fields.id, &filters.tweet_ids);
+
+    let author_ids = filters
+        .author_id
+        .into_iter()
+        .chain(filters.author_ids.iter().copied())
+        .collect::<Vec<_>>();
+    push_i64_filter(&mut parts, index.fields.author_id, &author_ids);
 
     if let Some(relation) = filters.relation.as_deref().filter(|value| *value != "all") {
         parts.push((
@@ -586,6 +575,34 @@ fn build_tweet_query(
     } else {
         Ok(Box::new(BooleanQuery::new(parts)))
     }
+}
+
+fn push_i64_filter(parts: &mut Vec<(Occur, Box<dyn Query>)>, field: Field, values: &[i64]) {
+    if values.is_empty() {
+        return;
+    }
+
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    values.dedup();
+    let mut terms = values
+        .into_iter()
+        .map(|value| {
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(
+                    Term::from_field_i64(field, value),
+                    IndexRecordOption::Basic,
+                )) as Box<dyn Query>,
+            )
+        })
+        .collect::<Vec<_>>();
+    let query = if terms.len() == 1 {
+        terms.remove(0).1
+    } else {
+        Box::new(BooleanQuery::new(terms)) as Box<dyn Query>
+    };
+    parts.push((Occur::Must, query));
 }
 
 fn collect_hits<F>(
@@ -954,9 +971,7 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2001i64,
-                    index.fields.id_prefix => "2001",
                     index.fields.author_id => 9001i64,
-                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能 搜索 排序",
                     index.fields.relation => "original",
                     index.fields.published_at => 10i64,
@@ -967,9 +982,7 @@ mod tests {
             writer
                 .add_document(doc!(
                     index.fields.id => 2002i64,
-                    index.fields.id_prefix => "2002",
                     index.fields.author_id => 9001i64,
-                    index.fields.author_id_prefix => "9001",
                     index.fields.body => "人工智能 搜索 新帖子",
                     index.fields.relation => "reply",
                     index.fields.published_at => 20i64,
@@ -984,6 +997,8 @@ mod tests {
             .search_tweets(
                 Some("人工智能"),
                 &TweetSearchFilters {
+                    tweet_ids: Vec::new(),
+                    author_ids: Vec::new(),
                     author_id: Some(9001),
                     relation: Some("all".to_owned()),
                 },
@@ -1002,6 +1017,8 @@ mod tests {
             .search_tweets(
                 Some("人工智能"),
                 &TweetSearchFilters {
+                    tweet_ids: Vec::new(),
+                    author_ids: Vec::new(),
                     author_id: Some(9001),
                     relation: Some("reply".to_owned()),
                 },
@@ -1020,6 +1037,8 @@ mod tests {
             .search_tweets(
                 Some("人工智能"),
                 &TweetSearchFilters {
+                    tweet_ids: Vec::new(),
+                    author_ids: Vec::new(),
                     author_id: Some(9001),
                     relation: Some("all".to_owned()),
                 },
@@ -1038,6 +1057,8 @@ mod tests {
             .search_tweets(
                 Some("人工智能"),
                 &TweetSearchFilters {
+                    tweet_ids: Vec::new(),
+                    author_ids: Vec::new(),
                     author_id: Some(9001),
                     relation: Some("all".to_owned()),
                 },

@@ -1060,6 +1060,8 @@ async fn list_tweets_search(
 
     let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
     let filters = TweetSearchFilters {
+        tweet_ids: Vec::new(),
+        author_ids: Vec::new(),
         author_id,
         relation: Some(relation.to_owned()),
     };
