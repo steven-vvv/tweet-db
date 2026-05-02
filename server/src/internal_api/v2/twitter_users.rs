@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Extension, Path, Query, State},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sqlx::Row;
 use time::OffsetDateTime;
 use tokio::try_join;
@@ -11,6 +13,7 @@ use tokio::try_join;
 use crate::{
     auth::ActiveSession,
     error::{AppError, AppResult},
+    search::{SearchHit, UserSearchFilters, UserSearchSort},
     state::AppState,
 };
 
@@ -212,71 +215,97 @@ pub async fn search_twitter_users(
     }
 
     let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let search = state
+        .search
+        .as_ref()
+        .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
+    let mut hits = search
+        .search_users(
+            &UserSearchFilters {
+                user_ids: user_ids.clone(),
+                user_name_prefix: user_name_prefix.clone(),
+                display_name_prefix: display_name_prefix.clone(),
+                ..Default::default()
+            },
+            UserSearchSort::Relevance,
+            limit.saturating_add(1),
+            offset,
+        )
+        .await?;
+
+    let has_more = hits.len() > limit;
+    if has_more {
+        hits.truncate(limit);
+    }
+
+    let data = fetch_twitter_users_by_search_hits(&state.db, &hits).await?;
+    let next_cursor = has_more
+        .then(|| {
+            encode_cursor(&TwitterUserSearchCursor {
+                v: CURSOR_VERSION,
+                user_ids,
+                user_name_prefix,
+                display_name_prefix,
+                offset: offset.saturating_add(limit),
+            })
+        })
+        .transpose()?;
+
+    Ok(Json(list_response(data, limit, next_cursor)))
+}
+
+async fn fetch_twitter_users_by_search_hits(
+    pool: &sqlx::PgPool,
+    hits: &[SearchHit],
+) -> AppResult<Vec<Value>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
     let rows = sqlx::query(
         r#"
-        WITH candidates AS (
-            SELECT unnest($1::BIGINT[]) AS user_id, 1 AS rank
-            UNION ALL
-            SELECT DISTINCT snapshot.user_id, 2 AS rank
-            FROM tweet.user_snapshot AS snapshot
-            WHERE $2::TEXT IS NOT NULL
-              AND lower(snapshot.user_name) LIKE $2
-            UNION ALL
-            SELECT DISTINCT snapshot.user_id, 3 AS rank
-            FROM tweet.user_snapshot AS snapshot
-            WHERE $3::TEXT IS NOT NULL
-              AND lower(snapshot.display_name) LIKE $3
-        ),
-        ranked AS (
-            SELECT user_id, MIN(rank) AS rank
-            FROM candidates
-            GROUP BY user_id
-        )
         SELECT
-            ranked.rank,
+            input.ord,
             u.id,
             u.registered_at,
             u.created_at,
             u.updated_at,
             to_jsonb(snapshot) AS latest_snapshot,
             to_jsonb(stats) AS latest_stats
-        FROM ranked
+        FROM unnest($1::BIGINT[]) WITH ORDINALITY AS input(id, ord)
         INNER JOIN tweet.twitter_user AS u
-          ON u.id = ranked.user_id
+          ON u.id = input.id
         LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
           ON snapshot.user_id = u.id
         LEFT JOIN tweet.v_latest_user_stats AS stats
           ON stats.user_id = u.id
-        ORDER BY ranked.rank ASC, u.updated_at DESC, u.id DESC
-        OFFSET $4
-        LIMIT $5
+        ORDER BY input.ord
         "#,
     )
-    .bind(&user_ids)
-    .bind(user_name_prefix.as_deref().map(|value| format!("{value}%")))
-    .bind(display_name_prefix.as_deref().map(|value| format!("{value}%")))
-    .bind(offset as i64)
-    .bind(limit_plus_one(limit))
-    .fetch_all(&state.db)
+    .bind(&ids)
+    .fetch_all(pool)
     .await?;
-
-    let has_more = rows.len() > limit;
-    let data = rows
+    let by_id = rows
         .into_iter()
-        .take(limit)
-        .map(twitter_user_summary_json_from_row)
-        .collect::<Vec<_>>();
-    let next_cursor = has_more.then(|| {
-        encode_cursor(&TwitterUserSearchCursor {
-            v: CURSOR_VERSION,
-            user_ids,
-            user_name_prefix,
-            display_name_prefix,
-            offset: offset.saturating_add(limit),
+        .map(|row| {
+            let id: i64 = row.get("id");
+            (id, twitter_user_summary_json_from_row(row))
         })
-    }).transpose()?;
+        .collect::<HashMap<_, _>>();
 
-    Ok(Json(list_response(data, limit, next_cursor)))
+    Ok(hits
+        .iter()
+        .filter_map(|hit| {
+            by_id.get(&hit.id).cloned().map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("searchScore".to_owned(), json!(hit.score));
+                    object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
+                }
+                item
+            })
+        })
+        .collect())
 }
 
 pub async fn list_twitter_user_snapshots(

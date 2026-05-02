@@ -14,7 +14,10 @@ use crate::{
     auth::{self, ActiveSession},
     db,
     error::{AppError, AppResult},
-    search::{SearchHit, SearchSort, SearchState, TweetSearchFilters, TweetSearchSort},
+    search::{
+        SearchHit, SearchSort, SearchState, TweetSearchFilters, TweetSearchSort, UserSearchFilters,
+        UserSearchSort,
+    },
     state::AppState,
     storage,
 };
@@ -598,8 +601,13 @@ pub async fn list_twitter_users(
     let q = normalize_query(query.list.q.as_deref());
     let sort = SearchSort::parse(query.sort.as_deref(), q.is_some())?;
     if let Some(search_query) = q.as_deref() {
+        let search = state
+            .search
+            .as_ref()
+            .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
         let value = list_twitter_users_search(
             &state.db,
+            search,
             search_query,
             sort,
             limit,
@@ -707,6 +715,7 @@ pub async fn list_twitter_users(
 
 async fn list_twitter_users_search(
     pool: &PgPool,
+    search: &SearchState,
     q: &str,
     sort: SearchSort,
     limit: usize,
@@ -726,37 +735,50 @@ async fn list_twitter_users_search(
     }
 
     let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
-    let id_prefix = prefix_pattern(Some(q));
-    let name_prefix = q.trim_start_matches('@').trim().to_ascii_lowercase();
-    let name_prefix = (!name_prefix.is_empty()).then(|| format!("{name_prefix}%"));
-    let order_clause = match sort {
-        SearchSort::Relevance => "ORDER BY ranked.rank ASC, u.updated_at DESC, u.id DESC",
-        SearchSort::Time => "ORDER BY u.updated_at DESC, u.id DESC",
-    };
-    let sql = format!(
-        r#"
-        WITH candidates AS (
-            SELECT u.id AS user_id, 1 AS rank
-            FROM tweet.twitter_user AS u
-            WHERE u.id::text LIKE $1
-            UNION ALL
-            SELECT DISTINCT snapshot.user_id, 2 AS rank
-            FROM tweet.user_snapshot AS snapshot
-            WHERE $2::TEXT IS NOT NULL
-              AND lower(snapshot.user_name) LIKE $2
-            UNION ALL
-            SELECT DISTINCT snapshot.user_id, 3 AS rank
-            FROM tweet.user_snapshot AS snapshot
-            WHERE $2::TEXT IS NOT NULL
-              AND lower(snapshot.display_name) LIKE $2
-        ),
-        ranked AS (
-            SELECT user_id, MIN(rank) AS rank
-            FROM candidates
-            GROUP BY user_id
+    let mut hits = search
+        .search_users(
+            &UserSearchFilters {
+                q: Some(q.to_owned()),
+                ..Default::default()
+            },
+            UserSearchSort::from(sort),
+            limit.saturating_add(1),
+            offset,
         )
+        .await?;
+    let has_more = hits.len() > limit;
+    if has_more {
+        hits.truncate(limit);
+    }
+
+    let items = fetch_twitter_user_admin_search_items(pool, &hits).await?;
+    let next_cursor = if has_more {
+        Some(encode_cursor(&TwitterUserSearchCursor {
+            v: CURSOR_VERSION,
+            q: q.to_owned(),
+            sort,
+            offset: offset.saturating_add(limit),
+        })?)
+    } else {
+        None
+    };
+
+    Ok(list_response(items, next_cursor))
+}
+
+async fn fetch_twitter_user_admin_search_items(
+    pool: &PgPool,
+    hits: &[SearchHit],
+) -> AppResult<Vec<Value>> {
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ids = hits.iter().map(|hit| hit.id).collect::<Vec<_>>();
+    let rows = sqlx::query(
+        r#"
         SELECT
-            ranked.rank,
+            input.ord,
             u.id,
             u.registered_at,
             u.updated_at,
@@ -768,9 +790,9 @@ async fn list_twitter_users_search(
             stats.tweets,
             COALESCE(tweet_counts.tweet_count, 0) AS tweet_count,
             COALESCE(media_counts.media_count, 0) AS media_count
-        FROM ranked
+        FROM unnest($1::BIGINT[]) WITH ORDINALITY AS input(id, ord)
         INNER JOIN tweet.twitter_user AS u
-          ON u.id = ranked.user_id
+          ON u.id = input.id
         LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
           ON snapshot.user_id = u.id
         LEFT JOIN tweet.v_latest_user_stats AS stats
@@ -785,49 +807,32 @@ async fn list_twitter_users_search(
             FROM tweet.media AS media
             WHERE media.origin_user_id = u.id
         ) AS media_counts ON TRUE
-        {order_clause}
-        OFFSET $3
-        LIMIT $4
-        "#
-    );
-    let mut rows = sqlx::query(&sql)
-        .bind(id_prefix.as_deref().unwrap_or(""))
-        .bind(name_prefix.as_deref())
-        .bind(offset as i64)
-        .bind(limit_plus_one(limit))
-        .fetch_all(pool)
-        .await?;
-    let has_more = rows.len() > limit;
-    if has_more {
-        rows.truncate(limit);
-    }
-
-    let items = rows
+        ORDER BY input.ord
+        "#,
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let by_id = rows
         .into_iter()
         .map(|row| {
-            let mut item = twitter_user_admin_json_from_row(&row);
-            if let Some(object) = item.as_object_mut() {
-                object.insert("searchScore".to_owned(), json!(row.get::<i32, _>("rank")));
-                object.insert(
-                    "searchSortTime".to_owned(),
-                    json!(row.get::<OffsetDateTime, _>("updated_at").unix_timestamp()),
-                );
-            }
-            item
+            let id: i64 = row.get("id");
+            (id, twitter_user_admin_json_from_row(&row))
         })
-        .collect::<Vec<_>>();
-    let next_cursor = if has_more {
-        Some(encode_cursor(&TwitterUserSearchCursor {
-            v: CURSOR_VERSION,
-            q: q.to_owned(),
-            sort,
-            offset: offset.saturating_add(limit),
-        })?)
-    } else {
-        None
-    };
+        .collect::<HashMap<_, _>>();
 
-    Ok(list_response(items, next_cursor))
+    Ok(hits
+        .iter()
+        .filter_map(|hit| {
+            by_id.get(&hit.id).cloned().map(|mut item| {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("searchScore".to_owned(), json!(hit.score));
+                    object.insert("searchSortTime".to_owned(), json!(hit.sort_time));
+                }
+                item
+            })
+        })
+        .collect())
 }
 
 fn twitter_user_admin_json_from_row(row: &sqlx::postgres::PgRow) -> Value {
@@ -923,7 +928,11 @@ pub async fn list_tweets(
     let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
     let relation = normalize_tweet_relation(query.relation.as_deref())?;
     let sort = SearchSort::parse(query.sort.as_deref(), q.is_some())?;
-    if let (Some(search), Some(search_query)) = (state.search.as_ref(), q.as_deref()) {
+    if let Some(search_query) = q.as_deref() {
+        let search = state
+            .search
+            .as_ref()
+            .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
         let value = list_tweets_search(
             &state.db,
             search,
