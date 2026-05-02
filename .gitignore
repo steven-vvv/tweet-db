@@ -3,6 +3,7 @@ server/.env
 server/config.toml
 webui/node_modules/
 webui/dist/
+*.tsbuildinfo
 .codex/
 .codex
 .db-certs/
