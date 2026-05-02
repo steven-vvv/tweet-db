@@ -222,6 +222,51 @@ pub(super) fn parse_optional_i64(value: Option<&str>, field: &str) -> AppResult<
         .transpose()
 }
 
+pub(super) fn parse_i64_csv(value: Option<&str>, field: &str) -> AppResult<Vec<i64>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+
+    let mut values = Vec::new();
+    for item in value.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        values.push(item.parse::<i64>().map_err(|_| {
+            AppError::bad_request(format!("{field} must be signed 64-bit integers"))
+        })?);
+    }
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
+}
+
+pub(super) fn normalize_csv(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+
+    let mut values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+pub(super) fn normalize_user_name_csv(value: Option<&str>) -> Vec<String> {
+    let mut values = normalize_csv(value)
+        .into_iter()
+        .filter_map(|value| {
+            let normalized = value.trim_start_matches('@').trim().to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
 pub(super) fn normalize_user_status(raw: Option<&str>) -> AppResult<String> {
     let value = raw.unwrap_or("all").trim().to_ascii_lowercase();
     match value.as_str() {
@@ -367,6 +412,12 @@ impl IncludeSet {
             .collect::<Vec<_>>();
 
         Ok(Self { values })
+    }
+
+    pub(super) fn from_values(values: &[&str]) -> Self {
+        Self {
+            values: values.iter().map(|value| value.to_string()).collect(),
+        }
     }
 
     pub(super) fn contains(&self, value: &str) -> bool {

@@ -47,6 +47,10 @@ pub fn routes() -> Router<AppState> {
             get(twitter_users::get_twitter_user),
         )
         .route(
+            "/internal/v2/twitter-users/{user_id}/tweets",
+            get(tweets::list_twitter_user_tweets),
+        )
+        .route(
             "/internal/v2/twitter-users/{user_id}/snapshots",
             get(twitter_users::list_twitter_user_snapshots),
         )
@@ -116,5 +120,9 @@ pub fn routes() -> Router<AppState> {
             get(search::get_index_task),
         )
         .route("/internal/v2/search/tweets", get(tweets::search_tweets))
+        .route(
+            "/internal/v2/search/users",
+            get(twitter_users::search_twitter_users),
+        )
         .route("/internal/v2/system/summary", get(system::summary))
 }

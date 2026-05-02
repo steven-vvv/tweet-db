@@ -23,6 +23,16 @@ pub struct TwitterUserListQuery {
     list: ListQuery,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TwitterUserSearchQuery {
+    #[serde(flatten)]
+    list: ListQuery,
+    user_ids: Option<String>,
+    user_name_prefix: Option<String>,
+    display_name_prefix: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct TwitterUserCursor {
     v: u8,
@@ -38,6 +48,15 @@ struct TwitterUserChildCursor {
     user_id: i64,
     #[serde(with = "time::serde::rfc3339")]
     recorded_at: OffsetDateTime,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TwitterUserSearchCursor {
+    v: u8,
+    user_ids: Vec<i64>,
+    user_name_prefix: Option<String>,
+    display_name_prefix: Option<String>,
+    offset: usize,
 }
 
 pub async fn list_twitter_users(
@@ -165,6 +184,101 @@ pub async fn get_twitter_user(
     )))
 }
 
+pub async fn search_twitter_users(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Query(query): Query<TwitterUserSearchQuery>,
+) -> AppResult<Json<ListResponse>> {
+    let _session = require_capability(session, Capability::TweetRead)?;
+    let limit = resolve_limit(query.list.limit);
+    let user_ids = parse_i64_csv(query.user_ids.as_deref(), "userIds")?;
+    let user_name_prefix = normalize_user_query_prefix(query.user_name_prefix.as_deref());
+    let display_name_prefix = normalize_user_query_prefix(query.display_name_prefix.as_deref());
+    if user_ids.is_empty() && user_name_prefix.is_none() && display_name_prefix.is_none() {
+        return Err(AppError::bad_request(
+            "one of userIds, userNamePrefix, displayNamePrefix is required",
+        ));
+    }
+
+    let cursor = decode_cursor::<TwitterUserSearchCursor>(query.list.cursor.as_deref())?;
+    if let Some(cursor) = cursor.as_ref() {
+        ensure_cursor_version(cursor.v)?;
+        if cursor.user_ids != user_ids
+            || cursor.user_name_prefix != user_name_prefix
+            || cursor.display_name_prefix != display_name_prefix
+        {
+            return Err(AppError::bad_request("cursor does not match filters"));
+        }
+    }
+
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let rows = sqlx::query(
+        r#"
+        WITH candidates AS (
+            SELECT unnest($1::BIGINT[]) AS user_id, 1 AS rank
+            UNION ALL
+            SELECT DISTINCT snapshot.user_id, 2 AS rank
+            FROM tweet.user_snapshot AS snapshot
+            WHERE $2::TEXT IS NOT NULL
+              AND lower(snapshot.user_name) LIKE $2
+            UNION ALL
+            SELECT DISTINCT snapshot.user_id, 3 AS rank
+            FROM tweet.user_snapshot AS snapshot
+            WHERE $3::TEXT IS NOT NULL
+              AND lower(snapshot.display_name) LIKE $3
+        ),
+        ranked AS (
+            SELECT user_id, MIN(rank) AS rank
+            FROM candidates
+            GROUP BY user_id
+        )
+        SELECT
+            ranked.rank,
+            u.id,
+            u.registered_at,
+            u.created_at,
+            u.updated_at,
+            to_jsonb(snapshot) AS latest_snapshot,
+            to_jsonb(stats) AS latest_stats
+        FROM ranked
+        INNER JOIN tweet.twitter_user AS u
+          ON u.id = ranked.user_id
+        LEFT JOIN tweet.v_latest_user_snapshot AS snapshot
+          ON snapshot.user_id = u.id
+        LEFT JOIN tweet.v_latest_user_stats AS stats
+          ON stats.user_id = u.id
+        ORDER BY ranked.rank ASC, u.updated_at DESC, u.id DESC
+        OFFSET $4
+        LIMIT $5
+        "#,
+    )
+    .bind(&user_ids)
+    .bind(user_name_prefix.as_deref().map(|value| format!("{value}%")))
+    .bind(display_name_prefix.as_deref().map(|value| format!("{value}%")))
+    .bind(offset as i64)
+    .bind(limit_plus_one(limit))
+    .fetch_all(&state.db)
+    .await?;
+
+    let has_more = rows.len() > limit;
+    let data = rows
+        .into_iter()
+        .take(limit)
+        .map(twitter_user_summary_json_from_row)
+        .collect::<Vec<_>>();
+    let next_cursor = has_more.then(|| {
+        encode_cursor(&TwitterUserSearchCursor {
+            v: CURSOR_VERSION,
+            user_ids,
+            user_name_prefix,
+            display_name_prefix,
+            offset: offset.saturating_add(limit),
+        })
+    }).transpose()?;
+
+    Ok(Json(list_response(data, limit, next_cursor)))
+}
+
 pub async fn list_twitter_user_snapshots(
     State(state): State<AppState>,
     session: Option<Extension<ActiveSession>>,
@@ -279,7 +393,31 @@ async fn fetch_twitter_user_row(
     .bind(user_id)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| AppError::not_found("twitter user not found"))
+        .ok_or_else(|| AppError::not_found("twitter user not found"))
+}
+
+fn twitter_user_summary_json_from_row(row: sqlx::postgres::PgRow) -> Value {
+    let mut item = twitter_user_json_from_row(&row);
+    if let Some(object) = item.as_object_mut() {
+        object.insert(
+            "latestSnapshot".to_owned(),
+            row.get::<Option<Value>, _>("latest_snapshot")
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "latestStats".to_owned(),
+            row.get::<Option<Value>, _>("latest_stats")
+                .unwrap_or(Value::Null),
+        );
+    }
+    item
+}
+
+fn normalize_user_query_prefix(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_start_matches('@').trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
 }
 
 async fn ensure_twitter_user_exists(pool: &sqlx::PgPool, user_id: i64) -> AppResult<()> {

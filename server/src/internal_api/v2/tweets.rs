@@ -34,7 +34,19 @@ pub struct TweetListQuery {
 pub struct TweetSearchListQuery {
     #[serde(flatten)]
     list: ListQuery,
+    tweet_ids: Option<String>,
+    author_ids: Option<String>,
+    author_user_names: Option<String>,
     author_id: Option<String>,
+    relation: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UserTweetListQuery {
+    #[serde(flatten)]
+    list: ListQuery,
     relation: Option<String>,
     sort: Option<String>,
 }
@@ -70,6 +82,16 @@ impl TweetListSort {
             Self::PublishedAt => "published_at",
             Self::CreatedAt => "created_at",
             Self::UpdatedAt => "updated_at",
+        }
+    }
+}
+
+impl From<TweetSearchSort> for TweetListSort {
+    fn from(value: TweetSearchSort) -> Self {
+        match value {
+            TweetSearchSort::Relevance | TweetSearchSort::PublishedAt => Self::PublishedAt,
+            TweetSearchSort::CreatedAt => Self::CreatedAt,
+            TweetSearchSort::UpdatedAt => Self::UpdatedAt,
         }
     }
 }
@@ -112,11 +134,25 @@ struct TweetMediaCursor {
 #[derive(Debug, Serialize, Deserialize)]
 struct TweetSearchCursor {
     v: u8,
-    q: String,
-    author_id: Option<i64>,
+    q: Option<String>,
+    tweet_ids: Vec<i64>,
+    author_ids: Vec<i64>,
+    author_user_names: Vec<String>,
     relation: String,
     sort: TweetSearchSort,
     offset: usize,
+}
+
+#[derive(Debug)]
+struct TweetQuerySpec {
+    q: Option<String>,
+    tweet_ids: Vec<i64>,
+    author_ids: Vec<i64>,
+    author_user_names: Vec<String>,
+    relation: String,
+    sort: TweetSearchSort,
+    limit: usize,
+    cursor: Option<String>,
 }
 
 pub async fn list_tweets(
@@ -130,7 +166,6 @@ pub async fn list_tweets(
     let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
     let relation = normalize_tweet_relation(query.relation.as_deref())?;
     let sort = TweetListSort::parse(query.sort.as_deref())?;
-    let includes = IncludeSet::parse(query.list.include.as_deref())?;
     let cursor = decode_cursor::<TweetCursor>(query.list.cursor.as_deref())?;
 
     if let Some(cursor) = cursor.as_ref() {
@@ -204,7 +239,7 @@ pub async fn list_tweets(
             },
         )
     })?;
-    hydrate_tweet_list(&state.db, &mut data, &includes).await?;
+    hydrate_browse_tweet_list(&state.db, &mut data).await?;
 
     Ok(Json(list_response(data, limit, next_cursor)))
 }
@@ -298,63 +333,36 @@ pub async fn search_tweets(
     Query(query): Query<TweetSearchListQuery>,
 ) -> AppResult<Json<ListResponse>> {
     let _session = require_capability(session, Capability::TweetRead)?;
-    let search = state
-        .search
-        .as_ref()
-        .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
+    let spec = tweet_query_spec_from_search_query(query)?;
+    let limit = spec.limit;
+    let (data, next_cursor) = execute_tweet_query(&state, spec).await?;
+
+    Ok(Json(list_response(data, limit, next_cursor)))
+}
+
+pub async fn list_twitter_user_tweets(
+    State(state): State<AppState>,
+    session: Option<Extension<ActiveSession>>,
+    Path(user_id): Path<i64>,
+    Query(query): Query<UserTweetListQuery>,
+) -> AppResult<Json<ListResponse>> {
+    let _session = require_capability(session, Capability::TweetRead)?;
     let limit = resolve_limit(query.list.limit);
-    let q = normalize_query(query.list.q.as_deref())
-        .ok_or_else(|| AppError::bad_request("q is required"))?;
-    let author_id = parse_optional_i64(query.author_id.as_deref(), "authorId")?;
-    let relation = normalize_tweet_relation(query.relation.as_deref())?;
-    let sort = TweetSearchSort::parse(query.sort.as_deref())?;
-    let includes = IncludeSet::parse(query.list.include.as_deref())?;
-    let cursor = decode_cursor::<TweetSearchCursor>(query.list.cursor.as_deref())?;
-
-    if let Some(cursor) = cursor.as_ref() {
-        ensure_cursor_version(cursor.v)?;
-        ensure_filter_match(
-            Some(cursor.q.as_str()),
-            Some(q.as_str()),
-            "cursor does not match query",
-        )?;
-        if cursor.author_id != author_id || cursor.relation != relation {
-            return Err(AppError::bad_request("cursor does not match filters"));
-        }
-        if cursor.sort != sort {
-            return Err(AppError::bad_request("cursor does not match sort"));
-        }
-    }
-
-    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
-    let filters = TweetSearchFilters {
+    let spec = TweetQuerySpec {
+        q: normalize_query(query.list.q.as_deref()),
         tweet_ids: Vec::new(),
-        author_ids: Vec::new(),
-        author_id,
-        relation: Some(relation.clone()),
+        author_ids: vec![user_id],
+        author_user_names: Vec::new(),
+        relation: normalize_tweet_relation(query.relation.as_deref())?,
+        sort: match query.sort.as_deref() {
+            Some(value) => TweetSearchSort::parse(Some(value))?,
+            None if normalize_query(query.list.q.as_deref()).is_some() => TweetSearchSort::Relevance,
+            None => TweetSearchSort::PublishedAt,
+        },
+        limit,
+        cursor: query.list.cursor,
     };
-    let mut hits = search
-        .search_tweets(Some(&q), &filters, sort, limit.saturating_add(1), offset)
-        .await?;
-    let has_more = hits.len() > limit;
-    if has_more {
-        hits.truncate(limit);
-    }
-
-    let mut data = fetch_tweets_by_search_hits(&state.db, &hits).await?;
-    hydrate_tweet_list(&state.db, &mut data, &includes).await?;
-    let next_cursor = if has_more {
-        Some(encode_cursor(&TweetSearchCursor {
-            v: CURSOR_VERSION,
-            q,
-            author_id,
-            relation,
-            sort,
-            offset: offset.saturating_add(limit),
-        })?)
-    } else {
-        None
-    };
+    let (data, next_cursor) = execute_tweet_query(&state, spec).await?;
 
     Ok(Json(list_response(data, limit, next_cursor)))
 }
@@ -439,6 +447,202 @@ pub async fn list_tweet_media(
     })?;
 
     Ok(Json(list_response(data, limit, next_cursor)))
+}
+
+fn tweet_query_spec_from_search_query(query: TweetSearchListQuery) -> AppResult<TweetQuerySpec> {
+    let mut author_ids = parse_i64_csv(query.author_ids.as_deref(), "authorIds")?;
+    if let Some(author_id) = parse_optional_i64(query.author_id.as_deref(), "authorId")? {
+        author_ids.push(author_id);
+        author_ids.sort_unstable();
+        author_ids.dedup();
+    }
+
+    let q = normalize_query(query.list.q.as_deref());
+    let sort = match query.sort.as_deref() {
+        Some(value) => TweetSearchSort::parse(Some(value))?,
+        None if q.is_some() => TweetSearchSort::Relevance,
+        None => TweetSearchSort::PublishedAt,
+    };
+
+    Ok(TweetQuerySpec {
+        q,
+        tweet_ids: parse_i64_csv(query.tweet_ids.as_deref(), "tweetIds")?,
+        author_ids,
+        author_user_names: normalize_user_name_csv(query.author_user_names.as_deref()),
+        relation: normalize_tweet_relation(query.relation.as_deref())?,
+        sort,
+        limit: resolve_limit(query.list.limit),
+        cursor: query.list.cursor,
+    })
+}
+
+async fn execute_tweet_query(
+    state: &AppState,
+    mut spec: TweetQuerySpec,
+) -> AppResult<(Vec<Value>, Option<String>)> {
+    let cursor = decode_cursor::<TweetSearchCursor>(spec.cursor.as_deref())?;
+    if let Some(cursor) = cursor.as_ref() {
+        ensure_cursor_version(cursor.v)?;
+        ensure_filter_match(
+            cursor.q.as_deref(),
+            spec.q.as_deref(),
+            "cursor does not match query",
+        )?;
+        if cursor.tweet_ids != spec.tweet_ids
+            || cursor.author_user_names != spec.author_user_names
+            || cursor.relation != spec.relation
+            || cursor.sort != spec.sort
+        {
+            return Err(AppError::bad_request("cursor does not match filters"));
+        }
+    }
+
+    let mut resolved_author_ids =
+        resolve_author_user_name_ids(&state.db, &spec.author_user_names).await?;
+    spec.author_ids.append(&mut resolved_author_ids);
+    spec.author_ids.sort_unstable();
+    spec.author_ids.dedup();
+    if let Some(cursor) = cursor.as_ref() {
+        if cursor.author_ids != spec.author_ids {
+            return Err(AppError::bad_request("cursor does not match filters"));
+        }
+    }
+
+    if spec.q.is_some() {
+        execute_tweet_text_query(state, spec, cursor).await
+    } else {
+        execute_tweet_sql_query(state, spec, cursor).await
+    }
+}
+
+async fn execute_tweet_text_query(
+    state: &AppState,
+    spec: TweetQuerySpec,
+    cursor: Option<TweetSearchCursor>,
+) -> AppResult<(Vec<Value>, Option<String>)> {
+    let search = state
+        .search
+        .as_ref()
+        .ok_or_else(|| AppError::service_unavailable("search subsystem is disabled"))?;
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let filters = TweetSearchFilters {
+        tweet_ids: spec.tweet_ids.clone(),
+        author_ids: spec.author_ids.clone(),
+        author_id: None,
+        relation: Some(spec.relation.clone()),
+    };
+    let mut hits = search
+        .search_tweets(
+            spec.q.as_deref(),
+            &filters,
+            spec.sort,
+            spec.limit.saturating_add(1),
+            offset,
+        )
+        .await?;
+    let has_more = hits.len() > spec.limit;
+    if has_more {
+        hits.truncate(spec.limit);
+    }
+
+    let mut data = fetch_tweets_by_search_hits(&state.db, &hits).await?;
+    hydrate_browse_tweet_list(&state.db, &mut data).await?;
+    let next_cursor = has_more.then(|| {
+        encode_cursor(&TweetSearchCursor {
+            v: CURSOR_VERSION,
+            q: spec.q.clone(),
+            tweet_ids: spec.tweet_ids.clone(),
+            author_ids: spec.author_ids.clone(),
+            author_user_names: spec.author_user_names.clone(),
+            relation: spec.relation.clone(),
+            sort: spec.sort,
+            offset: offset.saturating_add(spec.limit),
+        })
+    }).transpose()?;
+
+    Ok((data, next_cursor))
+}
+
+async fn execute_tweet_sql_query(
+    state: &AppState,
+    spec: TweetQuerySpec,
+    cursor: Option<TweetSearchCursor>,
+) -> AppResult<(Vec<Value>, Option<String>)> {
+    let offset = cursor.as_ref().map(|item| item.offset).unwrap_or_default();
+    let sort = TweetListSort::from(spec.sort);
+    let sort_column = sort.sql_column();
+    let tail = format!(
+        r#"
+        WHERE (
+                cardinality($1::BIGINT[]) = 0
+            OR t.id = ANY($1::BIGINT[])
+          )
+          AND (
+                cardinality($2::BIGINT[]) = 0
+            OR t.author_id = ANY($2::BIGINT[])
+          )
+          AND (
+                $3::text = 'all'
+            OR ($3 = 'original' AND t.reply_to_tweet_id IS NULL AND t.quote_tweet_id IS NULL AND t.repost_id IS NULL)
+            OR ($3 = 'reply' AND t.reply_to_tweet_id IS NOT NULL)
+            OR ($3 = 'quote' AND t.quote_tweet_id IS NOT NULL)
+            OR ($3 = 'repost' AND t.repost_id IS NOT NULL)
+          )
+        ORDER BY t.{sort_column} DESC, t.id DESC
+        OFFSET $4
+        LIMIT $5
+        "#
+    );
+    let sql = tweet_select_sql(&tail);
+    let rows = sqlx::query(&sql)
+        .bind(&spec.tweet_ids)
+        .bind(&spec.author_ids)
+        .bind(&spec.relation)
+        .bind(offset as i64)
+        .bind(limit_plus_one(spec.limit))
+        .fetch_all(&state.db)
+        .await?;
+
+    let has_more = rows.len() > spec.limit;
+    let mut data = rows
+        .into_iter()
+        .take(spec.limit)
+        .map(|row| tweet_json_from_row(&row))
+        .collect::<Vec<_>>();
+    hydrate_browse_tweet_list(&state.db, &mut data).await?;
+    let next_cursor = has_more.then(|| {
+        encode_cursor(&TweetSearchCursor {
+            v: CURSOR_VERSION,
+            q: None,
+            tweet_ids: spec.tweet_ids.clone(),
+            author_ids: spec.author_ids.clone(),
+            author_user_names: spec.author_user_names.clone(),
+            relation: spec.relation.clone(),
+            sort: spec.sort,
+            offset: offset.saturating_add(spec.limit),
+        })
+    }).transpose()?;
+
+    Ok((data, next_cursor))
+}
+
+async fn resolve_author_user_name_ids(pool: &PgPool, user_names: &[String]) -> AppResult<Vec<i64>> {
+    if user_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT snapshot.user_id
+        FROM tweet.user_snapshot AS snapshot
+        WHERE lower(snapshot.user_name) = ANY($1::TEXT[])
+        "#,
+    )
+    .bind(user_names)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 async fn fetch_tweets_by_search_hits(pool: &PgPool, hits: &[SearchHit]) -> AppResult<Vec<Value>> {
@@ -672,6 +876,11 @@ async fn hydrate_tweet_list(
     }
 
     Ok(())
+}
+
+async fn hydrate_browse_tweet_list(pool: &sqlx::PgPool, data: &mut [Value]) -> AppResult<()> {
+    let includes = IncludeSet::from_values(&["author", "stats", "media-resources"]);
+    hydrate_tweet_list(pool, data, &includes).await
 }
 
 async fn fetch_author_summary_map(
@@ -953,14 +1162,20 @@ mod tests {
     fn tweet_search_cursor_serializes_sort_and_offset() {
         let cursor = TweetSearchCursor {
             v: CURSOR_VERSION,
-            q: "rust".to_owned(),
-            author_id: Some(42),
+            q: Some("rust".to_owned()),
+            tweet_ids: vec![100],
+            author_ids: vec![42],
+            author_user_names: vec!["alice".to_owned()],
             relation: "all".to_owned(),
             sort: TweetSearchSort::UpdatedAt,
             offset: 30,
         };
         let value = serde_json::to_value(cursor).unwrap();
 
+        assert_eq!(value["q"], "rust");
+        assert_eq!(value["tweet_ids"][0], 100);
+        assert_eq!(value["author_ids"][0], 42);
+        assert_eq!(value["author_user_names"][0], "alice");
         assert_eq!(value["sort"], "updatedAt");
         assert_eq!(value["offset"], 30);
     }
