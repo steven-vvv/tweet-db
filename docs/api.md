@@ -475,6 +475,8 @@ user 搜索参数：
 - `limit`
 - `cursor`
 
+`/internal/v2/search/tweets` 和 `/internal/v2/search/users` 均由 Tantivy 生成命中 ID，再按 ID 从 PostgreSQL 读取事实数据并组装响应。`/internal/v2/system/summary` 的 `search.tantivy.tweets` 和 `search.tantivy.users` 返回当前 Tantivy 文档数，`search.indexTasks` 返回 PostgreSQL 索引队列状态。
+
 重新入队索引任务请求体：
 
 ```json
